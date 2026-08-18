@@ -1,6 +1,8 @@
 //! The webhook's pure half, importable by the golden tests. `main.rs`
 //! is transport over this.
 
+#![forbid(unsafe_code)]
+
 mod annotations;
 mod patch;
 

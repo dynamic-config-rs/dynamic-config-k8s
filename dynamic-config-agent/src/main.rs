@@ -18,6 +18,8 @@
 //! is not one — this binary flattens under its own stated rules
 //! (documented in the book's Rendering chapter) and owns that choice.
 
+#![forbid(unsafe_code)]
+
 mod render;
 mod sources;
 mod spec;
