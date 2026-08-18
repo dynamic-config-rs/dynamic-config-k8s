@@ -1,17 +1,24 @@
 {{- if .Values.operator.enabled }}
+{{- $fullname := include "dynamic-config.operator.fullname" . }}
+{{- if .Values.operator.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: dynamic-config-operator
+  name: {{ include "dynamic-config.operator.serviceAccountName" . }}
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- with (merge (dict) .Values.operator.serviceAccount.annotations .Values.commonAnnotations) }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
+{{- end }}
+{{- if .Values.operator.rbac.create }}
 # Least privilege for what the 0.3.0 reconcilers will do: watch the two
 # CRDs, own the ConfigMaps they render, record events. Nothing cluster-
 # shaping — no pods, no secrets beyond reads the classes name.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: dynamic-config-operator
+  name: {{ $fullname }}
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["dynamic-config.rs"]
@@ -36,34 +43,40 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: dynamic-config-operator
+  name: {{ $fullname }}
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: dynamic-config-operator
+  name: {{ $fullname }}
 subjects:
   - kind: ServiceAccount
-    name: dynamic-config-operator
+    name: {{ include "dynamic-config.operator.serviceAccountName" . }}
     namespace: "{{ .Release.Namespace }}"
 ---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dynamic-config-operator
+  name: {{ $fullname }}
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
 spec:
   replicas: 1
   selector:
-    matchLabels:
-      app.kubernetes.io/name: dynamic-config
-      app.kubernetes.io/component: operator
+    matchLabels: {{- include "dynamic-config.operator.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels: {{- include "dynamic-config.labels" . | nindent 8 }}
         app.kubernetes.io/component: operator
+        {{- with .Values.operator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with (merge (dict) .Values.operator.podAnnotations .Values.commonAnnotations) }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
-      serviceAccountName: dynamic-config-operator
+      serviceAccountName: {{ include "dynamic-config.operator.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -71,10 +84,25 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      {{- with .Values.operator.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: operator
           image: {{ include "dynamic-config.image" .Values.operator | quote }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
+          {{- with .Values.operator.extraEnv }}
+          env: {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
           resources: {{- toYaml .Values.operator.resources | nindent 12 }}
 {{- end }}

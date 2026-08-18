@@ -1,0 +1,7 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: dynamic-config
+  annotations:
+    # cainjector maintains the caBundle from the Certificate above.
+    cert-manager.io/inject-ca-from: dynamic-config/dynamic-config-webhook

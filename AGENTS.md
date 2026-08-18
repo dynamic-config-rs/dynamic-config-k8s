@@ -8,7 +8,7 @@ into ConfigMaps.
 dynamic-config-agent/      store → resolved document → atomic file
 dynamic-config-webhook/    AdmissionReview → JSONPatch (pure) + transport
 dynamic-config-operator/   the two CRDs, generated manifests, reconcile
-deploy/                    helm + kustomize + crds.json (generated!)
+deploy/                    helm (+ crds/) + kustomize (base/overlays) + crds.json — the CRD copies are ALL generated: `just crds` gates them
 e2e/                       the kind harness; smoke.sh is the contract
 ```
 

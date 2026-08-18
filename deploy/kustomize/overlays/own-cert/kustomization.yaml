@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+# Bring your own pair: drop the PEMs beside this file as tls.crt /
+# tls.key / ca.crt (the README shows an openssl one-liner), and the
+# generator below ships them as the Secret the deployment mounts.
+secretGenerator:
+  - name: dynamic-config-webhook-tls
+    namespace: dynamic-config
+    type: kubernetes.io/tls
+    files:
+      - tls.crt
+      - tls.key
+      - ca.crt
+    options:
+      disableNameSuffixHash: true
+# The webhook configuration must trust the same CA; kustomize cannot
+# read a file into a patch, so this one field is a post-apply one-liner
+# (README, step 3):
+#   kubectl patch mutatingwebhookconfiguration dynamic-config --type=json \
+#     -p "[{'op':'add','path':'/webhooks/0/clientConfig/caBundle','value':'$(base64 -w0 ca.crt)'}]"

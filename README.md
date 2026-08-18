@@ -21,6 +21,7 @@ Three pieces, staged shippable:
 |---|---|---|
 | `dynamic-config-agent` | 0.1.0 | init/sidecar binary: store → resolved document → atomic file, any format — `.properties` and `.ini` included. Six stores (consul, vault, config-server, firestore, git, redis), every auth method each store takes |
 | `dynamic-config-webhook` | 0.2.0 | the mutating admission webhook that writes the agent into annotated pods; terminates its own TLS (chart-minted certificate by default, cert-manager optional) |
+| `deploy/` | — | the chart (full values reference in its README), the kustomize base + overlays, and the CRDs — one generated source, three drift-gated copies |
 | `examples/` | — | thirteen ready-to-apply manifests: every store, every auth method, the native-sidecar Job, the template that renders an env file |
 | `dynamic-config-operator` | 0.3.0 | `DynamicConfigClass` (store bundles) and `DynamicConfigRender` (store → ConfigMap, for sidecar-averse workloads) |
 
