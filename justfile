@@ -18,10 +18,20 @@ test:
 crds:
     cargo run -p dynamic-config-operator -- --crds > /tmp/crds-now.json
     diff -u deploy/crds.json /tmp/crds-now.json
+    # The split copies (each file one VALID json doc — which is also
+    # valid YAML) feed helm's crds/ dir and the kustomize base. Drift
+    # in either is drift.
+    python3 scripts/split-crds.py /tmp/crds-now.json /tmp/crds-split
+    diff -ur deploy/crds /tmp/crds-split
+    diff -ur deploy/helm/crds /tmp/crds-split
+    diff -ur deploy/kustomize/base/crds /tmp/crds-split
 
 # Regenerate after a deliberate CRD change.
 crds-write:
     cargo run -p dynamic-config-operator -- --crds > deploy/crds.json
+    python3 scripts/split-crds.py deploy/crds.json deploy/crds
+    python3 scripts/split-crds.py deploy/crds.json deploy/helm/crds
+    python3 scripts/split-crds.py deploy/crds.json deploy/kustomize/base/crds
 
 images:
     docker build -f docker/Dockerfile.agent -t dynamic-config-agent:dev .

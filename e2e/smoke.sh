@@ -29,11 +29,16 @@ else
   extra=()
 fi
 
+# Into its OWN namespace, as production does: the webhook configuration
+# excludes the release namespace to keep the webhook from selecting its
+# own pods — install into `default` and that exclusion swallows every
+# workload beside it.
 helm install dynamic-config deploy/helm \
+  --namespace dynamic-config --create-namespace \
   --set webhook.image=dynamic-config-webhook --set webhook.tag=dev \
   --set agent.image=dynamic-config-agent --set agent.tag=dev \
   "${extra[@]}"
-kubectl rollout status deploy/dynamic-config-webhook --timeout=180s
+kubectl -n dynamic-config rollout status deploy/dynamic-config-webhook --timeout=180s
 
 # A consul to render from, and a document in it.
 kubectl apply -f e2e/consul.yaml
@@ -42,6 +47,18 @@ kubectl exec deploy/consul -- consul kv put myapp/config.json '{"host": "db.inte
 
 # The pod that asks.
 kubectl apply -f e2e/annotated-pod.yaml
+
+# On failure, say WHY before the trap tears the evidence down.
+diagnose() {
+  echo "════ the pod's containers:"
+  kubectl get pod annotated -o jsonpath='{.spec.initContainers[*].name} | {.spec.containers[*].name}'; echo
+  echo "════ webhook logs:"
+  kubectl -n dynamic-config logs deploy/dynamic-config-webhook --tail=30 || true
+  echo "════ recent events:"
+  kubectl get events --sort-by=.lastTimestamp | tail -12
+}
+trap 'diagnose; kind delete cluster --name "$cluster"' EXIT
+
 kubectl wait --for=condition=Ready pod/annotated --timeout=180s
 
 # The claim: the sidecar rendered the file where the annotation said.

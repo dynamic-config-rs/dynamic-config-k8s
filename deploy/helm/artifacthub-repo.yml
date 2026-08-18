@@ -1,0 +1,13 @@
+# ArtifactHub repository metadata. Publish path (the release round that
+# ships the chart): push the packaged chart to ghcr as OCI, then push
+# this file beside it —
+#   helm package deploy/helm
+#   helm push dynamic-config-0.1.0.tgz oci://ghcr.io/dynamic-config-rs/charts
+#   oras push ghcr.io/dynamic-config-rs/charts/dynamic-config:artifacthub.io \
+#     artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+# then claim the repo on artifacthub.io and paste the repositoryID it
+# assigns below.
+repositoryID: ""   # filled in when the repository is claimed on artifacthub.io
+owners:
+  - name: Cevat Batuhan Tolon
+    email: tallon1997r@gmail.com

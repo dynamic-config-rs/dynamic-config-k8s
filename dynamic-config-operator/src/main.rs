@@ -9,6 +9,8 @@
 //! their generated schemas, and the reconcile loop's shape — and the
 //! book's Operator chapter tracks what is wired against what is planned.
 
+#![forbid(unsafe_code)]
+
 mod crds;
 
 use tracing::info;

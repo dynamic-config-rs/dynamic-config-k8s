@@ -1,0 +1,14 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dynamic-config-webhook
+  namespace: dynamic-config
+spec:
+  secretName: dynamic-config-webhook-tls
+  dnsNames:
+    - dynamic-config-webhook.dynamic-config.svc
+    - dynamic-config-webhook.dynamic-config
+  issuerRef:
+    # Point at your ClusterIssuer (or change kind to Issuer).
+    name: REPLACE-WITH-YOUR-ISSUER
+    kind: ClusterIssuer

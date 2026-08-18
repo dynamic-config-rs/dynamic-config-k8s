@@ -11,6 +11,29 @@ version — the contract is the API here.
 
 ### Added
 
+- **The deploy surface grew up.** The chart's values now cover the
+  enterprise checklist — naming overrides, common labels/annotations,
+  per-component images with pull policies and digests, service
+  accounts, probe/rollout tuning, service type, objectSelector,
+  cert-manager duration/renewBefore, `extraEnv`/`extraVolumes` escape
+  hatches, operator RBAC toggle — with a full values reference in
+  `deploy/helm/README.md` and install NOTES. CRDs now actually install
+  with the chart (`crds/`), and `deploy/kustomize/` carries the same
+  resources for helm-less shops: a base plus cert-manager and
+  own-cert overlays. One generated CRD source, three drift-gated
+  copies (`just crds`).
+
+### Fixed
+
+- **The webhook silently excluded `default` when installed there.** The
+  self-deadlock guard excludes the release namespace; a chart installed
+  into `default` therefore never injected anything beside it. The e2e
+  smoke now installs into a dedicated namespace as production should,
+  the NOTES warn on a `default` install, and the smoke prints webhook
+  logs and events on failure instead of tearing the evidence down.
+- The operator image build pinned `enum-ordinalize` back to the 1.88
+  line the images build with.
+
 - **Output templating.** `dynamic-config.rs/template` (inline) and
   `template-configmap` (mounted, re-read every render) put a minijinja
   template between the resolved document and the file — env files,

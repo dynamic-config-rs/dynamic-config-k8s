@@ -1,0 +1,99 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "dynamicconfigrenders.dynamic-config.rs"
+  },
+  "spec": {
+    "group": "dynamic-config.rs",
+    "names": {
+      "categories": [],
+      "kind": "DynamicConfigRender",
+      "plural": "dynamicconfigrenders",
+      "shortNames": [],
+      "singular": "dynamicconfigrender"
+    },
+    "scope": "Namespaced",
+    "versions": [
+      {
+        "additionalPrinterColumns": [],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for DynamicConfigRenderSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "A store document reconciled into a ConfigMap, for workloads that cannot take a sidecar.",
+                "properties": {
+                  "class": {
+                    "description": "The class naming the store.",
+                    "type": "string"
+                  },
+                  "interval_seconds": {
+                    "default": 15,
+                    "description": "Poll interval, seconds.",
+                    "format": "uint64",
+                    "minimum": 0.0,
+                    "type": "integer"
+                  },
+                  "key": {
+                    "description": "The document's key in the store.",
+                    "type": "string"
+                  },
+                  "target": {
+                    "description": "The ConfigMap to write, and the file name inside it (its extension picks the rendered format).",
+                    "properties": {
+                      "config_map": {
+                        "type": "string"
+                      },
+                      "file": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "config_map",
+                      "file"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "class",
+                  "key",
+                  "target"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "nullable": true,
+                "properties": {
+                  "last_error": {
+                    "description": "The last failure, kind and path only \u2014 never a value, the same redaction rule as everywhere else in the organisation.",
+                    "nullable": true,
+                    "type": "string"
+                  },
+                  "rendered_at": {
+                    "description": "The last generation successfully rendered, and when.",
+                    "nullable": true,
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "DynamicConfigRender",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {
+          "status": {}
+        }
+      }
+    ]
+  }
+}

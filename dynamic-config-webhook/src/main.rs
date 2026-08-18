@@ -9,6 +9,8 @@
 //! `/tls` from cert-manager or from its own generated Secret; both look
 //! the same from here.
 
+#![forbid(unsafe_code)]
+
 mod tls;
 
 use std::sync::atomic::{AtomicU64, Ordering};

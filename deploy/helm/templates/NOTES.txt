@@ -1,0 +1,17 @@
+dynamic-config {{ .Chart.AppVersion }} is in.
+
+  webhook   : {{ include "dynamic-config.webhook.fullname" . }}.{{ .Release.Namespace }}.svc (failurePolicy: {{ .Values.webhook.failurePolicy }})
+  TLS       : {{ if .Values.webhook.certManager.enabled }}cert-manager ({{ .Values.webhook.certManager.issuerRef.name }}){{ else }}chart-minted, Secret reused across upgrades{{ end }}
+  gating    : {{ if .Values.webhook.namespaceGating }}namespaces labeled dynamic-config.rs/injection=enabled{{ else }}all namespaces except the excluded{{ end }}
+  operator  : {{ if .Values.operator.enabled }}enabled{{ else }}disabled (CRDs installed regardless){{ end }}
+
+Annotate a pod and read the file back:
+
+  kubectl annotate pod/POD dynamic-config.rs/inject=true ...   # the book: https://dynamic-config-rs.github.io/k8s/
+
+{{- if eq .Release.Namespace "default" }}
+
+WARNING: installed into `default`. The webhook never selects its own
+namespace, so pods in `default` will NOT be injected. Install into a
+dedicated namespace (helm install -n dynamic-config --create-namespace).
+{{- end }}

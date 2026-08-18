@@ -1,9 +1,28 @@
-# The images. Digest-pin in production (set `digest`, which wins over
-# `tag`); the chart refuses `latest` outright.
+# dynamic-config: the injector chart.
+#
+# Every value the templates read, in the order an operator meets them.
+# The full reference with defaults and prose lives in this chart's
+# README.md; the book's Install and Security pages carry the trades.
+
+# ── Naming ───────────────────────────────────────────────────────────
+# Resource names default to fixed, cluster-recognisable ones
+# ("dynamic-config-webhook"); override only when running two releases
+# side by side.
+nameOverride: ""
+fullnameOverride: ""
+
+# Labels/annotations stamped on EVERY resource this chart renders.
+commonLabels: {}
+commonAnnotations: {}
+
+# Pull credentials for private registries, applied to every component.
+imagePullSecrets: []
+
+# ── The agent (what gets injected) ───────────────────────────────────
 agent:
   image: ghcr.io/dynamic-config-rs/dynamic-config-agent
   tag: "0.1.0"
-  digest: ""
+  digest: ""            # wins over tag when set — pin in production
   # Fleet-wide defaults for every injected container; the
   # `agent-cpu-request` (etc.) annotations still override per pod.
   # cpuLimit stays empty on purpose — throttling a config agent buys
@@ -14,10 +33,12 @@ agent:
     memoryLimit: 64Mi
     cpuLimit: ""
 
+# ── The webhook ──────────────────────────────────────────────────────
 webhook:
   image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
   tag: "0.1.0"
   digest: ""
+  imagePullPolicy: IfNotPresent
   replicas: 2
 
   # The port the webhook binds. `hostNetwork: true` is for clusters
@@ -25,46 +46,79 @@ webhook:
   # networking is the usual case) — pick a collision-free port there.
   port: 8443
   hostNetwork: false
+  # Only meaningful with hostNetwork; ClusterFirstWithHostNet keeps
+  # in-cluster DNS working from the host network namespace.
+  dnsPolicy: ""
+
+  serviceAccount:
+    create: true
+    name: ""            # defaults to the webhook's fullname
+    annotations: {}
 
   # How the webhook gets its serving certificate.
   #
   # `certManager.enabled: false` (the default) — the chart generates a
-  # CA and a ten-year certificate at install time, embeds the caBundle
-  # in the webhook configuration, and reuses the Secret on upgrade. No
-  # dependency; rotation happens by reinstalling the Secret (delete it
-  # and upgrade).
+  # CA and a certificate at install time, embeds the caBundle in the
+  # webhook configuration, and reuses the Secret on upgrade. No
+  # dependency; rotate by deleting the Secret and upgrading.
   #
   # `certManager.enabled: true` — cert-manager issues and RENEWS the
   # certificate, cainjector maintains the caBundle, and the webhook
-  # reloads the pair from disk without a restart. The right choice when
-  # cert-manager is already in the cluster.
+  # reloads the pair from disk without a restart.
   certManager:
     enabled: false
     issuerRef:
-      name: ""        # required when enabled: a ClusterIssuer or Issuer
+      name: ""          # required when enabled: a ClusterIssuer or Issuer
       kind: ClusterIssuer
+    duration: ""        # e.g. 2160h; cert-manager's default when empty
+    renewBefore: ""     # e.g. 360h
+  # Days of validity for the self-signed pair (certManager disabled).
+  selfSignedDays: 3650
 
   # `Ignore` fails OPEN: an unreachable webhook lets pods through
   # un-injected, and the pod that asked shows the gap loudly (its file
-  # never appears). `Fail` closes the gap and couples every pod CREATE
-  # in selected namespaces to this webhook's availability. The book's
-  # security page carries the full trade.
+  # never appears). `Fail` closes the gap and couples pod CREATEs in
+  # selected namespaces to this webhook's availability.
   failurePolicy: Ignore
   timeoutSeconds: 5
+  reinvocationPolicy: Never
 
-  # Namespaces the webhook never touches, beyond its own and kube-system.
+  # Namespaces the webhook never touches, beyond its own, kube-system
+  # and kube-node-lease.
   excludeNamespaces: []
-
   # Istio-style opt-in: when true, only namespaces labeled
   #   dynamic-config.rs/injection: enabled
-  # are selected at all. Bounds the blast radius, and makes
-  # `failurePolicy: Fail` a per-namespace promise instead of a
-  # cluster-wide one.
+  # are selected at all — and `failurePolicy: Fail` becomes a
+  # per-namespace promise instead of a cluster-wide one.
   namespaceGating: false
+  # An additional objectSelector for the webhook configuration, verbatim.
+  objectSelector: {}
+
+  service:
+    type: ClusterIP
+    port: 443
+    annotations: {}
 
   resources:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { memory: 64Mi }
+
+  # Probes, tunable per cluster speed; paths and scheme are fixed by
+  # the binary (HTTPS /healthz on `port`).
+  readinessProbe:
+    initialDelaySeconds: 2
+    periodSeconds: 10
+    failureThreshold: 3
+  livenessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 20
+    failureThreshold: 3
+
+  # Rollout shape.
+  strategy: {}          # verbatim `spec.strategy` when set
+  revisionHistoryLimit: 10
+  minReadySeconds: 0
+  terminationGracePeriodSeconds: 30
 
   # Spread the replicas; soft, so single-node clusters still schedule.
   topologySpread: true
@@ -77,6 +131,12 @@ webhook:
   tolerations: []
   affinity: {}
   podAnnotations: {}
+  podLabels: {}
+
+  # Escape hatches, rendered verbatim into the webhook container/pod.
+  extraEnv: []          # e.g. [{ name: RUST_LOG, value: debug }]
+  extraVolumeMounts: []
+  extraVolumes: []
 
 # The webhook needs no egress at all and only the API server calls in;
 # this policy writes both facts down. Off by default because a cluster
@@ -84,14 +144,26 @@ webhook:
 networkPolicy:
   enabled: false
 
-# Pull credentials for private registries, applied to every component.
-imagePullSecrets: []
-
+# ── The operator (0.3.0's half; the CRDs install either way) ─────────
 operator:
-  enabled: false      # 0.3.0's half; the CRDs install either way
+  enabled: false
   image: ghcr.io/dynamic-config-rs/dynamic-config-operator
   tag: "0.1.0"
   digest: ""
+  imagePullPolicy: IfNotPresent
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  rbac:
+    create: true
   resources:
     requests: { cpu: 10m, memory: 32Mi }
     limits: { memory: 128Mi }
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podLabels: {}
+  extraEnv: []

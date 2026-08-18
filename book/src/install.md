@@ -67,6 +67,38 @@ replicas ride a PodDisruptionBudget, and `tag: latest` fails the
 render. An optional NetworkPolicy writes down that the webhook accepts
 the API server and calls nobody.
 
+## One namespace of its own
+
+Install into a dedicated namespace, always:
+
+```sh
+helm install dynamic-config deploy/helm -n dynamic-config --create-namespace
+```
+
+The webhook configuration excludes its own namespace by name — the
+self-deadlock guard — so a release installed into `default` silently
+excludes every workload sharing `default` with it. The chart's NOTES
+print a warning when that happens; the e2e smoke installs the dedicated
+way for the same reason.
+
+## Values, all of them
+
+The [chart README](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/deploy/helm/README.md)
+is the full values reference — naming overrides, common labels,
+per-component images and pull policy, service accounts, probe and
+rollout tuning, `extraEnv`/`extraVolumes` escape hatches, namespace
+gating, the operator's RBAC toggle. Everything the templates read is in
+that table.
+
+## Without helm: kustomize
+
+`deploy/kustomize/` carries the same resources as a base plus two TLS
+overlays — cert-manager, and bring-your-own-PEMs via `secretGenerator`.
+Its [README](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/deploy/kustomize/README.md)
+is the three-step walkthrough, including the one `caBundle` patch
+kustomize cannot express. The CRDs ship inside the base, drift-gated
+against the operator's `--crds` output like every other copy.
+
 ## The smoke test
 
 The e2e smoke (`e2e/smoke.sh`) is the install, end to end, against a

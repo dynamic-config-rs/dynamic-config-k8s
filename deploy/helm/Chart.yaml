@@ -1,6 +1,58 @@
 apiVersion: v2
 name: dynamic-config
-description: The dynamic-config Kubernetes integration — webhook-injected agent, and the operator's CRDs
+description: >-
+  The dynamic-config Kubernetes integration: a mutating webhook that
+  reads dynamic-config.rs/* annotations and injects a rendering agent —
+  six configuration stores, every auth method each store takes, output
+  templating — plus the operator's CRDs. Zero dependencies by default:
+  the chart mints its own webhook certificate; cert-manager is optional.
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+home: https://dynamic-config-rs.github.io/k8s/
+sources:
+  - https://github.com/dynamic-config-rs/dynamic-config-k8s
+  - https://github.com/dynamic-config-rs/dynamic-config
+keywords:
+  - configuration
+  - hot-reload
+  - vault
+  - consul
+  - injector
+  - mutating-webhook
+  - sidecar
+maintainers:
+  - name: Cevat Batuhan Tolon
+    url: https://github.com/dynamic-config-rs
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: integration-delivery
+  artifacthub.io/operator: "false"
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/prerelease: "true"
+  artifacthub.io/crds: |
+    - kind: DynamicConfigClass
+      version: v1alpha1
+      name: dynamicconfigclasses.dynamic-config.rs
+      displayName: DynamicConfigClass
+      description: A named store-plus-auth bundle pods reference instead of repeating endpoints (reconcilers land in 0.3.0).
+    - kind: DynamicConfigRender
+      version: v1alpha1
+      name: dynamicconfigrenders.dynamic-config.rs
+      displayName: DynamicConfigRender
+      description: A rendered document reconciled into a ConfigMap, for workloads that must not carry a sidecar (0.3.0).
+  artifacthub.io/images: |
+    - name: dynamic-config-webhook
+      image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:0.1.0
+    - name: dynamic-config-agent
+      image: ghcr.io/dynamic-config-rs/dynamic-config-agent:0.1.0
+    - name: dynamic-config-operator
+      image: ghcr.io/dynamic-config-rs/dynamic-config-operator:0.1.0
+  artifacthub.io/links: |
+    - name: The book (annotation contract, stores, security posture)
+      url: https://dynamic-config-rs.github.io/k8s/
+    - name: Values reference
+      url: https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/deploy/helm/README.md
+    - name: Deploying without helm (kustomize)
+      url: https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/deploy/kustomize/README.md
