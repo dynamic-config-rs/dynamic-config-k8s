@@ -1,0 +1,80 @@
+{{- if .Values.operator.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dynamic-config-operator
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+---
+# Least privilege for what the 0.3.0 reconcilers will do: watch the two
+# CRDs, own the ConfigMaps they render, record events. Nothing cluster-
+# shaping — no pods, no secrets beyond reads the classes name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dynamic-config-operator
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["dynamic-config.rs"]
+    resources: ["dynamicconfigclasses", "dynamicconfigrenders"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["dynamic-config.rs"]
+    resources: ["dynamicconfigrenders/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dynamic-config-operator
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dynamic-config-operator
+subjects:
+  - kind: ServiceAccount
+    name: dynamic-config-operator
+    namespace: "{{ .Release.Namespace }}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-config-operator
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dynamic-config
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels: {{- include "dynamic-config.labels" . | nindent 8 }}
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: dynamic-config-operator
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: {{ include "dynamic-config.image" .Values.operator | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
+          resources: {{- toYaml .Values.operator.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,243 @@
+{{/*
+Everything that must agree on one certificate lives in this one file,
+computed once: the Secret, the Deployment's rollout checksum and the
+webhook configuration's caBundle. Three separate templates would each
+call the generator and mint three different CAs.
+*/}}
+{{- $tls := dict }}
+{{- if not .Values.webhook.certManager.enabled }}
+{{- $tls = include "dynamic-config.selfSignedTls" . | fromYaml }}
+{{- end }}
+{{- if .Values.webhook.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  secretName: dynamic-config-webhook-tls
+  dnsNames:
+    - dynamic-config-webhook.{{ .Release.Namespace }}.svc
+    - dynamic-config-webhook.{{ .Release.Namespace }}
+  issuerRef:
+    name: {{ required "webhook.certManager.issuerRef.name is required when certManager is enabled" .Values.webhook.certManager.issuerRef.name }}
+    kind: {{ .Values.webhook.certManager.issuerRef.kind }}
+{{- else }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dynamic-config-webhook-tls
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $tls.crt }}
+  tls.key: {{ $tls.key }}
+  ca.crt: {{ $tls.ca }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+# The webhook talks to nobody — not even the API server. A token it
+# does not hold is a token nothing can steal.
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.webhook.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dynamic-config
+      app.kubernetes.io/component: webhook
+  template:
+    metadata:
+      labels: {{- include "dynamic-config.labels" . | nindent 8 }}
+        app.kubernetes.io/component: webhook
+      {{- if or (not .Values.webhook.certManager.enabled) .Values.webhook.podAnnotations }}
+      annotations:
+        {{- if not .Values.webhook.certManager.enabled }}
+        # Roll the pods when the generated certificate changes; the
+        # webhook also reloads from disk, this covers the fresh-install
+        # race where the Secret lands after the pod started.
+        checksum/tls: {{ $tls.crt | sha256sum }}
+        {{- end }}
+        {{- with .Values.webhook.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: dynamic-config-webhook
+      automountServiceAccountToken: false
+      {{- if .Values.webhook.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.webhook.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.webhook.topologySpread }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: dynamic-config
+              app.kubernetes.io/component: webhook
+      {{- end }}
+      {{- with .Values.webhook.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: webhook
+          image: {{ include "dynamic-config.image" .Values.webhook | quote }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DYNAMIC_CONFIG_AGENT_IMAGE
+              value: {{ include "dynamic-config.image" .Values.agent | quote }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
+              value: "0.0.0.0:{{ .Values.webhook.port }}"
+            - name: DYNAMIC_CONFIG_AGENT_CPU_REQUEST
+              value: {{ .Values.agent.defaults.cpuRequest | quote }}
+            - name: DYNAMIC_CONFIG_AGENT_MEMORY_REQUEST
+              value: {{ .Values.agent.defaults.memoryRequest | quote }}
+            - name: DYNAMIC_CONFIG_AGENT_MEMORY_LIMIT
+              value: {{ .Values.agent.defaults.memoryLimit | quote }}
+            {{- with .Values.agent.defaults.cpuLimit }}
+            - name: DYNAMIC_CONFIG_AGENT_CPU_LIMIT
+              value: {{ . | quote }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.webhook.port }}
+              name: https
+          volumeMounts:
+            - { name: tls, mountPath: /tls, readOnly: true }
+          securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
+          resources: {{- toYaml .Values.webhook.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.webhook.port }}, scheme: HTTPS }
+            initialDelaySeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.webhook.port }}, scheme: HTTPS }
+            periodSeconds: 20
+      volumes:
+        - name: tls
+          secret:
+            secretName: dynamic-config-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: dynamic-config
+    app.kubernetes.io/component: webhook
+  ports:
+    - port: 443
+      targetPort: {{ .Values.webhook.port }}
+{{- if .Values.webhook.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.webhook.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dynamic-config
+      app.kubernetes.io/component: webhook
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# Both facts about the webhook's traffic, written down: only the API
+# server calls in (it has no stable selector, so the ingress rule is
+# port-shaped), and nothing goes out at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dynamic-config-webhook
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dynamic-config
+      app.kubernetes.io/component: webhook
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: {{ .Values.webhook.port }}
+          protocol: TCP
+  egress: []
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: dynamic-config
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- if .Values.webhook.certManager.enabled }}
+  annotations:
+    cert-manager.io/inject-ca-from: "{{ .Release.Namespace }}/dynamic-config-webhook"
+  {{- end }}
+webhooks:
+  - name: inject.dynamic-config.rs
+    clientConfig:
+      {{- if not .Values.webhook.certManager.enabled }}
+      caBundle: {{ $tls.ca }}
+      {{- end }}
+      service:
+        name: dynamic-config-webhook
+        namespace: "{{ .Release.Namespace }}"
+        path: /mutate
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    # Never the control plane's namespaces, never this chart's own — a
+    # webhook that can select its own pods can deadlock its own rollout.
+    namespaceSelector:
+      matchExpressions:
+        {{- if .Values.webhook.namespaceGating }}
+        - key: dynamic-config.rs/injection
+          operator: In
+          values: [enabled]
+        {{- end }}
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - kube-node-lease
+            - {{ .Release.Namespace }}
+            {{- range .Values.webhook.excludeNamespaces }}
+            - {{ . }}
+            {{- end }}
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    matchPolicy: Equivalent
+    reinvocationPolicy: Never
+    admissionReviewVersions: ["v1"]
+    sideEffects: None

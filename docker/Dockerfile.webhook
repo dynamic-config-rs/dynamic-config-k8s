@@ -1,0 +1,13 @@
+# The agent: one static-ish binary on distroless. Build with the
+# workspace as context:
+#   docker build -f docker/Dockerfile.webhook -t dynamic-config-webhook .
+FROM rust:1.88-slim AS build
+WORKDIR /src
+COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && cargo build --release -p dynamic-config-webhook
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /src/target/release/dynamic-config-webhook /usr/local/bin/
+USER nonroot
+ENTRYPOINT ["dynamic-config-webhook"]

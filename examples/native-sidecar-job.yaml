@@ -1,0 +1,25 @@
+# A Job whose pod wants live configuration: with a classic sidecar the
+# Job never finishes (the sidecar keeps Running); with
+# `native-sidecar: "true"` (Kubernetes 1.29+) the watcher is an init
+# container with restartPolicy Always — started before the work,
+# stopped after it, and the Job completes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-rebill
+spec:
+  template:
+    metadata:
+      annotations:
+        dynamic-config.rs/inject: "true"
+        dynamic-config.rs/source: "consul"
+        dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+        dynamic-config.rs/key: "myapp/config.json"
+        dynamic-config.rs/path: "/config/rendered.toml"
+        dynamic-config.rs/mode: "both"
+        dynamic-config.rs/native-sidecar: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: myapp-batch:1

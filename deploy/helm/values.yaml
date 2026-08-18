@@ -1,0 +1,97 @@
+# The images. Digest-pin in production (set `digest`, which wins over
+# `tag`); the chart refuses `latest` outright.
+agent:
+  image: ghcr.io/dynamic-config-rs/dynamic-config-agent
+  tag: "0.1.0"
+  digest: ""
+  # Fleet-wide defaults for every injected container; the
+  # `agent-cpu-request` (etc.) annotations still override per pod.
+  # cpuLimit stays empty on purpose — throttling a config agent buys
+  # nothing and delays reloads.
+  defaults:
+    cpuRequest: 10m
+    memoryRequest: 32Mi
+    memoryLimit: 64Mi
+    cpuLimit: ""
+
+webhook:
+  image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
+  tag: "0.1.0"
+  digest: ""
+  replicas: 2
+
+  # The port the webhook binds. `hostNetwork: true` is for clusters
+  # whose CNI keeps the API server off the pod network (EKS custom
+  # networking is the usual case) — pick a collision-free port there.
+  port: 8443
+  hostNetwork: false
+
+  # How the webhook gets its serving certificate.
+  #
+  # `certManager.enabled: false` (the default) — the chart generates a
+  # CA and a ten-year certificate at install time, embeds the caBundle
+  # in the webhook configuration, and reuses the Secret on upgrade. No
+  # dependency; rotation happens by reinstalling the Secret (delete it
+  # and upgrade).
+  #
+  # `certManager.enabled: true` — cert-manager issues and RENEWS the
+  # certificate, cainjector maintains the caBundle, and the webhook
+  # reloads the pair from disk without a restart. The right choice when
+  # cert-manager is already in the cluster.
+  certManager:
+    enabled: false
+    issuerRef:
+      name: ""        # required when enabled: a ClusterIssuer or Issuer
+      kind: ClusterIssuer
+
+  # `Ignore` fails OPEN: an unreachable webhook lets pods through
+  # un-injected, and the pod that asked shows the gap loudly (its file
+  # never appears). `Fail` closes the gap and couples every pod CREATE
+  # in selected namespaces to this webhook's availability. The book's
+  # security page carries the full trade.
+  failurePolicy: Ignore
+  timeoutSeconds: 5
+
+  # Namespaces the webhook never touches, beyond its own and kube-system.
+  excludeNamespaces: []
+
+  # Istio-style opt-in: when true, only namespaces labeled
+  #   dynamic-config.rs/injection: enabled
+  # are selected at all. Bounds the blast radius, and makes
+  # `failurePolicy: Fail` a per-namespace promise instead of a
+  # cluster-wide one.
+  namespaceGating: false
+
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 64Mi }
+
+  # Spread the replicas; soft, so single-node clusters still schedule.
+  topologySpread: true
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  priorityClassName: ""
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# The webhook needs no egress at all and only the API server calls in;
+# this policy writes both facts down. Off by default because a cluster
+# without a network plugin enforcing policies silently ignores it.
+networkPolicy:
+  enabled: false
+
+# Pull credentials for private registries, applied to every component.
+imagePullSecrets: []
+
+operator:
+  enabled: false      # 0.3.0's half; the CRDs install either way
+  image: ghcr.io/dynamic-config-rs/dynamic-config-operator
+  tag: "0.1.0"
+  digest: ""
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 128Mi }

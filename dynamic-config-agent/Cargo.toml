@@ -1,0 +1,31 @@
+[package]
+name = "dynamic-config-agent"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Init-container and sidecar: renders dynamic-config documents from remote stores to files a pod reads"
+publish = false   # ships as an image, not a crate
+
+[dependencies]
+dynamic-config = { workspace = true, features = ["json", "toml", "yaml", "ini", "properties", "watch", "tracing"] }
+dynamic-config-consul = { workspace = true }
+dynamic-config-vault = { workspace = true }
+dynamic-config-server = { workspace = true }
+dynamic-config-firestore = { workspace = true }
+dynamic-config-store-core = { workspace = true }
+minijinja = { workspace = true }
+dynamic-config-git = { workspace = true }
+dynamic-config-redis = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+serde_yaml = "0.9"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

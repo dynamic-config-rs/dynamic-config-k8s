@@ -1,0 +1,25 @@
+# A static Vault token: the method every tutorial starts with, and the
+# only one that cannot log in again when it dies. Fine for a first run;
+# vault-kubernetes.yaml is the shape to grow into.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token
+stringData:
+  token: REPLACE-WITH-A-TOKEN
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "vault"
+    dynamic-config.rs/endpoint: "https://vault.vault.svc:8200"
+    dynamic-config.rs/key: "secret/myapp"
+    dynamic-config.rs/path: "/config/rendered.yaml"
+    dynamic-config.rs/token-secret: "vault-token/token"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

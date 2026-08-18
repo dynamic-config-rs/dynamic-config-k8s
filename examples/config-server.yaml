@@ -1,0 +1,26 @@
+# The aggregation front: the server holds the store credentials once
+# and speaks all nine stores — including etcd, NATS and S3, which reach
+# the agent directly in 0.2.0. The pod holds one short client token
+# scoped to one application.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: config-server-token
+stringData:
+  token: REPLACE-WITH-A-CLIENT-TOKEN-32-BYTES-MIN
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "config-server"
+    dynamic-config.rs/endpoint: "http://config-server.infra.svc:8888"
+    dynamic-config.rs/key: "billing/prod"
+    dynamic-config.rs/path: "/config/rendered.json"
+    dynamic-config.rs/token-secret: "config-server-token/token"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

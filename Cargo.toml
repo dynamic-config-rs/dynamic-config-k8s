@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "dynamic-config-agent",
+    "dynamic-config-webhook",
+    "dynamic-config-operator",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/dynamic-config-rs/dynamic-config-k8s"
+homepage = "https://dynamic-config-rs.github.io/k8s/"
+authors = ["Cevat Batuhan Tolon"]
+
+[workspace.dependencies]
+# The engine, for resolving; the stores, for fetching. Carets: the agent
+# is an application, and an engine patch should reach it on rebuild.
+dynamic-config = { version = "0.7", default-features = false }
+dynamic-config-consul = "0.7"
+dynamic-config-vault = "0.7"
+dynamic-config-server = { version = "0.7", default-features = false, features = ["client", "tls"] }
+dynamic-config-firestore = "0.7"
+dynamic-config-store-core = "0.7"
+minijinja = "2"
+dynamic-config-git = "0.7"
+dynamic-config-redis = { version = "0.7", features = ["tls"] }
+serde = { version = "1.0.221", features = ["derive"] }
+serde_json = "1.0.127"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# ── 0.7 TRAIN, DEVELOPMENT ONLY ─────────────────────────────────────────
+# Same arrangement and guard as the bindings: built against engine API

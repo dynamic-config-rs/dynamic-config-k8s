@@ -1,0 +1,34 @@
+# Git over SSH with a read-only deploy key. Two things to know:
+#
+# 1. The Secret type is kubernetes.io/ssh-auth, whose one key is
+#    `ssh-privatekey`; the webhook mounts it 0400 because ssh refuses
+#    group-readable keys, and `auth: ssh-key` is implied.
+# 2. The STOCK agent image has no ssh client (distroless). Build the
+#    one-liner image from the book's Git page and point the chart's
+#    `agent.image` at it — HTTPS token auth needs none of this.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: config-deploy-key
+type: kubernetes.io/ssh-auth
+stringData:
+  ssh-privatekey: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    REPLACE-WITH-A-DEPLOY-KEY
+    -----END OPENSSH PRIVATE KEY-----
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "git"
+    dynamic-config.rs/endpoint: "git@github.com:acme/config.git"
+    dynamic-config.rs/key: "billing/prod.yaml"
+    dynamic-config.rs/path: "/config/rendered.yaml"
+    dynamic-config.rs/ssh-secret: "config-deploy-key"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

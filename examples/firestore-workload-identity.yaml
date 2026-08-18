@@ -1,0 +1,24 @@
+# Firestore through GKE Workload Identity: zero distributed secret. The
+# service account below must be annotated with its GCP pairing:
+#
+#   kubectl annotate serviceaccount billing \
+#     iam.gke.io/gcp-service-account=billing-reader@acme-prod.iam.gserviceaccount.com
+#
+# `auth` is omitted — metadata-server is firestore's default. Init
+# mode: render once before the app starts, no sidecar afterwards.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "firestore"
+    dynamic-config.rs/endpoint: "acme-prod"
+    dynamic-config.rs/key: "config/billing"
+    dynamic-config.rs/path: "/config/rendered.json"
+    dynamic-config.rs/mode: "init"
+spec:
+  serviceAccountName: billing
+  containers:
+    - name: app
+      image: myapp:1

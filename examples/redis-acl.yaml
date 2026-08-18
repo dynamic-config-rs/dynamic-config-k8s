@@ -1,0 +1,26 @@
+# Redis credentials live in the url and nowhere else — so the WHOLE
+# address is the secret, and `endpoint-secret` replaces `endpoint`.
+# Server side, a read-only ACL user scoped to the config prefix:
+#
+#   ACL SETUSER config-reader on >s3cr3t ~myapp/* +get resetchannels
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-url
+stringData:
+  url: "redis://config-reader:REPLACE-PASSWORD@redis.infra.svc:6379/0"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "redis"
+    dynamic-config.rs/endpoint-secret: "redis-url/url"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

@@ -1,0 +1,30 @@
+# AppRole, the two-halves pattern: the role id is public and rides an
+# annotation; the secret id is the second secret slot and rides a
+# Secret into DYNAMIC_CONFIG_AGENT_PASSWORD — which has no flag
+# equivalent, on purpose.
+#
+#   vault write -f -field=secret_id auth/approle/role/myapp/secret-id
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-approle
+stringData:
+  secret-id: REPLACE-WITH-THE-SECRET-ID
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "vault"
+    dynamic-config.rs/endpoint: "https://vault.vault.svc:8200"
+    dynamic-config.rs/key: "secret/myapp"
+    dynamic-config.rs/path: "/config/rendered.yaml"
+    dynamic-config.rs/auth: "approle"
+    dynamic-config.rs/auth-role: "REPLACE-WITH-THE-ROLE-ID"
+    dynamic-config.rs/password-secret: "vault-approle/secret-id"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

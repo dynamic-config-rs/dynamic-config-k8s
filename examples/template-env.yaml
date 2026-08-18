@@ -1,0 +1,34 @@
+# Output templating: the application wants an env file, not a config
+# document. The template lives in a ConfigMap — reviewed and versioned
+# like the code it effectively is — and the rendered file's extension
+# is free because the template owns the bytes.
+#
+# Typos are safe: `{{ db.hots }}` is a render ERROR (strict undefined),
+# not an empty string, and the running pod keeps its last good file.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: billing-template
+data:
+  template: |
+    DATABASE_URL=postgres://{{ db.user }}@{{ db.host }}:{{ db.port }}/billing
+    {% for h in cache.hosts -%}
+    CACHE_HOST={{ h }}
+    {% endfor -%}
+    BETA={{ flags.beta }}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "consul"
+    dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/app.env"
+    dynamic-config.rs/template-configmap: "billing-template"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

@@ -1,0 +1,16 @@
+# The smallest possible ask: an open Consul (ACLs off, or a default
+# policy that reads), five annotations, no secrets anywhere.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "consul"
+    dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

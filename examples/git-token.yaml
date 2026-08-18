@@ -1,0 +1,28 @@
+# Configuration from a git repository, read at a tag: a GitLab deploy
+# token or GitHub fine-grained PAT with read-only scope on this one
+# repository. The pin means the running fleet moves only when somebody
+# moves the tag — reviews decide, not pushes.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: config-repo-token
+stringData:
+  token: REPLACE-WITH-A-READ-ONLY-TOKEN
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "git"
+    dynamic-config.rs/endpoint: "https://gitlab.acme.dev/platform/config.git"
+    dynamic-config.rs/key: "billing/prod.yaml"
+    dynamic-config.rs/path: "/config/rendered.yaml"
+    dynamic-config.rs/ref: "tag:config-v42"
+    dynamic-config.rs/auth: "token"
+    dynamic-config.rs/token-secret: "config-repo-token/token"
+spec:
+  containers:
+    - name: app
+      image: myapp:1

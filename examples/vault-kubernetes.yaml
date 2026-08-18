@@ -1,0 +1,30 @@
+# The production shape for Vault on Kubernetes: no distributed secret,
+# a role bound to this service account, and the internal CA trusted
+# from a ConfigMap.
+#
+#   vault auth enable kubernetes
+#   vault write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc
+#   vault write auth/kubernetes/role/myapp \
+#     bound_service_account_names=billing \
+#     bound_service_account_namespaces=default \
+#     policies=myapp-read ttl=1h
+#
+#   kubectl create configmap vault-ca --from-file=ca.crt=./internal-ca.pem
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "vault"
+    dynamic-config.rs/endpoint: "https://vault.vault.svc:8200"
+    dynamic-config.rs/key: "secret/myapp"
+    dynamic-config.rs/path: "/config/rendered.yaml"
+    dynamic-config.rs/auth: "kubernetes"
+    dynamic-config.rs/auth-role: "myapp"
+    dynamic-config.rs/ca-configmap: "vault-ca"
+spec:
+  serviceAccountName: billing
+  containers:
+    - name: app
+      image: myapp:1
