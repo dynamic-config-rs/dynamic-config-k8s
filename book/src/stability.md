@@ -11,3 +11,8 @@ history, whatever the rest of the family does.
 - The agent's store list grows additively (etcd, nats and s3 in 0.2.0).
 - The engine dependency is a caret: an engine patch reaches the images
   on rebuild.
+
+The repository's [ROADMAP](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/ROADMAP.md)
+carries the ladder in full — the async stores and etcd's
+two-methods-forever answer, the self-rotating webhook TLS mode and the
+one narrow RBAC it will cost, the operator's reconcilers.
