@@ -39,6 +39,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The agent's etcd store compiles its gRPC stubs at build time.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -50,6 +52,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The agent's etcd store compiles its gRPC stubs at build time.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace
       # The generated CRDs have not drifted from the types.
       - run: |
