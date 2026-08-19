@@ -10,6 +10,8 @@ never the first admission.
 
 ```text
 defaults:  annotation  >  per-store default  >  fleet default  >  built-in
+pins:      a value marked "!" (or under overridable: "false") refuses a
+           DIFFERING annotation — the tiers still fill what pods omit
 gates:     the installer's word is final
 ```
 
@@ -33,17 +35,96 @@ validated with the same rules as the annotation it stands in for:
 | `agent-run-as-user` | `65532` | numeric, `0` refused |
 | `agent-run-as-group` | `65532` | numeric, `0` refused |
 | `metrics-port` | none | a port; a pod opts out of a default with `"0"` |
+| `path` | none | absolute; the rendered file's location |
+| `source` | none | fleet level only (`agent.defaults.source`): one of the nine stores |
 
 Pod-wide knobs (mode, volume, resources, identity, metrics) resolve
 against the DEFAULT render's store; per-render knobs (`watch-seconds`,
 `file-mode`) resolve against [each render's own
 store](annotations.md#several-documents-one-pod).
 
-What is NOT defaultable, on purpose: `source`, `endpoint`, `key` and
-`path`. Those four are the identity of the document a pod reads —
-inject them from configuration and two pods with identical annotations
-could render different files depending on where the webhook runs. A
-default that changes WHAT you read is not a default; it is a surprise.
+And per store, EVERY store-shaped annotation is defaultable — the
+address, the document, the credentials' Secret names, the auth flags,
+the templates:
+
+```text
+endpoint   endpoint-secret   key          token-secret   password-secret
+ca-configmap   tls-secret    ssh-secret   aws-secret     section
+auth   auth-mount   auth-role   auth-username   auth-token-path
+namespace   ref   api-url   template   template-configmap
+```
+
+Each is validated as its annotation would be (`*-secret` values need
+the `<secret-name>/<key>` slash), and the either-or pairs
+(`endpoint`/`endpoint-secret`, `template`/`template-configmap`) resolve
+as a LEVEL: any pod-side answer mutes both installation halves, so a
+pod that chose `endpoint-secret` never inherits a stray plain
+endpoint.
+
+With `source` and `path` at the fleet tier and `endpoint` and `key` in
+a store's tier, the minimal pod is a single line of intent:
+
+```yaml
+metadata:
+  annotations:
+    dynamic-config.rs/inject: "true"
+```
+
+Defaulting `key` deserves a sentence of caution: two pods leaning on
+the same store default read the SAME document. For a shared,
+cluster-wide configuration that is exactly right; for per-app
+documents, leave `key` to the pods.
+
+What stays the pod's alone: `env-inject` and `env-restart` (they name
+a container only the pod knows), `agent-env` (gated per pod), and
+`inject` itself — a default that opts workloads in silently is not a
+default, it is a surprise.
+
+## Pinning: the override mode
+
+Every installation value carries an override rule, and the closest
+word wins:
+
+1. a trailing `!` on the value — **pinned** — or a trailing `?` —
+   **overridable**;
+2. no marker: the STORE's own flag, when its `perStore` group carries
+   `overridable=true|false`;
+3. neither: whatever `agent.defaults.overridable` says (`"true"`
+   unless set otherwise).
+
+A pinned value REFUSES a differing annotation at admission — never
+silently outvotes it, because a value the author wrote and did not
+get is a debugging session. The same value restated passes, which
+keeps migrations painless. Knobs the installation never set are
+untouched by all of this: `overridable: "false"` pins what you SET,
+not the whole contract.
+
+```yaml
+agent:
+  defaults:
+    overridable: "false"        # everything set below is pinned…
+    fileMode: "0640"            # …like this
+    watchSeconds: "30?"         # …except this one, explicitly opened
+    perStore:
+      # A store pins its own group: everything vault-shaped is the
+      # platform team's word, except the watch interval.
+      vault: "overridable=false, endpoint=https://vault.vault.svc:8200, auth=kubernetes, watch-seconds=30?"
+      # And a store can OPEN its group under a strict fleet flag:
+      # consul values stay the pods' even with the "false" above.
+      consul: "overridable=true, endpoint=http://consul.infra.svc:8500"
+```
+
+All three rungs compose per store and per value: a `!` inside an
+`overridable=true` group pins just that value; a `?` inside an
+`overridable=false` group opens just that one. The rule always comes
+from the TIER that supplied the value — a store's flag never pins a
+fleet default.
+
+The pin follows the pair rule too: a pinned `endpoint` also refuses a
+pod that answers with `endpoint-secret` — the address is one decision,
+and it is not the pod's to make. A pinned fleet `source`
+(`source: "consul!"`) refuses pods that name any other store, which is
+the enforcement twin of the `sourceAllow` gate below.
 
 ## Per-store defaults, all nine stores
 
@@ -59,11 +140,14 @@ agent:
     watchSeconds: "30"          # the fleet's floor
     fileMode: "0640"
     perStore:
-      # Local, cheap to poll: tighten the interval.
-      consul: "watch-seconds=10"
-      # Secrets: owner-only file, and the writer's identity pinned so
-      # the app's uid owns what it reads.
-      vault: "file-mode=0400, agent-run-as-user=1000, agent-run-as-group=1000"
+      # Local, cheap to poll: tighten the interval — and the address
+      # is the platform's, PINNED, so pods need not carry it and
+      # cannot point elsewhere.
+      consul: "endpoint=http://consul.infra.svc:8500!, watch-seconds=10"
+      # Secrets: the whole group is the platform team's word
+      # (address, auth, CA), and the file lands owner-only, owned by
+      # the app's uid.
+      vault: "overridable=false, endpoint=https://vault.vault.svc:8200, auth=kubernetes, ca-configmap=vault-ca, file-mode=0400, agent-run-as-user=1000, agent-run-as-group=1000"
       # A JVM config server answers slowly; give the render room.
       config-server: "watch-seconds=20, agent-memory-limit=96Mi"
       # Billed per read: poll gently.
@@ -289,7 +373,7 @@ webhook:
 The source gates decide which STORES a namespace may render from.
 Two lists, because the two postures are different jobs:
 
-- **`sourceAllow`** — empty admits every store everywhere, so an
+- **`sourceAllow`** — empty means `*`: every store, everywhere, so an
   upgrade changes nothing until the installer says so. Non-empty
   flips the posture: ONLY the listed sources pass, per namespace. Use
   it when the store set is policy: payments reads vault and s3,
@@ -355,6 +439,9 @@ users get the one that matters.
 | `agent.defaults.runAsUser` / `.runAsGroup` | `DYNAMIC_CONFIG_AGENT_RUN_AS_USER` / `_GROUP` |
 | `agent.defaults.metricsPort` | `DYNAMIC_CONFIG_AGENT_METRICS_PORT` |
 | `agent.defaults.env` | `DYNAMIC_CONFIG_AGENT_ENV` |
+| `agent.defaults.source` | `DYNAMIC_CONFIG_AGENT_SOURCE` |
+| `agent.defaults.path` | `DYNAMIC_CONFIG_AGENT_PATH` |
+| `agent.defaults.overridable` | `DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE` |
 | `agent.defaults.perStore` | `DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS` |
 | `webhook.agentEnvAllow` | `DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW` |
 | `webhook.sourceAllow` | `DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW` |

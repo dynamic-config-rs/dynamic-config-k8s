@@ -44,7 +44,9 @@ helm install dynamic-config deploy/helm \
   --set agent.image=dynamic-config-agent --set agent.tag=dev \
   --set webhook.agentEnvAllow="default: RUST_LOG" \
   --set webhook.sourceDeny="default: git" \
-  --set agent.defaults.perStore.consul="watch-seconds=7" \
+  --set-string agent.defaults.perStore.consul='watch-seconds=7\,endpoint=http://consul.default.svc:8500!\,key=myapp/config.json' \
+  --set agent.defaults.source="consul" \
+  --set agent.defaults.path="/config/rendered.toml" \
   "${extra[@]}"
 kubectl -n dynamic-config rollout status deploy/dynamic-config-webhook --timeout=180s
 
@@ -149,6 +151,44 @@ kubectl get pod annotated -o json \
 agent=[c for c in pod["spec"]["containers"] if c["name"]=="dynamic-config-agent"][0]; \
 args=agent["args"]; assert args[args.index("--watch")+1]=="7", args'
 echo "STORE DEFAULTS OK: the consul tier set the watch interval"
+
+# The whole-installation tier: a pod that says NOTHING but "inject me"
+# gets source, endpoint, key and path from the installation.
+kubectl apply -f - <<'POD'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minimal
+  annotations:
+    dynamic-config.rs/inject: "true"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+POD
+kubectl wait --for=condition=Ready pod/minimal --timeout=180s
+kubectl exec minimal -c app -- cat /config/rendered.toml | grep 'port = 9000'
+echo "MINIMAL OK: inject-only pod rendered from installation defaults"
+
+# And the pinned endpoint refuses a pod that names another address.
+pinned="$(kubectl apply -f - 2>&1 <<'POD' && echo UNEXPECTED-ADMIT || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pinned-endpoint
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/endpoint: "http://rogue.default.svc:8500"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+POD
+)"
+echo "$pinned" | grep -q "pins it" || { echo "the pin did not hold: $pinned"; exit 1; }
+echo "PIN OK: a pinned endpoint refuses a differing annotation"
 
 trap 'kind delete cluster --name "$cluster"; rm -f "$KUBECONFIG"' EXIT
 echo "SMOKE OK: the annotation became a file inside the pod"

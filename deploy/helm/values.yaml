@@ -60,11 +60,32 @@ agent:
     # allowlist applies; a pod's own `agent-env` overrides it name by
     # name. Same NAME=value grammar: "HTTPS_PROXY=http://egress:3128"
     env: ""
+    # A fleet default SOURCE and PATH: with these (plus a per-store
+    # endpoint and key below) a pod can deploy knowing nothing but
+    # `inject: "true"`.
+    source: ""
+    path: ""
+    # The default override mode: "true" (the default) lets pod
+    # annotations override installation values; "false" pins every
+    # value the installation SET (knobs it never set stay the pod's).
+    # Per value, a trailing "!" pins and a trailing "?" opens,
+    # whichever way this flag points. A pinned value refuses a
+    # DIFFERING annotation at admission; the same value restated is
+    # fine.
+    overridable: ""
     # Per-STORE defaults, one tier above the fleet's: the value is the
     # same key=value grammar, keys spelled as the annotations spell
-    # them. A pod's annotation still outranks both tiers.
+    # them — EVERY store-shaped annotation is available (endpoint,
+    # endpoint-secret, key, token-secret, password-secret,
+    # ca-configmap, tls-secret, ssh-secret, aws-secret, section, auth,
+    # auth-mount, auth-role, auth-username, auth-token-path, namespace,
+    # ref, api-url, template, template-configmap) plus every knob. A
+    # pod's annotation still outranks both tiers, unless pinned:
+    # "!" pins one value, "?" opens one value, and "overridable=false"
+    # inside a group pins everything THAT store sets — the ladder is
+    # per-value marker > per-store overridable > the flag above.
     #   perStore:
-    #     vault: "watch-seconds=30, file-mode=0640"
+    #     vault: "overridable=false, endpoint=https://vault.vault.svc:8200, auth=kubernetes, watch-seconds=30?"
     #     s3: "agent-memory-limit=128Mi"
     perStore: {}
 

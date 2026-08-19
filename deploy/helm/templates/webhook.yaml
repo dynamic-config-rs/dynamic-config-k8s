@@ -277,6 +277,18 @@ spec:
             - name: DYNAMIC_CONFIG_AGENT_ENV
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.agent.defaults.source }}
+            - name: DYNAMIC_CONFIG_AGENT_SOURCE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.path }}
+            - name: DYNAMIC_CONFIG_AGENT_PATH
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if ne (toString .Values.agent.defaults.overridable) "" }}
+            - name: DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE
+              value: {{ .Values.agent.defaults.overridable | toString | quote }}
+            {{- end }}
             {{- if .Values.agent.defaults.perStore }}
             {{- $groups := list }}
             {{- range $store, $knobs := .Values.agent.defaults.perStore }}

@@ -155,8 +155,11 @@ agent:
     runAsGroup: "1000"
     metricsPort: "9102"    # empty = no metrics; pods opt out with metrics-port "0"
     env: "HTTPS_PROXY=http://egress.infra.svc:3128"  # every agent; pod's agent-env wins per name
+    source: "consul"       # pods may omit source entirely
+    path: "/config/rendered.toml"
+    overridable: ""        # "false" pins every value set here; "!"/"?" per value
     perStore:              # the tier between annotation and fleet
-      vault: "watch-seconds=10, file-mode=0400"
+      vault: "endpoint=https://vault.vault.svc:8200!, auth=kubernetes, watch-seconds=10"
       s3: "agent-memory-limit=128Mi"
 webhook:
   agentEnvAllow: "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"
@@ -166,8 +169,12 @@ webhook:
 
 `perStore` keys are spelled exactly as the annotations spell them
 (`watch-seconds`, not `watchSeconds`) — one grammar for the value,
-whether it arrives per pod, per store, or per fleet. `agent.defaults.env`
-needs no allowlist: the installer owns both the values and the gate.
+whether it arrives per pod, per store, or per fleet — and they cover
+EVERY store-shaped annotation, so a developer can deploy knowing
+nothing but `inject: "true"`. The `!` above PINS the vault address: a
+pod annotating a different endpoint is refused, not silently
+corrected. `agent.defaults.env` needs no allowlist: the installer owns
+both the values and the gate.
 
 Helm's schema refuses a malformed value at render time; the webhook
 re-validates ALL of it at startup and refuses to serve on a typo — so

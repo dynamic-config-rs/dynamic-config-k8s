@@ -182,6 +182,9 @@ verbatim from the tests:
 - a source `sourceDeny` turns off in the pod's namespace, or one
   missing from a non-empty `sourceAllow` — checked on every render,
   named suffixes included
+- an annotation that differs from a PINNED installation value
+  (`!`-marked, or any set value under `overridable: "false"`) — the
+  refusal names both values; restating the pinned value passes
 - any `dynamic-config.rs/*` key the contract does not list
 - `template` and `template-configmap` both set — one template, one
   place
@@ -255,13 +258,17 @@ The middle tiers are the installation's ([the full
 list](install.md#fleet-wide-defaults-validated-at-the-door)): fleet
 defaults cover every knob — resources, `file-mode`, `watch-seconds`,
 `mode`, `volume-medium`, `native-sidecar`, `agent-run-as-user`/`-group`,
-`metrics-port`, and a fleet-wide agent environment — and
-`agent.defaults.perStore` sets the same knobs one store at a time
-(`vault: "watch-seconds=30, file-mode=0640"`). Pod-wide knobs (mode,
+`metrics-port`, `path`, `source`, and a fleet-wide agent environment —
+and `agent.defaults.perStore` sets, one store at a time, the same
+knobs PLUS every store-shaped annotation: `endpoint`, `key`, `auth`
+and its friends, the credential Secrets, the templates. A pod can
+deploy carrying nothing but `inject: "true"`. Pod-wide knobs (mode,
 volume, resources, identity) take the DEFAULT render's store tier;
-per-render knobs (`watch-seconds`, `file-mode`) resolve against each
-render's own store. Every tier is validated with the SAME rules as the
-annotation it stands in for, at webhook startup.
+per-render knobs resolve against each render's own store. Every tier
+is validated with the SAME rules as the annotation it stands in for,
+at webhook startup — and any value can be PINNED (`!`, or
+`overridable: "false"`), refusing a differing annotation instead of
+being overridden by it.
 
 [Installation Defaults and Gates](installation-defaults.md) carries
 the full knob table, a per-store example for all nine stores, and the

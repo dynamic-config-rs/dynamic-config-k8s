@@ -45,7 +45,10 @@ values reference.
 | `agent.defaults.runAsGroup` | `""` | fleet-default agent GID (same rule) |
 | `agent.defaults.metricsPort` | `""` | serve agent metrics on this port by default; pods opt out with `metrics-port: "0"` |
 | `agent.defaults.env` | `""` | fleet-wide agent environment, `NAME=value, …`; a pod's `agent-env` overrides name by name |
-| `agent.defaults.perStore` | `{}` | per-STORE defaults, one tier above the fleet's: `vault: "watch-seconds=30, file-mode=0640"` — keys spelled as the annotations spell them |
+| `agent.defaults.perStore` | `{}` | per-STORE defaults, one tier above the fleet's — every store-shaped annotation (endpoint, auth, ca-configmap, token-secret, key, template, …) plus every knob: `vault: "endpoint=https://vault:8200!, auth=kubernetes"` |
+| `agent.defaults.source` | `""` | fleet default source — a pod may omit `dynamic-config.rs/source` entirely |
+| `agent.defaults.path` | `""` | fleet default rendered-file path |
+| `agent.defaults.overridable` | `""` | `"true"` (default): annotations override installation values; `"false"`: every installation-SET value is pinned. Per store, `overridable=false` inside a `perStore` group pins that store's values; per value, `!` pins and `?` opens — closest word wins. Pinned conflicts are refused at admission |
 | `webhook.agentEnvAllow` | `""` | which `agent-env` names pods may set, per namespace: `"payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"`; empty = refused everywhere |
 | `webhook.sourceAllow` | `""` | which stores pods may use, per namespace (empty = every store everywhere; non-empty = ONLY the listed) |
 | `webhook.sourceDeny` | `""` | stores turned off, per namespace; outranks `sourceAllow` |

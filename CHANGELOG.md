@@ -11,6 +11,22 @@ version — the contract is the API here.
 
 ### Added
 
+- **The whole contract is installable, and any value can be pinned**:
+  per-store defaults now take EVERY store-shaped annotation (endpoint,
+  endpoint-secret, key, the credential Secrets, ca-configmap,
+  tls-secret, ssh-secret, aws-secret, section, the auth flags,
+  namespace, ref, api-url, the templates), and the fleet tier gains
+  `source` and `path` — a pod can deploy carrying nothing but
+  `inject: "true"`. Every installation value carries an override rule:
+  a trailing `!` pins it (a DIFFERING annotation is refused at
+  admission; the same value restated passes), `?` opens it,
+  `overridable=false` inside a `perStore` group pins that one store's
+  values, and `agent.defaults.overridable: "false"` flips the default
+  for every value the installation set — never for knobs it left
+  alone. The closest word wins: value marker, then store flag, then
+  the installation's. Pins
+  follow the either-or pairs: a pinned endpoint also refuses an
+  endpoint-secret answer, so the address cannot be sidestepped.
 - **Source gates, global and per namespace**: `webhook.sourceAllow`
   admits only the stores it names (empty = every store, so upgrades
   change nothing); `webhook.sourceDeny` turns stores off outright and

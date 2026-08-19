@@ -128,6 +128,24 @@
                 "type": "string"
               },
               "description": "Per-store default knobs: {vault: 'watch-seconds=30, file-mode=0640'} \u2014 keys spelled as the annotations spell them."
+            },
+            "source": {
+              "type": "string",
+              "pattern": "^(consul|vault|config-server|firestore|git|redis|etcd|nats|s3)?[!?]?$",
+              "description": "Fleet default source; a pod may then omit dynamic-config.rs/source. '!' pins, '?' opens."
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^(/.*)?[!?]?$",
+              "description": "Fleet default rendered-file path; per-pod path still wins unless pinned."
+            },
+            "overridable": {
+              "type": [
+                "string",
+                "boolean"
+              ],
+              "pattern": "^(true|false)?$",
+              "description": "Default override mode: 'true' (default) = annotations win; 'false' = installation-set values are pinned. Per-value '!'/'?' markers win either way."
             }
           },
           "additionalProperties": false

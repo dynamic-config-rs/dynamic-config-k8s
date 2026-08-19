@@ -59,7 +59,11 @@ spec:
             #   DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP       "1000"
             #   DYNAMIC_CONFIG_AGENT_METRICS_PORT       "9102"
             #   DYNAMIC_CONFIG_AGENT_ENV                "HTTPS_PROXY=http://egress:3128"
-            #   DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS     "vault: watch-seconds=30; s3: file-mode=0640"
+            #   DYNAMIC_CONFIG_AGENT_SOURCE             "consul"   ("!" pins, "?" opens)
+            #   DYNAMIC_CONFIG_AGENT_PATH               "/config/rendered.toml"
+            #   DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE "false"  (pins every set value)
+            #   DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS     "vault: overridable=false, endpoint=https://vault:8200, auth=kubernetes; s3: file-mode=0640?"
+            #     ("!" pins a value, "?" opens one, overridable=false pins a store's group)
             #   DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW  "payments: HTTPS_PROXY; *: RUST_LOG"
             #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW     "payments: vault, s3; *: consul"
             #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY      "sandbox: git"
