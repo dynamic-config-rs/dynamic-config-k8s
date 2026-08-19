@@ -1,4 +1,4 @@
-# The Six, and the Three Waiting
+# The Nine Stores
 
 One page per store the agent speaks, each with the full pod YAML for
 **every** authentication method the store takes — copy, adjust names,
@@ -28,22 +28,22 @@ Common to all six:
   `dynamic-config.rs/ca-configmap`.
 
 Every pairing on these pages also exists as a ready-to-apply manifest
-in the repository's `examples/` directory — thirteen files, each
+in the repository's `examples/` directory — twenty-two manifests plus six real-software walkthroughs, each
 self-contained with its Secret placeholders.
 
-## etcd, NATS, S3 — 0.2.0
+## etcd, NATS, S3 — the async three
 
-The other three store crates exist and work — from the engine, from the
-bindings — but their clients are async, and the 0.1 agent drives the
-blocking `RemoteSource` trait. The agent refuses them by name today:
+Since 0.2.0 the agent drives both of the engine's source traits: the
+blocking six run under a blocking task, and [etcd](etcd.md),
+[NATS](nats.md) and [S3](s3.md) — whose clients are async — are driven
+directly by the agent's own runtime. The 0.1 refusal-by-name retired
+with this.
 
-```text
---source etcd lands in 0.2.0 (its client is async); consul, vault,
-config-server, firestore, git and redis are the 0.1 stores
-```
+The [config server](config-server.md) indirection remains the answer
+to a different question: a fleet of pods that should not each hold
+store credentials — the server holds them once.
 
-Until then, the pattern that works today: put a
-[config server](config-server.md) in front. The server side speaks all
-nine stores including the async three, and the agent speaks the server.
-That indirection is also the answer when a fleet of pods should not
-each hold store credentials — the server holds them once.
+A tenth store — GCP Secret Manager, Azure App Configuration — is a
+compile-time addition with a well-worn path:
+[Adding a Store](adding-a-store.md) walks it end to end, worked example
+included, plus the two no-code compositions that cover the meantime.

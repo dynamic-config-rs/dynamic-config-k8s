@@ -1,0 +1,87 @@
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "clusterdynamicconfigclasses.dynamic-config.rs"
+  },
+  "spec": {
+    "group": "dynamic-config.rs",
+    "names": {
+      "categories": [],
+      "kind": "ClusterDynamicConfigClass",
+      "plural": "clusterdynamicconfigclasses",
+      "shortNames": [],
+      "singular": "clusterdynamicconfigclass"
+    },
+    "scope": "Cluster",
+    "versions": [
+      {
+        "additionalPrinterColumns": [],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for ClusterDynamicConfigClassSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "The cluster-scoped class: the platform team defines stores (and holds their credentials) ONCE, and tenant namespaces reference them by name without ever seeing a credential. The credential Secret lives in an explicitly named namespace, and `namespaces` is the allowlist that keeps \"global\" from meaning \"anyone\".",
+                "properties": {
+                  "endpoint": {
+                    "description": "The store's address.",
+                    "type": "string"
+                  },
+                  "namespaces": {
+                    "description": "Namespaces whose Renders may use this class. Absent means every namespace \u2014 say so on purpose, not by omission.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "nullable": true,
+                    "type": "array"
+                  },
+                  "source": {
+                    "description": "Which store speaks at the other end.",
+                    "type": "string"
+                  },
+                  "tokenSecret": {
+                    "description": "The credential, when the store wants one \u2014 with the namespace it lives in named explicitly, because a cluster-scoped object has no namespace of its own to default to.",
+                    "nullable": true,
+                    "properties": {
+                      "key": {
+                        "default": "token",
+                        "description": "The key inside the Secret; `token` by default.",
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "namespace"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "source"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "ClusterDynamicConfigClass",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {}
+      }
+    ]
+  }
+}

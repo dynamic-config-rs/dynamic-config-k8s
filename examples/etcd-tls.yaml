@@ -1,0 +1,39 @@
+# etcd with TLS client certificates — the method etcd operators already
+# deploy, and the credential IS the certificate. etcd has no Kubernetes
+# auth method to log into; its two native methods are both first-class.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-ca
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    REPLACE-WITH-YOUR-ETCD-CA
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: etcd-client-tls
+type: kubernetes.io/tls
+stringData:
+  tls.crt: REPLACE-WITH-THE-CLIENT-CERTIFICATE
+  tls.key: REPLACE-WITH-ITS-KEY
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "etcd"
+    dynamic-config.rs/endpoint: "https://etcd.infra.svc:2379"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+    dynamic-config.rs/tls-secret: "etcd-client-tls"
+    dynamic-config.rs/ca-configmap: "etcd-ca"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]

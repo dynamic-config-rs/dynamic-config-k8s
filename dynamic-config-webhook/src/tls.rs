@@ -74,6 +74,13 @@ impl Material {
         self.certificate.exists() && self.key.exists()
     }
 
+    /// Whether the pair on disk actually parses into a server config —
+    /// the selfRotate placeholder Secret mounts EMPTY files, so
+    /// existence alone says nothing while the first mint is in flight.
+    pub fn loadable(&self) -> bool {
+        self.load().is_ok()
+    }
+
     fn load(&self) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
         let chain: Vec<CertificateDer<'static>> =
             CertificateDer::pem_file_iter(&self.certificate)?.collect::<Result<_, _>>()?;

@@ -6,9 +6,48 @@
 //! already refused every wrong combination, so the `expect`s below are
 //! statements, not hopes.
 
-use dynamic_config::RemoteSource;
+use std::sync::Arc;
+
+use dynamic_config::{AsyncRemoteSource, RemoteSource};
 
 use crate::spec::Spec;
+
+/// What `build` answers: one of the engine's two source traits.
+///
+/// The blocking six run under `spawn_blocking` — honest async, no
+/// `block_on`-inside-a-runtime hazard — and the async three are driven
+/// directly. `Arc` rather than `Box` because a blocking fetch moves a
+/// clone onto the blocking pool.
+pub enum Built {
+    Blocking(Arc<dyn RemoteSource>),
+    Async(Arc<dyn AsyncRemoteSource>),
+}
+
+impl Built {
+    /// The store's own redacted self-description.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Blocking(source) => source.describe(),
+            Self::Async(source) => source.describe(),
+        }
+    }
+
+    /// One document, whichever trait fetches it.
+    pub async fn fetch(&self) -> Result<dynamic_config::Fetched, dynamic_config::Error> {
+        match self {
+            Self::Blocking(source) => {
+                let source = Arc::clone(source);
+
+                tokio::task::spawn_blocking(move || source.fetch())
+                    .await
+                    .map_err(|error| {
+                        dynamic_config::Error::remote(format!("fetch task: {error}"))
+                    })?
+            }
+            Self::Async(source) => source.fetch().await,
+        }
+    }
+}
 
 /// The same three TLS settings, spelled as data, for whichever store
 /// takes them. Each store crate re-exports the one shared `TlsConfig`
@@ -29,7 +68,15 @@ macro_rules! tls_config {
     }};
 }
 
-pub fn build(spec: &Spec) -> Result<Box<dyn RemoteSource>, Box<dyn std::error::Error>> {
+pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
+    // The async three first: their construction awaits.
+    match spec.source.as_str() {
+        "etcd" => return etcd(spec).await,
+        "nats" => return nats(spec).await,
+        "s3" => return s3(spec).await,
+        _ => {}
+    }
+
     let wants_tls = spec.ca.is_some() || spec.tls_cert.is_some();
 
     let source: Box<dyn RemoteSource> = match spec.source.as_str() {
@@ -149,6 +196,43 @@ pub fn build(spec: &Spec) -> Result<Box<dyn RemoteSource>, Box<dyn std::error::E
                 application,
                 profile,
             );
+
+            if spec.auth.as_deref() == Some("kubernetes") {
+                // The pod's own projected token, re-read per fetch (it
+                // rotates); the server's [kubernetes] auth reviews it.
+                // A thin adapter rather than a client knob: building a
+                // `ConfigServer` is free (its I/O happens at fetch), so
+                // rebuilding one around the CURRENT token each fetch is
+                // the whole rotation story.
+                let path = spec.auth_token_path.clone().unwrap_or_else(|| {
+                    "/var/run/secrets/kubernetes.io/serviceaccount/token".to_owned()
+                });
+
+                let described = format!("{} (kubernetes identity)", store.describe());
+                let endpoint = spec.endpoint.clone();
+                let application = application.to_owned();
+                let profile = profile.to_owned();
+                let tls =
+                    wants_tls.then(|| tls_config!(spec, dynamic_config_store_core::tls::TlsConfig));
+
+                return Ok(Built::Blocking(Arc::new(RotatingBearer {
+                    build: Box::new(move || {
+                        let mut store = dynamic_config_server::client::ConfigServer::new(
+                            &endpoint,
+                            &application,
+                            &profile,
+                        );
+
+                        if let Some(tls) = &tls {
+                            store = store.with_tls(tls.clone());
+                        }
+
+                        store
+                    }),
+                    token_path: path.into(),
+                    described,
+                })));
+            }
 
             if let Some(token) = &spec.token {
                 store = store.with_token(token);
@@ -270,5 +354,112 @@ pub fn build(spec: &Spec) -> Result<Box<dyn RemoteSource>, Box<dyn std::error::E
         other => return Err(format!("unreachable: {other} passed spec validation").into()),
     };
 
-    Ok(source)
+    Ok(Built::Blocking(Arc::from(source)))
+}
+
+/// A config-server client whose bearer is a FILE, re-read per fetch:
+/// projected service-account tokens rotate underneath a long-lived
+/// sidecar, and the token a fetch presents must be the current one.
+/// Builds a fresh client each fetch — construction is free (the
+/// client's I/O happens inside `fetch`), so this IS the rotation story.
+struct RotatingBearer {
+    build: Box<dyn Fn() -> dynamic_config_server::client::ConfigServer + Send + Sync>,
+    token_path: std::path::PathBuf,
+    described: String,
+}
+
+impl RemoteSource for RotatingBearer {
+    fn fetch(&self) -> Result<dynamic_config::Fetched, dynamic_config::Error> {
+        let token = std::fs::read_to_string(&self.token_path).map_err(|error| {
+            dynamic_config::Error::auth(format!(
+                "reading the service-account token at {}: {error}",
+                self.token_path.display()
+            ))
+        })?;
+
+        (self.build)().with_token(token.trim()).fetch()
+    }
+
+    fn describe(&self) -> String {
+        self.described.clone()
+    }
+}
+
+/// etcd, with the two methods etcd itself speaks — TLS client
+/// certificates (the credential IS the certificate) and
+/// username/password — both first-class, per the roadmap's identity
+/// policy: etcd has no Kubernetes auth method to log into, and a
+/// contract that punishes such stores punishes their users.
+async fn etcd(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
+    use dynamic_config_etcd::{ConnectOptions, Etcd};
+
+    let endpoints: Vec<&str> = spec.endpoint.split(',').map(str::trim).collect();
+    let mut options = ConnectOptions::new();
+
+    if let Some(user) = &spec.auth_username {
+        options = options.with_user(user, spec.password.as_deref().expect("validated"));
+    }
+
+    let wants_tls = spec.ca.is_some() || spec.tls_cert.is_some();
+    let store = if wants_tls {
+        let tls = tls_config!(spec, dynamic_config_etcd::TlsConfig);
+
+        Etcd::with_tls(endpoints, spec.key.as_str(), options, &tls).await?
+    } else {
+        Etcd::with_options(endpoints, spec.key.as_str(), options).await?
+    };
+
+    Ok(Built::Async(Arc::new(store)))
+}
+
+/// NATS JetStream KV: `--key <bucket>/<key>`; a `.creds` file — the way
+/// a NATS account authenticates — comes in as `--auth-token-path`.
+async fn nats(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
+    use dynamic_config_nats::{ConnectOptions, Nats};
+
+    let (bucket, key) = spec
+        .key
+        .split_once('/')
+        .ok_or("nats' --key is <bucket>/<key>")?;
+
+    let options = match (&spec.auth_token_path, &spec.token) {
+        (Some(path), _) => ConnectOptions::with_credentials_file(path)
+            .await
+            .map_err(|error| format!("nats credentials file: {error}"))?,
+        (None, Some(token)) => ConnectOptions::with_token(token.clone()),
+        (None, None) => ConnectOptions::new(),
+    };
+
+    let store = Nats::with_options(spec.endpoint.as_str(), bucket, key, options).await?;
+
+    Ok(Built::Async(Arc::new(store)))
+}
+
+/// S3 (and everything speaking its API): `--endpoint <bucket>`, the
+/// object key in `--key`. Credentials come from the ambient chain —
+/// which on EKS is IRSA, the workload's own identity, no secret
+/// distributed. `--api-url` overrides the endpoint for MinIO/Ceph/R2.
+async fn s3(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
+    use dynamic_config_s3::S3;
+
+    let store = match &spec.api_url {
+        Some(url) => {
+            // An explicit endpoint means a non-AWS S3 (MinIO, Ceph, R2).
+            // There is no IMDS there, so the SDK's region lookup would
+            // hang and then leave the client region-less — which the SDK
+            // refuses. The value itself is ignored by these servers.
+            let region = aws_config::meta::region::RegionProviderChain::default_provider()
+                .or_else("us-east-1");
+            let config = aws_config::from_env()
+                .region(region)
+                .endpoint_url(url)
+                .load()
+                .await;
+
+            S3::with_config(&config, spec.endpoint.as_str(), spec.key.as_str())
+        }
+        None => S3::new(spec.endpoint.as_str(), spec.key.as_str()).await?,
+    };
+
+    Ok(Built::Async(Arc::new(store)))
 }

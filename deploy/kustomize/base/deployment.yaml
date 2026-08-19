@@ -34,11 +34,11 @@ spec:
               app.kubernetes.io/component: webhook
       containers:
         - name: webhook
-          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:0.1.0
+          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.1.1
           imagePullPolicy: IfNotPresent
           env:
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
-              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:0.1.0
+              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
               value: "0.0.0.0:8443"
             - name: DYNAMIC_CONFIG_AGENT_CPU_REQUEST
@@ -47,6 +47,22 @@ spec:
               value: "32Mi"
             - name: DYNAMIC_CONFIG_AGENT_MEMORY_LIMIT
               value: "64Mi"
+            # Optional fleet defaults, per-store defaults and the gates —
+            # set via an overlay patch; empty means unset, and the webhook
+            # validates every value at startup:
+            #   DYNAMIC_CONFIG_AGENT_FILE_MODE          "0640"
+            #   DYNAMIC_CONFIG_AGENT_WATCH_SECONDS      "30"
+            #   DYNAMIC_CONFIG_AGENT_MODE               "both"
+            #   DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM      "disk"
+            #   DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR     "true"
+            #   DYNAMIC_CONFIG_AGENT_RUN_AS_USER        "1000"
+            #   DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP       "1000"
+            #   DYNAMIC_CONFIG_AGENT_METRICS_PORT       "9102"
+            #   DYNAMIC_CONFIG_AGENT_ENV                "HTTPS_PROXY=http://egress:3128"
+            #   DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS     "vault: watch-seconds=30; s3: file-mode=0640"
+            #   DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW  "payments: HTTPS_PROXY; *: RUST_LOG"
+            #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW     "payments: vault, s3; *: consul"
+            #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY      "sandbox: git"
           ports:
             - containerPort: 8443
               name: https

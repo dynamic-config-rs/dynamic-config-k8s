@@ -33,7 +33,7 @@
                     "description": "Which store speaks at the other end: etcd, consul, vault or config-server.",
                     "type": "string"
                   },
-                  "token_secret": {
+                  "tokenSecret": {
                     "description": "A Secret in this namespace holding the token, when the store wants one; its `token` key is what the agent receives.",
                     "nullable": true,
                     "type": "string"

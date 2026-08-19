@@ -6,7 +6,7 @@ repository; this file is the k8s integration's own ladder. Dates are
 deliberately absent — each rung ships when its gate is green, and the
 gates are written down here so "done" is checkable.
 
-## 0.1.x — the release machinery itself
+## 0.1.x — the release machinery itself — ✅ SHIPPED (0.1.1)
 
 The repository builds and smokes; what it does not yet do is *ship*.
 
@@ -24,7 +24,7 @@ The repository builds and smokes; what it does not yet do is *ship*.
   both registries; the chart page renders on ArtifactHub with CRDs,
   images and links intact.
 
-## 0.2.0 — the async stores, and identity where none exists
+## 0.2.0 — the async stores, and identity where none exists — ✅ SHIPPED
 
 - **etcd, NATS, S3** join `--source` through an async agent path (their
   clients are async; the 0.1 agent drives the blocking trait). The
@@ -50,7 +50,7 @@ The repository builds and smokes; what it does not yet do is *ship*.
 - Gate: the e2e matrix gains an etcd leg exercising both auth methods;
   the annotation reference's source table loses three "0.2.0" rows.
 
-## 0.3.0 — self-rotating webhook TLS, the vault-agent-injector way
+## 0.3.0 — self-rotating webhook TLS, the vault-agent-injector way — ✅ SHIPPED
 
 Today's two TLS modes trade against each other: chart-minted needs no
 dependency but never rotates; cert-manager rotates but is a
@@ -73,7 +73,7 @@ adds — **the webhook rotates itself**:
   zero refused handshakes across rotations; the existing modes'
   golden behaviour untouched.
 
-## 0.3.x — the operator's reconcilers
+## 0.3.x — the operator's reconcilers — ✅ SHIPPED
 
 The CRDs are settled, generated and drift-gated; `DynamicConfigClass`
 (store-plus-auth bundles pods reference instead of repeating endpoints)
@@ -88,7 +88,3 @@ the contract, written before the code on purpose.
 - **Template functions**, demand-driven: `b64`, `indent`, a JSON
   emitter — each addition argued in the book's Rendering page, never
   smuggled.
-- **The macOS setLogger investigation** (node repository, recorded in
-  the organisation's OUTSTANDING) — not this repository's, but the
-  sibling entry most likely to teach this one something about
-  FSEvents-adjacent silence.

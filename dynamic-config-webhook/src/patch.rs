@@ -11,7 +11,7 @@ use crate::annotations::{self, Mode};
 /// and this constant is only the fallback a bare binary gets. Read once:
 /// an admission decision must not change between two requests because
 /// somebody edited the environment.
-const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:0.1.0";
+const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1";
 
 fn agent_image() -> &'static str {
     static IMAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -21,8 +21,30 @@ fn agent_image() -> &'static str {
     })
 }
 
+/// The pull secret injected pods need when the agent image lives in a
+/// private mirror. The Secret itself is namespaced, so it must exist in
+/// every namespace that injects — the chart README says so out loud.
+fn agent_pull_secret() -> Option<&'static str> {
+    static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+    SECRET
+        .get_or_init(|| {
+            std::env::var("DYNAMIC_CONFIG_AGENT_PULL_SECRET")
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
 /// The whole webhook: a review's response, allowed or patched or refused.
 pub fn admission_response(review: &Value) -> Value {
+    admission_response_with(review, annotations::installation())
+}
+
+/// [`admission_response`] with the installation made explicit — the
+/// server feeds its own; tests construct theirs through
+/// [`Installation::from_lookup`](annotations::Installation::from_lookup).
+pub fn admission_response_with(review: &Value, install: &annotations::Installation) -> Value {
     let uid = review
         .pointer("/request/uid")
         .and_then(Value::as_str)
@@ -32,9 +54,82 @@ pub fn admission_response(review: &Value) -> Value {
         return respond(uid, json!({ "allowed": true }));
     };
 
-    match annotations::of_pod(pod) {
+    match annotations::of_pod_with(pod, install) {
         Ok(None) => respond(uid, json!({ "allowed": true })),
         Ok(Some(request)) => {
+            // Everything below passed the FORMAT checks in parsing;
+            // whether it may pass AT ALL is the installer's policy,
+            // judged against the namespace this pod is landing in.
+            let namespace = review
+                .pointer("/request/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let refuse = |message: String| {
+                respond(
+                    uid,
+                    json!({
+                        "allowed": false,
+                        "status": { "message": message, "code": 400 },
+                    }),
+                )
+            };
+
+            // The source gates cover EVERY render — a denied store must
+            // not ride in on a named suffix.
+            let sources = std::iter::once(request.source.as_str())
+                .chain(request.extra.iter().map(|extra| extra.source.as_str()));
+
+            for source in sources {
+                if install.source_denied(namespace, source) {
+                    return refuse(format!(
+                        "source {source} is turned off in namespace \
+                         {namespace:?} by this installation \
+                         (webhook.sourceDeny in the chart; the \
+                         DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY variable, for \
+                         kustomize)"
+                    ));
+                }
+
+                if !install.source_allowed(namespace, source) {
+                    let permitted = install.source_listing(namespace);
+                    let here = if permitted.is_empty() {
+                        "no source is currently allowed here".to_owned()
+                    } else {
+                        format!("allowed here: {permitted}")
+                    };
+
+                    return refuse(format!(
+                        "source {source} is not on this installation's \
+                         allowlist for namespace {namespace:?} — {here} \
+                         (webhook.sourceAllow in the chart; the \
+                         DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW variable, for \
+                         kustomize)"
+                    ));
+                }
+            }
+
+            for (name, _) in &request.agent_env {
+                if !install.agent_env_allowed(namespace, name) {
+                    let permitted = install.agent_env_listing(namespace);
+                    let here = if permitted.is_empty() {
+                        "nothing is currently allowed here".to_owned()
+                    } else {
+                        format!("allowed here: {permitted}")
+                    };
+
+                    return refuse(format!(
+                        "{}agent-env sets {name}, and this installation \
+                         does not allow it in namespace {namespace:?} — \
+                         {here}. The gate belongs to whoever installed \
+                         the webhook: webhook.agentEnvAllow in the chart \
+                         (the DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW \
+                         variable, for kustomize)",
+                        annotations::PREFIX
+                    ));
+                }
+            }
+
             let patches = patches_for(pod, &request);
             let encoded = base64(&serde_json::to_vec(&patches).expect("patches serialise"));
 
@@ -115,6 +210,10 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             "path": "/spec/volumes/-",
             "value": {
                 "name": "dynamic-config-ssh",
+                // Owner-only ON PURPOSE, unlike the TLS pair below: ssh
+                // clients refuse a key anyone else can read, so widening
+                // this to fix the nonroot-read problem would break the
+                // very client it feeds.
                 "secret": { "secretName": ssh.name, "defaultMode": 0o400 },
             },
         }));
@@ -126,9 +225,63 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             "path": "/spec/volumes/-",
             "value": {
                 "name": "dynamic-config-client-tls",
-                "secret": { "secretName": tls, "defaultMode": 0o400 },
+                // 0444, not 0400: the kubelet writes secret files as root and
+                // the agent runs nonroot — owner-only would lock the agent out
+                // of its own credential. Only the agent mounts this volume.
+                "secret": { "secretName": tls, "defaultMode": 0o444 },
             },
         }));
+    }
+
+    // The named renders' aux material, one suffixed volume each — the
+    // shared render volume is the one above; only credentials and
+    // templates multiply.
+    for extra in &request.extra {
+        let n = &extra.name;
+
+        if let Some(ca) = &extra.ca {
+            patches.push(json!({
+                "op": "add",
+                "path": "/spec/volumes/-",
+                "value": {
+                    "name": format!("dynamic-config-ca-{n}"),
+                    "configMap": { "name": ca.name },
+                },
+            }));
+        }
+
+        if let Some(ssh) = &extra.ssh {
+            patches.push(json!({
+                "op": "add",
+                "path": "/spec/volumes/-",
+                "value": {
+                    "name": format!("dynamic-config-ssh-{n}"),
+                    "secret": { "secretName": ssh.name, "defaultMode": 0o400 },
+                },
+            }));
+        }
+
+        if let Some(tls) = &extra.tls {
+            patches.push(json!({
+                "op": "add",
+                "path": "/spec/volumes/-",
+                "value": {
+                    "name": format!("dynamic-config-client-tls-{n}"),
+                    "secret": { "secretName": tls, "defaultMode": 0o444 },
+                },
+            }));
+        }
+
+        if let Some(template) = &extra.template {
+            patches.push(json!({
+                "op": "add",
+                "path": "/spec/volumes/-",
+                "value": {
+                    "name": format!("dynamic-config-template-{n}"),
+                    "configMap": { "name": template.name },
+                },
+            }));
+        }
     }
 
     if let Some(template) = &request.template {
@@ -173,6 +326,109 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             "path": format!("/spec/containers/{index}/volumeMounts/-"),
             "value": { "name": "dynamic-config", "mountPath": mount_dir },
         }));
+    }
+
+    // 2a½. The agent image's pull secret, when the fleet mirrors from a
+    // private registry: appended, never replaced — the pod's own pull
+    // secrets keep working.
+    if let Some(name) = agent_pull_secret() {
+        if pod.pointer("/spec/imagePullSecrets").is_none() {
+            patches.push(json!({
+                "op": "add",
+                "path": "/spec/imagePullSecrets",
+                "value": [],
+            }));
+        }
+
+        patches.push(json!({
+            "op": "add",
+            "path": "/spec/imagePullSecrets/-",
+            "value": { "name": name },
+        }));
+    }
+
+    // 2b. The env wrapper: the named container's command becomes
+    // `sh -c 'set -a; . <path>; set +a; exec "$@"' dynamic-config-env
+    // <original command and args…>` — the rendered dotenv is the
+    // process's REAL environment, loaded once at start (Kubernetes'
+    // rule: a running environ never changes; the init agent guarantees
+    // the file exists first). `args` folds into `command`, so it is
+    // removed where present.
+    if let Some(name) = &request.env_inject {
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for (index, container) in containers.iter().enumerate() {
+            if container["name"].as_str() != Some(name.as_str()) {
+                continue;
+            }
+
+            // With env-restart, the wrapper also exports the file's
+            // fingerprint — what the liveness probe below compares the
+            // CURRENT file against. File moves → probe fails → the
+            // kubelet restarts this one container → the wrapper runs
+            // again and sources the new file. The kernel's env-freeze
+            // rule is honoured, not fought.
+            let script = if request.env_restart {
+                format!(
+                    "set -a; . {path}; set +a; \
+                     export DYNAMIC_CONFIG_ENV_FINGERPRINT=\"$(cksum < {path})\"; \
+                     exec \"$@\"",
+                    path = request.path
+                )
+            } else {
+                format!("set -a; . {}; set +a; exec \"$@\"", request.path)
+            };
+
+            let mut wrapped = vec![
+                json!("/bin/sh"),
+                json!("-c"),
+                json!(script),
+                json!("dynamic-config-env"),
+            ];
+
+            wrapped.extend(container["command"].as_array().cloned().unwrap_or_default());
+            wrapped.extend(container["args"].as_array().cloned().unwrap_or_default());
+
+            patches.push(json!({
+                "op": "replace",
+                "path": format!("/spec/containers/{index}/command"),
+                "value": wrapped,
+            }));
+
+            if container.get("args").is_some() {
+                patches.push(json!({
+                    "op": "remove",
+                    "path": format!("/spec/containers/{index}/args"),
+                }));
+            }
+
+            if request.env_restart {
+                // Admission already refused a container that has its own
+                // livenessProbe. Cadence follows the sidecar's: there is
+                // no point probing faster than the file can change.
+                let period = request.watch_seconds.clamp(10, 120);
+
+                patches.push(json!({
+                    "op": "add",
+                    "path": format!("/spec/containers/{index}/livenessProbe"),
+                    "value": {
+                        "exec": { "command": [
+                            "/bin/sh", "-c",
+                            format!(
+                                "test \"$(cksum < {})\" = \"$DYNAMIC_CONFIG_ENV_FINGERPRINT\"",
+                                request.path
+                            ),
+                        ]},
+                        "periodSeconds": period,
+                        "failureThreshold": 1,
+                    },
+                }));
+            }
+        }
     }
 
     // 3. The agent itself.
@@ -258,14 +514,28 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             // relaxes a pod's posture is a finding, not a feature.
             "securityContext": {
                 "runAsNonRoot": true,
-                "runAsUser": 65532,
-                "runAsGroup": 65532,
+                // Overridable UID/GID (never root — admission refuses 0):
+                // the rendered file's owner should match what the APP
+                // container runs as, which is the whole reason a
+                // tighter-than-default file-mode can still be read.
+                "runAsUser": request.run_as_user.unwrap_or(65532),
+                "runAsGroup": request.run_as_group.unwrap_or(65532),
                 "allowPrivilegeEscalation": false,
                 "capabilities": { "drop": ["ALL"] },
                 "readOnlyRootFilesystem": true,
                 "seccompProfile": { "type": "RuntimeDefault" },
             },
         });
+
+        // Only the WATCHING agent serves metrics: a one-shot init has
+        // nothing long-lived to scrape.
+        if let (Some(port), true) = (request.metrics_port, watch) {
+            container["args"]
+                .as_array_mut()
+                .expect("args is the array built above")
+                .extend([json!("--metrics-addr"), json!(format!("0.0.0.0:{port}"))]);
+            container["ports"] = json!([{ "containerPort": port, "name": "metrics" }]);
+        }
 
         // Secret material reaches the agent as environment, never as
         // arguments: `kubectl describe pod` prints args to anyone with
@@ -285,6 +555,156 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 .collect();
         }
 
+        if let Some(secret) = &request.aws_secret {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+                env.push(json!({
+                    "name": key,
+                    "valueFrom": { "secretKeyRef": { "name": secret, "key": key } },
+                }));
+            }
+
+            container["env"] = json!(env);
+        }
+
+        // The installer's fleet environment first, then the pod's own
+        // (allowlisted by the admission before any patch was cut) —
+        // overlaps were already resolved in the pod's favour.
+        if !request.fleet_env.is_empty() || !request.agent_env.is_empty() {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for (name, value) in request.fleet_env.iter().chain(&request.agent_env) {
+                env.push(json!({ "name": name, "value": value }));
+            }
+
+            container["env"] = json!(env);
+        }
+
+        container
+    };
+
+    // A named render's agent: the same restricted container, its own
+    // store flags, its own aux mounts — mode, resources and identity
+    // stay pod-wide.
+    let extra_agent = |extra: &annotations::ExtraRender, watch: bool| {
+        let n = &extra.name;
+        let mut arguments = vec!["--source".to_owned(), extra.source.clone()];
+
+        if let Some(endpoint) = &extra.endpoint {
+            arguments.push("--endpoint".to_owned());
+            arguments.push(endpoint.clone());
+        }
+
+        arguments.push("--key".to_owned());
+        arguments.push(extra.key.clone());
+        arguments.push("--out".to_owned());
+        arguments.push(extra.path.clone());
+
+        for (flag, value) in &extra.arguments {
+            arguments.push(flag.clone());
+            arguments.push(value.clone());
+        }
+
+        if watch {
+            arguments.push("--watch".to_owned());
+            arguments.push(extra.watch_seconds.to_string());
+        }
+
+        let mut mounts = vec![json!({ "name": "dynamic-config", "mountPath": mount_dir })];
+
+        if extra.ca.is_some() {
+            mounts.push(json!({
+                "name": format!("dynamic-config-ca-{n}"),
+                "mountPath": format!("{}-{n}", annotations::CA_MOUNT),
+                "readOnly": true,
+            }));
+        }
+
+        if extra.ssh.is_some() {
+            mounts.push(json!({
+                "name": format!("dynamic-config-ssh-{n}"),
+                "mountPath": format!("{}-{n}", annotations::SSH_MOUNT),
+                "readOnly": true,
+            }));
+        }
+
+        if extra.tls.is_some() {
+            mounts.push(json!({
+                "name": format!("dynamic-config-client-tls-{n}"),
+                "mountPath": format!("{}-{n}", annotations::TLS_MOUNT),
+                "readOnly": true,
+            }));
+        }
+
+        if extra.template.is_some() {
+            mounts.push(json!({
+                "name": format!("dynamic-config-template-{n}"),
+                "mountPath": format!("{}-{n}", annotations::TEMPLATE_MOUNT),
+                "readOnly": true,
+            }));
+        }
+
+        let mut limits = json!({ "memory": request.resources.memory_limit });
+
+        if let Some(cpu) = &request.resources.cpu_limit {
+            limits["cpu"] = json!(cpu);
+        }
+
+        let mut container = json!({
+            "name": if watch {
+                format!("dynamic-config-agent-{n}")
+            } else {
+                format!("dynamic-config-init-{n}")
+            },
+            "image": agent_image(),
+            "args": arguments,
+            "volumeMounts": mounts,
+            "resources": {
+                "requests": {
+                    "cpu": request.resources.cpu_request,
+                    "memory": request.resources.memory_request,
+                },
+                "limits": limits,
+            },
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": request.run_as_user.unwrap_or(65532),
+                "runAsGroup": request.run_as_group.unwrap_or(65532),
+                "allowPrivilegeEscalation": false,
+                "capabilities": { "drop": ["ALL"] },
+                "readOnlyRootFilesystem": true,
+                "seccompProfile": { "type": "RuntimeDefault" },
+            },
+        });
+
+        if !extra.secret_env.is_empty() {
+            container["env"] = extra
+                .secret_env
+                .iter()
+                .map(|(variable, secret)| {
+                    json!({
+                        "name": variable,
+                        "valueFrom": {
+                            "secretKeyRef": { "name": secret.name, "key": secret.key },
+                        },
+                    })
+                })
+                .collect();
+        }
+
+        // agent-env is pod-wide, like resources and identity: every
+        // render's agent runs with the same environment.
+        if !request.fleet_env.is_empty() || !request.agent_env.is_empty() {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for (name, value) in request.fleet_env.iter().chain(&request.agent_env) {
+                env.push(json!({ "name": name, "value": value }));
+            }
+
+            container["env"] = json!(env);
+        }
+
         container
     };
 
@@ -298,6 +718,12 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
         patches.push(json!({
             "op": "add", "path": "/spec/initContainers/-", "value": agent(false),
         }));
+
+        for extra in &request.extra {
+            patches.push(json!({
+                "op": "add", "path": "/spec/initContainers/-", "value": extra_agent(extra, false),
+            }));
+        }
     }
 
     if matches!(request.mode, Mode::Sidecar | Mode::Both) {
@@ -305,9 +731,6 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             // The 1.29+ sidecar shape: an init container that restarts
             // always starts before the app containers, ends after them,
             // and does not stop a Job from finishing.
-            let mut sidecar = agent(true);
-            sidecar["restartPolicy"] = json!("Always");
-
             if pod.pointer("/spec/initContainers").is_none() && !matches!(request.mode, Mode::Both)
             {
                 patches.push(json!({
@@ -315,13 +738,31 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 }));
             }
 
+            let mut sidecar = agent(true);
+            sidecar["restartPolicy"] = json!("Always");
+
             patches.push(json!({
                 "op": "add", "path": "/spec/initContainers/-", "value": sidecar,
             }));
+
+            for extra in &request.extra {
+                let mut sidecar = extra_agent(extra, true);
+                sidecar["restartPolicy"] = json!("Always");
+
+                patches.push(json!({
+                    "op": "add", "path": "/spec/initContainers/-", "value": sidecar,
+                }));
+            }
         } else {
             patches.push(json!({
                 "op": "add", "path": "/spec/containers/-", "value": agent(true),
             }));
+
+            for extra in &request.extra {
+                patches.push(json!({
+                    "op": "add", "path": "/spec/containers/-", "value": extra_agent(extra, true),
+                }));
+            }
         }
     }
 

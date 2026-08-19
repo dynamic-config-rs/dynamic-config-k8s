@@ -1,0 +1,41 @@
+# Least privilege for the reconcilers: watch the three CRDs, own the
+# ConfigMaps AND Secrets a Render targets, read the token Secrets
+# classes name (a cluster class's credential lives in the platform's
+# namespace — the read happens with THIS identity, never the tenant's),
+# record events, hold a lease.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dynamic-config-operator
+rules:
+  - apiGroups: ["dynamic-config.rs"]
+    resources: ["dynamicconfigclasses", "clusterdynamicconfigclasses", "dynamicconfigrenders"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["dynamic-config.rs"]
+    resources: ["dynamicconfigrenders/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dynamic-config-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dynamic-config-operator
+subjects:
+  - kind: ServiceAccount
+    name: dynamic-config-operator
+    namespace: dynamic-config

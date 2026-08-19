@@ -1,0 +1,88 @@
+# Two etcds, one per auth method — the honest shape: a single listener
+# cannot both REQUIRE client certificates and accept password-only
+# clients, and pretending otherwise would test neither.
+#
+# etcd-password: TLS on the wire, users enforced by etcd's own auth.
+# etcd-mtls:     TLS on the wire AND the client certificate required —
+#                the credential IS the certificate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd-password
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: etcd-password } }
+  template:
+    metadata:
+      labels: { app: etcd-password }
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.6.5
+          command:
+            - etcd
+            - --advertise-client-urls=https://0.0.0.0:2379
+            - --listen-client-urls=https://0.0.0.0:2379
+            - --cert-file=/etc/etcd-tls/tls.crt
+            - --key-file=/etc/etcd-tls/tls.key
+          ports:
+            - containerPort: 2379
+          volumeMounts:
+            - { name: tls, mountPath: /etc/etcd-tls, readOnly: true }
+      volumes:
+        - name: tls
+          secret: { secretName: etcd-server-tls }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-password
+spec:
+  selector: { app: etcd-password }
+  ports:
+    - port: 2379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd-mtls
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: etcd-mtls } }
+  template:
+    metadata:
+      labels: { app: etcd-mtls }
+    spec:
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.6.5
+          command:
+            - etcd
+            - --advertise-client-urls=https://0.0.0.0:2379
+            - --listen-client-urls=https://0.0.0.0:2379
+            - --cert-file=/etc/etcd-tls/tls.crt
+            - --key-file=/etc/etcd-tls/tls.key
+            - --trusted-ca-file=/etc/etcd-tls/ca.crt
+            - --client-cert-auth=true
+          ports:
+            - containerPort: 2379
+          volumeMounts:
+            - { name: tls, mountPath: /etc/etcd-tls, readOnly: true }
+            # The CLIENT pair too, so the seeding etcdctl inside this pod
+            # can present a certificate the server's clientAuth check
+            # accepts — the server's own pair (serverAuth EKU) cannot.
+            - { name: client-tls, mountPath: /etc/etcd-client, readOnly: true }
+      volumes:
+        - name: tls
+          secret: { secretName: etcd-server-tls }
+        - name: client-tls
+          secret: { secretName: etcd-client-tls }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-mtls
+spec:
+  selector: { app: etcd-mtls }
+  ports:
+    - port: 2379

@@ -20,15 +20,12 @@
 
 #![forbid(unsafe_code)]
 
-mod render;
-mod sources;
-mod spec;
-
-use std::time::Duration;
+use dynamic_config_agent::{render, sources, spec};
 
 use tracing::{info, warn};
 
-fn main() -> std::process::ExitCode {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
     // Structured logs from the first line: this process's audience is
     // `kubectl logs`, and JSON is what log pipelines index. The engine's
     // own diagnostics join via its `tracing` feature.
@@ -49,7 +46,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    match run(&spec) {
+    match run(&spec).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             warn!(error = %error, "agent stopped");
@@ -58,18 +55,31 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
-    let source = sources::build(spec)?;
+async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
+    let source = sources::build(spec).await?;
 
     info!(source = %source.describe(), out = %spec.out.display(), "agent starting");
+
+    if let Some(address) = &spec.metrics_addr {
+        tokio::spawn(dynamic_config_agent::metrics::serve(
+            address.clone(),
+            "dynamic_config_agent",
+        ));
+    }
 
     let mut last_rendered: Option<String> = None;
 
     loop {
-        match render::fetch_and_render(source.as_ref(), spec) {
+        let attempt = match source.fetch().await {
+            Ok(fetched) => render::render_fetched(&fetched, spec),
+            Err(error) => Err(error.into()),
+        };
+
+        match attempt {
             Ok(rendered) => {
                 if last_rendered.as_deref() != Some(rendered.as_str()) {
-                    render::write_atomically(&spec.out, &rendered)?;
+                    render::write_atomically(&spec.out, &rendered, spec.file_mode)?;
+                    dynamic_config_agent::metrics::rendered();
                     info!(bytes = rendered.len(), "rendered");
                     last_rendered = Some(rendered);
                 } else {
@@ -84,19 +94,14 @@ fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(error);
                 }
 
+                dynamic_config_agent::metrics::failed();
                 warn!(error = %error, "fetch failed; the rendered file is unchanged");
             }
         }
 
         match spec.watch {
-            Some(interval) => std::thread::sleep(interval),
+            Some(interval) => tokio::time::sleep(interval).await,
             None => return Ok(()),
         }
     }
-
-    #[allow(unreachable_code)]
-    Ok(())
 }
-
-#[allow(dead_code)]
-fn unused_duration_helper(_: Duration) {}

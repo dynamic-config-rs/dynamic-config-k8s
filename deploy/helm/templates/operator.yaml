@@ -22,7 +22,7 @@ metadata:
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["dynamic-config.rs"]
-    resources: ["dynamicconfigclasses", "dynamicconfigrenders"]
+    resources: ["dynamicconfigclasses", "clusterdynamicconfigclasses", "dynamicconfigrenders"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["dynamic-config.rs"]
     resources: ["dynamicconfigrenders/status"]
@@ -30,9 +30,13 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # `get` for the token Secrets classes name; the write verbs because a
+  # Render's `secret:` target IS a Secret this operator owns and
+  # reconciles. `create` cannot be name-scoped in RBAC — the trade of
+  # writing Secrets at all, taken here and stated.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get"]
+    verbs: ["get", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -98,11 +102,14 @@ spec:
       {{- end }}
       containers:
         - name: operator
-          image: {{ include "dynamic-config.image" .Values.operator | quote }}
+          image: {{ include "dynamic-config.image" (dict "component" .Values.operator "root" $) | quote }}
           imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
           {{- with .Values.operator.extraEnv }}
           env: {{- toYaml . | nindent 12 }}
           {{- end }}
+          ports:
+            - containerPort: 9090
+              name: metrics
           securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
           resources: {{- toYaml .Values.operator.resources | nindent 12 }}
 {{- end }}

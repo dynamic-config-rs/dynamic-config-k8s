@@ -21,8 +21,12 @@ imagePullSecrets: []
 # ── The agent (what gets injected) ───────────────────────────────────
 agent:
   image: ghcr.io/dynamic-config-rs/dynamic-config-agent
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""            # wins over tag when set — pin in production
+  # The pull secret injected pods get (appended to their own) when the
+  # agent image lives in a private mirror. Pull secrets are namespaced:
+  # the Secret must exist in every namespace that injects.
+  pullSecret: ""
   # Fleet-wide defaults for every injected container; the
   # `agent-cpu-request` (etc.) annotations still override per pod.
   # cpuLimit stays empty on purpose — throttling a config agent buys
@@ -32,11 +36,58 @@ agent:
     memoryRequest: 32Mi
     memoryLimit: 64Mi
     cpuLimit: ""
+    # The rendered file's octal permissions when a pod does not say
+    # (empty = the agent's own 0644); `file-mode` still wins per pod.
+    fileMode: ""
+    # The default watch interval, whole seconds (empty = 15);
+    # `watch-seconds` still wins per pod.
+    watchSeconds: ""
+    # The default injection mode: init | sidecar | both (empty = sidecar).
+    mode: ""
+    # The shared volume's default medium: memory | disk (empty = memory).
+    volumeMedium: ""
+    # "true" runs watching agents as native sidecars by default
+    # (Kubernetes 1.29+); empty = false.
+    nativeSidecar: ""
+    # The injected container's default UID/GID (empty = 65532);
+    # 0 is refused — the agent stays nonroot in every configuration.
+    runAsUser: ""
+    runAsGroup: ""
+    # Serve agent metrics on this port by default (empty = no metrics
+    # endpoint); a pod opts out with `metrics-port: "0"`.
+    metricsPort: ""
+    # Environment every injected agent gets, installer-set so no
+    # allowlist applies; a pod's own `agent-env` overrides it name by
+    # name. Same NAME=value grammar: "HTTPS_PROXY=http://egress:3128"
+    env: ""
+    # Per-STORE defaults, one tier above the fleet's: the value is the
+    # same key=value grammar, keys spelled as the annotations spell
+    # them. A pod's annotation still outranks both tiers.
+    #   perStore:
+    #     vault: "watch-seconds=30, file-mode=0640"
+    #     s3: "agent-memory-limit=128Mi"
+    perStore: {}
 
 # ── The webhook ──────────────────────────────────────────────────────
 webhook:
+  # Which `agent-env` variable names pods may set on their injected
+  # agents, and where. Empty = the annotation is refused everywhere.
+  # Grammar: semicolons between groups, an optional `namespace:` head
+  # on each (absent or `*` = every namespace), commas between names,
+  # a trailing `*` on a name is a prefix glob. The webhook validates
+  # this at startup and refuses to serve on a typo.
+  #   agentEnvAllow: "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"
+  agentEnvAllow: ""
+  # Which STORES pods may use, and where — same grammar, names from
+  # the source list. Empty = every store, everywhere; non-empty = ONLY
+  # the listed. `sourceDeny` is the subtractive twin and outranks the
+  # allowlist. Both validated at webhook startup.
+  #   sourceAllow: "payments: vault, s3; *: consul"
+  #   sourceDeny: "sandbox: git"
+  sourceAllow: ""
+  sourceDeny: ""
   image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""
   imagePullPolicy: IfNotPresent
   replicas: 2
@@ -75,6 +126,22 @@ webhook:
   # Days of validity for the self-signed pair (certManager disabled).
   selfSignedDays: 3650
 
+  # `selfRotate.enabled: true` — the third mode: the webhook is its own
+  # certificate authority. It mints a CA and leaf IN MEMORY at rotation
+  # time, writes the pair to its own Secret (every replica serves it
+  # via the file hot-reload), and patches the webhook configuration's
+  # caBundle itself — the Vault-agent-injector shape. No dependency,
+  # AND it rotates: a fresh pair every 24h, leader-elected over a
+  # Lease so replicas do not race.
+  #
+  # The price, stated here beside failurePolicy because they are the
+  # same trade: the webhook gets a service-account token and three
+  # narrow permissions (its one Secret, its one webhook configuration
+  # by name, leases in this namespace) — the pure zero-RBAC posture of
+  # the other two modes is deliberately given up for rotation.
+  selfRotate:
+    enabled: false
+
   # `Ignore` fails OPEN: an unreachable webhook lets pods through
   # un-injected, and the pod that asked shows the gap loudly (its file
   # never appears). `Fail` closes the gap and couples pod CREATEs in
@@ -86,7 +153,7 @@ webhook:
   # Namespaces the webhook never touches, beyond its own, kube-system
   # and kube-node-lease.
   excludeNamespaces: []
-  # Istio-style opt-in: when true, only namespaces labeled
+  # Opt-in: when true, only namespaces labeled
   #   dynamic-config.rs/injection: enabled
   # are selected at all — and `failurePolicy: Fail` becomes a
   # per-namespace promise instead of a cluster-wide one.
@@ -148,7 +215,7 @@ networkPolicy:
 operator:
   enabled: false
   image: ghcr.io/dynamic-config-rs/dynamic-config-operator
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""
   imagePullPolicy: IfNotPresent
   serviceAccount:

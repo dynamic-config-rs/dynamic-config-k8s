@@ -1,0 +1,253 @@
+name: Release
+
+# Merging a version bump into `main` IS the release — the wheel wave's
+# shape, aimed at registries. The `decide` job checks whether the
+# workspace version is new; a docs merge is a green no-op and a version
+# bump builds the three images multi-arch, pushes them to ghcr.io and
+# Docker Hub with identical digests (one buildx build, both registries in
+# the tag list), signs everything with cosign keyless, attaches SBOM and
+# provenance attestations, pushes the chart as OCI with its ArtifactHub
+# metadata, and mints the tag last — a tag marks what actually shipped.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GHCR: ghcr.io/${{ github.repository_owner }}
+  # The repository variable, with NO fallback: a missing variable must
+  # fail the login loudly, never push to a guessed account.
+  DOCKERHUB: docker.io/${{ vars.DOCKERHUB_USERNAME }}
+
+jobs:
+  decide:
+    name: is this a release?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: check
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "v$version is already tagged — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is new — this push is a release."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    name: verify before shipping
+    needs: decide
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: the changelog names this version
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::no section for $VERSION"
+            exit 1
+          fi
+
+      # One version, three places: the workspace, the chart, and what the
+      # chart deploys. A release where they disagree ships images the
+      # chart does not reference.
+      - name: the chart agrees on the version
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          chart=$(grep -m1 '^version:' deploy/helm/Chart.yaml | awk '{print $2}')
+          app=$(grep -m1 '^appVersion:' deploy/helm/Chart.yaml | tr -d '"' | awk '{print $2}')
+
+          if [ "$chart" != "$VERSION" ] || [ "$app" != "$VERSION" ]; then
+            echo "::error file=deploy/helm/Chart.yaml::chart $chart / appVersion $app, workspace $VERSION"
+            exit 1
+          fi
+
+      # The agent's etcd store compiles its gRPC stubs at build time.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  images:
+    name: ${{ matrix.component }} image, both registries
+    needs: [decide, verify]
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # Generous on purpose: the arm64 half compiles a Rust workspace
+    # under qemu, and the agent's tree includes the store crates.
+    timeout-minutes: 210
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # cosign keyless: the certificate names this workflow
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [agent, webhook, operator]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ONE build, every tag: both registries receive the same manifest
+      # list, so the digests are identical by construction — `cosign
+      # verify` against either registry proves the same bytes.
+      - name: build, attest, push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:v${{ needs.decide.outputs.version }}
+            ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:latest
+            ${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }}:v${{ needs.decide.outputs.version }}
+            ${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }}:latest
+
+      # Keyless: no key to rotate or leak — the signature's certificate
+      # binds this repository, this workflow, this run. Signed by digest,
+      # never by tag: a tag can move, the digest cannot.
+      - name: cosign sign, both registries
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          cosign sign --yes "${GHCR}/dynamic-config-${{ matrix.component }}@${DIGEST}"
+          cosign sign --yes "${DOCKERHUB}/dynamic-config-${{ matrix.component }}@${DIGEST}"
+
+      - name: the digests match across registries
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          on_ghcr=$(docker buildx imagetools inspect \
+            "${GHCR}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
+          on_hub=$(docker buildx imagetools inspect \
+            "${DOCKERHUB}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
+
+          echo "ghcr: $on_ghcr"
+          echo "hub:  $on_hub"
+          [ "$on_ghcr" = "$on_hub" ] && [ "$on_ghcr" = "\"${DIGEST}\"" ]
+
+  chart:
+    name: chart to ghcr + ArtifactHub metadata
+    needs: [decide, images]
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: helm login to ghcr
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: package and push the chart
+        id: push
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          helm package deploy/helm
+          out=$(helm push "dynamic-config-${VERSION}.tgz" "oci://${GHCR}/charts" 2>&1)
+          echo "$out"
+          digest=$(echo "$out" | grep -o 'sha256:[a-f0-9]*' | head -1)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: sign the chart
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${GHCR}/charts/dynamic-config@${DIGEST}"
+
+      # The repository-metadata layer ArtifactHub reads beside the chart;
+      # the claim on artifacthub.io is a one-time console action after the
+      # first release lands.
+      - name: push the ArtifactHub metadata
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          oras login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$TOKEN"
+          oras push "${GHCR}/charts/dynamic-config:artifacthub.io" \
+            --artifact-type application/vnd.cncf.artifacthub.config.v1+yaml \
+            deploy/helm/artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+
+  tag-and-release:
+    name: tag and GitHub release
+    needs: [decide, images, chart]
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Minted only after every artifact is on its registry: the tag
+      # marks what actually shipped.
+      - name: tag the release
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "dynamic-config-k8s $VERSION" "$GITHUB_SHA"
+          git push origin "v$VERSION"
+
+      - name: the changelog section, as the release body
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { printing = 1; next }
+            printing && /^## / { exit }
+            printing { print }
+          ' CHANGELOG.md > body.md
+
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: v${{ needs.decide.outputs.version }}
+          name: dynamic-config-k8s ${{ needs.decide.outputs.version }}
+          body_path: body.md

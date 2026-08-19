@@ -6,5 +6,7 @@
 mod annotations;
 mod patch;
 
-pub use annotations::{of_pod, Mode, Request, PREFIX};
-pub use patch::{admission_response, patches_for};
+pub use annotations::{
+    of_pod, of_pod_with, verify_installation, Installation, Mode, Request, ScopedNames, PREFIX,
+};
+pub use patch::{admission_response, admission_response_with, patches_for};

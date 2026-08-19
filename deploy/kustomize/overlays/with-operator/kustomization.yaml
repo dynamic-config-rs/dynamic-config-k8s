@@ -1,0 +1,13 @@
+# The operator, kustomize-shaped: Render → ConfigMap/Secret reconciler
+# plus the RBAC the helm chart's operator.enabled=true grants. Compose
+# with a TLS overlay — this one carries no webhook TLS answer:
+#
+#   resources:
+#     - ../cert-manager        # or ../own-cert, or ../selfrotate
+#     - ../with-operator
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - serviceaccount.yaml
+  - rbac.yaml
+  - deployment.yaml

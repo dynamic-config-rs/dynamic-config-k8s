@@ -1,0 +1,129 @@
+# One stack, every delivery at once — a four-component "shop" wired from
+# two stores, with THREE secrets injected three different ways and not
+# one of them visible to a developer, a manifest, or git.
+#
+#   vault  secret/shop/postgres → Secret `pg-credentials`  (entries)
+#   vault  secret/shop/redis    → Secret `redis-auth`      (entries)
+#   consul shop/api.json        → api's env (env-inject + env-restart)
+#   consul shop/worker.json     → worker's live file (sidecar)
+#
+# The stores' own credentials live in the `platform` namespace behind a
+# ClusterDynamicConfigClass allowlist; the `shop` namespace holds only
+# references.
+#
+# ── The platform team's half (applied once, cluster-wide) ─────────────
+apiVersion: dynamic-config.rs/v1alpha1
+kind: ClusterDynamicConfigClass
+metadata:
+  name: platform-vault
+spec:
+  source: vault
+  endpoint: https://vault.vault.svc:8200
+  tokenSecret: { name: vault-token, namespace: platform, key: token }
+  namespaces: [shop]
+---
+apiVersion: dynamic-config.rs/v1alpha1
+kind: ClusterDynamicConfigClass
+metadata:
+  name: platform-consul
+spec:
+  source: consul
+  endpoint: http://consul.infra.svc:8500
+  namespaces: [shop]
+---
+# ── Secret №1: postgres credentials, key names bitnami chose ──────────
+# (helm install db bitnami/postgresql --set auth.existingSecret=pg-credentials)
+apiVersion: dynamic-config.rs/v1alpha1
+kind: DynamicConfigRender
+metadata:
+  name: pg-credentials
+  namespace: shop
+spec:
+  class: platform-vault
+  classKind: ClusterDynamicConfigClass
+  key: secret/shop/postgres
+  target: { secret: pg-credentials, shape: entries }
+---
+# ── Secret №2: the redis password, consumed two ways below ────────────
+apiVersion: dynamic-config.rs/v1alpha1
+kind: DynamicConfigRender
+metadata:
+  name: redis-auth
+  namespace: shop
+spec:
+  class: platform-vault
+  classKind: ClusterDynamicConfigClass
+  key: secret/shop/redis
+  target: { secret: redis-auth, shape: entries }   # key: redis-password
+---
+# ── Component 1: the API — env-only software, restarts on change ──────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: shop
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: api } }
+  template:
+    metadata:
+      labels: { app: api }
+      annotations:
+        dynamic-config.rs/inject: "true"
+        dynamic-config.rs/mode: "both"
+        dynamic-config.rs/source: "consul"
+        dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+        dynamic-config.rs/key: "shop/api.json"
+        dynamic-config.rs/path: "/config/api.env"
+        dynamic-config.rs/template: |
+          API_PORT={{ port }}
+          FEATURE_CHECKOUT={{ features.checkout }}
+        dynamic-config.rs/env-inject: "api"
+        dynamic-config.rs/env-restart: "true"
+    spec:
+      containers:
+        - name: api
+          image: busybox:1.36
+          command: ["sh", "-c", "echo port=$API_PORT checkout=$FEATURE_CHECKOUT redis=$REDIS_PASSWORD; sleep 3600"]
+          env:
+            # Secret №2, first way: one entry, straight from the Secret.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: redis-auth, key: redis-password }
+---
+# ── Component 2: the worker — reads files, fully live, zero restarts ──
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: shop
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: worker } }
+  template:
+    metadata:
+      labels: { app: worker }
+      annotations:
+        dynamic-config.rs/inject: "true"
+        dynamic-config.rs/source: "consul"
+        dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+        dynamic-config.rs/key: "shop/worker.json"
+        dynamic-config.rs/path: "/config/worker.toml"
+        dynamic-config.rs/watch-seconds: "15"
+    spec:
+      containers:
+        - name: worker
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do echo ── $(date); cat /config/worker.toml; sleep 30; done"]
+          volumeMounts:
+            # Secret №2, second way: mounted, so a rotation lands
+            # WITHOUT a restart (kubelet syncs the file; the worker
+            # re-reads per job).
+            - { name: redis-auth, mountPath: /secrets, readOnly: true }
+      volumes:
+        - name: redis-auth
+          secret: { secretName: redis-auth }
+# ── Components 3 & 4: postgres and redis themselves ──────────────────
+#   helm install db bitnami/postgresql -n shop --set auth.existingSecret=pg-credentials
+#   helm install cache bitnami/redis  -n shop --set auth.existingSecret=redis-auth \
+#     --set auth.existingSecretPasswordKey=redis-password

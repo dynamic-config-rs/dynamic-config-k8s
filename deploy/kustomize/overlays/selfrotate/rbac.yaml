@@ -1,0 +1,56 @@
+# The narrow price of selfRotate, all of it: ONE secret and leases in
+# this namespace, ONE webhook configuration by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dynamic-config-webhook-selfrotate
+  namespace: dynamic-config
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [dynamic-config-webhook-tls]
+    verbs: [get, patch, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [dynamic-config-webhook-rotation]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dynamic-config-webhook-selfrotate
+  namespace: dynamic-config
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dynamic-config-webhook-selfrotate
+subjects:
+  - kind: ServiceAccount
+    name: dynamic-config-webhook
+    namespace: dynamic-config
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dynamic-config-selfrotate
+rules:
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations]
+    resourceNames: [dynamic-config]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dynamic-config-selfrotate
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dynamic-config-selfrotate
+subjects:
+  - kind: ServiceAccount
+    name: dynamic-config-webhook
+    namespace: dynamic-config

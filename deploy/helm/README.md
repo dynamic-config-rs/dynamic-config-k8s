@@ -2,7 +2,7 @@
 
 The injector chart: a mutating webhook that reads `dynamic-config.rs/*`
 annotations and writes a rendering agent into annotated pods, plus the
-operator's CRDs (reconcilers land in 0.3.0).
+operator's CRDs and, when enabled, the operator itself.
 
 ```sh
 helm install dynamic-config ./deploy/helm
@@ -10,7 +10,9 @@ helm install dynamic-config ./deploy/helm
 
 That is the whole install — no dependencies. The chart mints its own
 webhook certificate by default; `webhook.certManager.enabled=true`
-switches to cert-manager-issued, auto-renewed TLS. The
+switches to cert-manager-issued, auto-renewed TLS; and
+`webhook.selfRotate.enabled=true` is the third mode — the webhook
+mints, rotates and re-trusts its own pair, no dependency AND renewal. The
 [book](https://dynamic-config-rs.github.io/k8s/) carries the annotation
 contract, the store pages and the security posture; this page is the
 values reference.
@@ -29,11 +31,24 @@ values reference.
 
 | value | default | meaning |
 |---|---|---|
-| `agent.image` / `agent.tag` / `agent.digest` | ghcr, versioned | the injected image; `digest` wins over `tag`; `latest` is refused at render |
+| `agent.image` / `agent.tag` / `agent.digest` | ghcr; tag empty = `v<appVersion>` | the injected image; `digest` wins over `tag`; `latest` is refused at render |
 | `agent.defaults.cpuRequest` | `10m` | fleet-wide default for injected containers |
 | `agent.defaults.memoryRequest` | `32Mi` | — |
 | `agent.defaults.memoryLimit` | `64Mi` | — |
 | `agent.defaults.cpuLimit` | `""` | empty on purpose: throttling a config agent buys nothing |
+| `agent.defaults.fileMode` | `""` | fleet-default octal permissions for rendered files (empty = the agent's 0644); per-pod `file-mode` still wins |
+| `agent.defaults.watchSeconds` | `""` | fleet-default watch interval, whole seconds (empty = 15); per-pod `watch-seconds` still wins |
+| `agent.defaults.mode` | `""` | fleet-default injection mode `init`/`sidecar`/`both` (empty = sidecar) |
+| `agent.defaults.volumeMedium` | `""` | fleet-default volume medium `memory`/`disk` (empty = memory) |
+| `agent.defaults.nativeSidecar` | `""` | `"true"` makes native sidecars the fleet default (empty = false) |
+| `agent.defaults.runAsUser` | `""` | fleet-default agent UID (empty = 65532; 0 refused) |
+| `agent.defaults.runAsGroup` | `""` | fleet-default agent GID (same rule) |
+| `agent.defaults.metricsPort` | `""` | serve agent metrics on this port by default; pods opt out with `metrics-port: "0"` |
+| `agent.defaults.env` | `""` | fleet-wide agent environment, `NAME=value, …`; a pod's `agent-env` overrides name by name |
+| `agent.defaults.perStore` | `{}` | per-STORE defaults, one tier above the fleet's: `vault: "watch-seconds=30, file-mode=0640"` — keys spelled as the annotations spell them |
+| `webhook.agentEnvAllow` | `""` | which `agent-env` names pods may set, per namespace: `"payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"`; empty = refused everywhere |
+| `webhook.sourceAllow` | `""` | which stores pods may use, per namespace (empty = every store everywhere; non-empty = ONLY the listed) |
+| `webhook.sourceDeny` | `""` | stores turned off, per namespace; outranks `sourceAllow` |
 
 Per-pod `dynamic-config.rs/agent-*` annotations override these.
 
@@ -50,6 +65,7 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | `webhook.certManager.enabled` | `false` | `false`: chart-minted cert, Secret reused across upgrades; `true`: cert-manager issues and renews |
 | `webhook.certManager.issuerRef.name/kind` | — | required when enabled |
 | `webhook.certManager.duration/renewBefore` | cert-manager defaults | certificate lifetime knobs |
+| `webhook.selfRotate.enabled` | `false` | the third TLS mode: the webhook mints CA+leaf in memory, writes its own Secret, patches its own caBundle (two-CA transition window), rotates every 24h behind a Lease. Costs three name-scoped RBAC grants — stated beside the toggle in values.yaml. Mutually exclusive with certManager |
 | `webhook.selfSignedDays` | `3650` | validity of the chart-minted pair |
 | `webhook.failurePolicy` | `Ignore` | `Fail` couples pod CREATEs to webhook availability — the book's security page owns the trade |
 | `webhook.timeoutSeconds` | `5` | admission deadline |
@@ -68,7 +84,7 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | `webhook.extraEnv` / `.extraVolumes` / `.extraVolumeMounts` | `[]` | verbatim escape hatches |
 | `networkPolicy.enabled` | `false` | ingress 8443 only, **egress empty** — the webhook calls nobody |
 
-### Operator (0.3.0's half; CRDs install either way)
+### Operator (CRDs install either way)
 
 | value | default | meaning |
 |---|---|---|

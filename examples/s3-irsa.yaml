@@ -1,0 +1,27 @@
+# S3 with IRSA — the workload's own identity, no secret distributed.
+# The service account carries the IAM role annotation; the injected
+# agent inherits the pod's identity exactly as the app does, which is
+# the entire point of workload identity.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: billing
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE-ACCOUNT:role/billing-config-read
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "s3"
+    dynamic-config.rs/endpoint: "myapp-config"
+    dynamic-config.rs/key: "prod/db.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+spec:
+  serviceAccountName: billing
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]

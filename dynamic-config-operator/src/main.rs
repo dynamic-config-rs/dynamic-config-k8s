@@ -5,9 +5,9 @@
 //! - `DynamicConfigRender` reconciles a store document into a ConfigMap
 //!   — the mode for workloads that cannot take a sidecar.
 //!
-//! 6c of the staged plan: this binary is the *scaffold* — CRD types,
-//! their generated schemas, and the reconcile loop's shape — and the
-//! book's Operator chapter tracks what is wired against what is planned.
+//! Deliberately THIN, per the recorded tripwire: two CRDs, a
+//! reconcile-to-ConfigMap loop through the agent's own machinery, and
+//! nothing more.
 
 #![forbid(unsafe_code)]
 
@@ -33,7 +33,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    info!("operator starting (reconcilers land in 0.3.0 — see the book)");
+    // One provider, stated: with ring and aws-lc both reachable in the
+    // dependency graph, rustls refuses to pick — and panics inside the
+    // first TLS handshake instead of here, where the message can say
+    // what to do.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "a rustls CryptoProvider was already installed")?;
+
+    info!("operator starting: Render → ConfigMap/Secret reconciler, Class watch wired");
+
+    // The metrics contract's operator slice, opt-out by unsetting.
+    let metrics = std::env::var("DYNAMIC_CONFIG_OPERATOR_METRICS_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9090".to_owned());
+
+    if !metrics.is_empty() {
+        tokio::spawn(dynamic_config_agent::metrics::serve(
+            metrics,
+            "dynamic_config_operator",
+        ));
+    }
 
     let client = kube::Client::try_default().await?;
     crds::run(client).await

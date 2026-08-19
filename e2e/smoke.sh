@@ -9,9 +9,14 @@ cd "$(dirname "$0")/.."
 
 cluster=dynamic-config-e2e
 
+# An isolated kubeconfig: two e2e legs on one machine must not trade
+# current-contexts under each other.
+export KUBECONFIG
+KUBECONFIG=$(mktemp)
+
 kind create cluster --name "$cluster" --wait 120s
 
-trap 'kind delete cluster --name "$cluster"' EXIT
+trap 'kind delete cluster --name "$cluster"; rm -f "$KUBECONFIG"' EXIT
 
 just images
 kind load docker-image --name "$cluster" \
@@ -37,6 +42,9 @@ helm install dynamic-config deploy/helm \
   --namespace dynamic-config --create-namespace \
   --set webhook.image=dynamic-config-webhook --set webhook.tag=dev \
   --set agent.image=dynamic-config-agent --set agent.tag=dev \
+  --set webhook.agentEnvAllow="default: RUST_LOG" \
+  --set webhook.sourceDeny="default: git" \
+  --set agent.defaults.perStore.consul="watch-seconds=7" \
   "${extra[@]}"
 kubectl -n dynamic-config rollout status deploy/dynamic-config-webhook --timeout=180s
 
@@ -61,8 +69,11 @@ trap 'diagnose; kind delete cluster --name "$cluster"' EXIT
 
 kubectl wait --for=condition=Ready pod/annotated --timeout=180s
 
-# The claim: the sidecar rendered the file where the annotation said.
+# The claim: the sidecar rendered the file where the annotation said —
+# and the app container (uid 1000, per the pod) can read it even at
+# 0640, because the run-as annotations made the agent write as 1000.
 kubectl exec annotated -c app -- cat /config/rendered.toml | grep 'port = 9000'
+kubectl exec annotated -c app -- stat -c '%a %u %g' /config/rendered.toml | grep '640 1000 1000'
 
 # And the posture claims hold on the running pod, not only in a fixture:
 # the agent is the restricted-PSS shape and the volume never touches disk.
@@ -72,10 +83,72 @@ pod = json.loads(os.environ["POD_JSON"])
 agent = next(c for c in pod["spec"]["containers"] if c["name"] == "dynamic-config-agent")
 sc = agent["securityContext"]
 assert sc["runAsNonRoot"] and not sc["allowPrivilegeEscalation"], sc
+assert sc["runAsUser"] == 1000 and sc["runAsGroup"] == 1000, sc
 assert sc["capabilities"]["drop"] == ["ALL"], sc
 volume = next(v for v in pod["spec"]["volumes"] if v["name"] == "dynamic-config")
 assert volume["emptyDir"].get("medium") == "Memory", volume
 print("POSTURE OK: restricted agent, memory-backed volume")
 CHECK
 
+# The agent-env gate, both ways round: an allowlisted name lands as
+# environment on the agent; a name outside the list is REFUSED at
+# admission, and the refusal names the chart value that opens it.
+kubectl get pod annotated -o json \
+  | python3 -c 'import json,sys; pod=json.load(sys.stdin); \
+agent=[c for c in pod["spec"]["containers"] if c["name"]=="dynamic-config-agent"][0]; \
+assert {"name":"RUST_LOG","value":"debug"} in agent.get("env",[]), agent.get("env")'
+
+refusal="$(kubectl apply -f - 2>&1 <<'POD' && echo UNEXPECTED-ADMIT || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gated
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "consul"
+    dynamic-config.rs/endpoint: "http://consul.default.svc:8500"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+    dynamic-config.rs/agent-env: "HTTPS_PROXY=http://mitm:3128"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+POD
+)"
+echo "$refusal" | grep -q "agentEnvAllow" || { echo "the gate did not hold: $refusal"; exit 1; }
+echo "GATE OK: agent-env passes allowlisted names and refuses the rest"
+
+# The source gate: git is turned off in this namespace by the install.
+denied="$(kubectl apply -f - 2>&1 <<'POD' && echo UNEXPECTED-ADMIT || true
+apiVersion: v1
+kind: Pod
+metadata:
+  name: denied-store
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "git"
+    dynamic-config.rs/endpoint: "https://github.com/example/config.git"
+    dynamic-config.rs/key: "config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+POD
+)"
+echo "$denied" | grep -q "sourceDeny" || { echo "the source gate did not hold: $denied"; exit 1; }
+echo "SOURCE GATE OK: a denied store never reaches scheduling"
+
+# The per-store default tier: the pod names no watch-seconds, the
+# install says consul watches every 7 — the sidecar's args carry it.
+kubectl get pod annotated -o json \
+  | python3 -c 'import json,sys; pod=json.load(sys.stdin); \
+agent=[c for c in pod["spec"]["containers"] if c["name"]=="dynamic-config-agent"][0]; \
+args=agent["args"]; assert args[args.index("--watch")+1]=="7", args'
+echo "STORE DEFAULTS OK: the consul tier set the watch interval"
+
+trap 'kind delete cluster --name "$cluster"; rm -f "$KUBECONFIG"' EXIT
 echo "SMOKE OK: the annotation became a file inside the pod"

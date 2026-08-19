@@ -1,0 +1,33 @@
+# The platform-team shape, split: ONE
+# cluster-scoped class holds the store address and the credential (in
+# the platform's own namespace), and tenant namespaces reference it by
+# name — a developer writes a Render and never sees, holds or mounts a
+# store credential. `namespaces` is the boundary that keeps "global"
+# from meaning "anyone".
+apiVersion: dynamic-config.rs/v1alpha1
+kind: ClusterDynamicConfigClass
+metadata:
+  name: platform-consul
+spec:
+  source: consul
+  endpoint: http://consul.infra.svc:8500
+  tokenSecret:
+    name: consul-token
+    namespace: platform          # tenants cannot read it here
+    key: token
+  namespaces: [team-a, team-b]   # absent = every namespace, on purpose
+---
+# In team-a's namespace — nothing here is a secret:
+apiVersion: dynamic-config.rs/v1alpha1
+kind: DynamicConfigRender
+metadata:
+  name: team-a-app
+  namespace: team-a
+spec:
+  class: platform-consul
+  classKind: ClusterDynamicConfigClass
+  key: team-a/app.json
+  target:
+    configMap: team-a-app
+    file: config.toml
+  intervalSeconds: 30

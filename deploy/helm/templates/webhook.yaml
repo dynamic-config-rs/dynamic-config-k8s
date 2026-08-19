@@ -5,8 +5,12 @@ webhook configuration's caBundle. Three separate templates would each
 call the generator and mint three different CAs.
 */}}
 {{- $fullname := include "dynamic-config.webhook.fullname" . }}
+{{- if and .Values.webhook.certManager.enabled .Values.webhook.selfRotate.enabled }}
+{{- fail "webhook.certManager and webhook.selfRotate are two answers to one question: enable at most one" }}
+{{- end }}
+{{- $selfRotate := .Values.webhook.selfRotate.enabled }}
 {{- $tls := dict }}
-{{- if not .Values.webhook.certManager.enabled }}
+{{- if and (not .Values.webhook.certManager.enabled) (not $selfRotate) }}
 {{- $tls = include "dynamic-config.selfSignedTls" . | fromYaml }}
 {{- end }}
 {{- if .Values.webhook.certManager.enabled }}
@@ -30,6 +34,84 @@ spec:
   issuerRef:
     name: {{ required "webhook.certManager.issuerRef.name is required when certManager is enabled" .Values.webhook.certManager.issuerRef.name }}
     kind: {{ .Values.webhook.certManager.issuerRef.kind }}
+{{- else if $selfRotate }}
+{{- if not (lookup "v1" "Secret" .Release.Namespace (printf "%s-tls" $fullname)) }}
+{{/* An empty vessel the webhook fills and rotates; `lookup` keeps an
+     upgrade from resetting a pair already minted. */}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}-tls
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: ""
+  tls.key: ""
+{{- end }}
+---
+# The narrow price of selfRotate, all of it: ONE secret and leases in
+# this namespace, ONE webhook configuration by name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-selfrotate
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: ["{{ $fullname }}-tls"]
+    verbs: [get, patch, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [dynamic-config-webhook-rotation]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-selfrotate
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-selfrotate
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dynamic-config.webhook.serviceAccountName" . }}
+    namespace: "{{ .Release.Namespace }}"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-selfrotate
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+rules:
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations]
+    resourceNames: ["{{ include "dynamic-config.fullname" . }}"]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-selfrotate
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "dynamic-config.fullname" . }}-selfrotate
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dynamic-config.webhook.serviceAccountName" . }}
+    namespace: "{{ .Release.Namespace }}"
 {{- else }}
 apiVersion: v1
 kind: Secret
@@ -53,8 +135,10 @@ metadata:
   {{- with (merge (dict) .Values.webhook.serviceAccount.annotations .Values.commonAnnotations) }}
   annotations: {{- toYaml . | nindent 4 }}
   {{- end }}
-# The webhook talks to nobody — not even the API server. A token it
-# does not hold is a token nothing can steal.
+# Outside selfRotate the webhook talks to nobody — not even the API
+# server — and a token it does not hold is a token nothing can steal.
+# selfRotate is exactly the trade of that purity for rotation, so the
+# token exists only there, mounted at the pod.
 automountServiceAccountToken: false
 {{- end }}
 ---
@@ -82,9 +166,9 @@ spec:
         {{- with .Values.webhook.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or (not .Values.webhook.certManager.enabled) .Values.webhook.podAnnotations .Values.commonAnnotations }}
+      {{- if or (and (not .Values.webhook.certManager.enabled) (not $selfRotate)) .Values.webhook.podAnnotations .Values.commonAnnotations }}
       annotations:
-        {{- if not .Values.webhook.certManager.enabled }}
+        {{- if and (not .Values.webhook.certManager.enabled) (not $selfRotate) }}
         # Roll the pods when the generated certificate changes; the
         # webhook also reloads from disk, this covers the fresh-install
         # race where the Secret lands after the pod started.
@@ -99,7 +183,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "dynamic-config.webhook.serviceAccountName" . }}
-      automountServiceAccountToken: false
+      automountServiceAccountToken: {{ $selfRotate }}
       terminationGracePeriodSeconds: {{ .Values.webhook.terminationGracePeriodSeconds }}
       {{- if .Values.webhook.hostNetwork }}
       hostNetwork: true
@@ -136,11 +220,11 @@ spec:
       {{- end }}
       containers:
         - name: webhook
-          image: {{ include "dynamic-config.image" .Values.webhook | quote }}
+          image: {{ include "dynamic-config.image" (dict "component" .Values.webhook "root" $) | quote }}
           imagePullPolicy: {{ .Values.webhook.imagePullPolicy }}
           env:
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
-              value: {{ include "dynamic-config.image" .Values.agent | quote }}
+              value: {{ include "dynamic-config.image" (dict "component" .Values.agent "root" $) | quote }}
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
               value: "0.0.0.0:{{ .Values.webhook.port }}"
             - name: DYNAMIC_CONFIG_AGENT_CPU_REQUEST
@@ -152,6 +236,78 @@ spec:
             {{- with .Values.agent.defaults.cpuLimit }}
             - name: DYNAMIC_CONFIG_AGENT_CPU_LIMIT
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.pullSecret }}
+            - name: DYNAMIC_CONFIG_AGENT_PULL_SECRET
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.fileMode }}
+            - name: DYNAMIC_CONFIG_AGENT_FILE_MODE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.watchSeconds }}
+            - name: DYNAMIC_CONFIG_AGENT_WATCH_SECONDS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.mode }}
+            - name: DYNAMIC_CONFIG_AGENT_MODE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.volumeMedium }}
+            - name: DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.nativeSidecar }}
+            - name: DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.runAsUser }}
+            - name: DYNAMIC_CONFIG_AGENT_RUN_AS_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.runAsGroup }}
+            - name: DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.metricsPort }}
+            - name: DYNAMIC_CONFIG_AGENT_METRICS_PORT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.defaults.env }}
+            - name: DYNAMIC_CONFIG_AGENT_ENV
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.agent.defaults.perStore }}
+            {{- $groups := list }}
+            {{- range $store, $knobs := .Values.agent.defaults.perStore }}
+            {{- $groups = append $groups (printf "%s: %s" $store $knobs) }}
+            {{- end }}
+            - name: DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS
+              value: {{ join "; " $groups | quote }}
+            {{- end }}
+            {{- with .Values.webhook.agentEnvAllow }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.webhook.sourceAllow }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.webhook.sourceDeny }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $selfRotate }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_SELF_ROTATE
+              value: "1"
+            - name: DYNAMIC_CONFIG_WEBHOOK_NAMESPACE
+              value: "{{ .Release.Namespace }}"
+            - name: DYNAMIC_CONFIG_WEBHOOK_SERVICE
+              value: {{ $fullname | quote }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_TLS_SECRET
+              value: "{{ $fullname }}-tls"
+            - name: DYNAMIC_CONFIG_WEBHOOK_MWC
+              value: {{ include "dynamic-config.fullname" . | quote }}
             {{- end }}
             {{- with .Values.webhook.extraEnv }}
             {{- toYaml . | nindent 12 }}
@@ -173,13 +329,25 @@ spec:
             failureThreshold: {{ .Values.webhook.readinessProbe.failureThreshold }}
           livenessProbe:
             httpGet: { path: /healthz, port: {{ .Values.webhook.port }}, scheme: HTTPS }
+            {{- if $selfRotate }}
+            {{/* The first minted pair rides the kubelet's secret sync
+                 (up to a minute); a liveness clock tuned for mounted-at-
+                 start certificates would kill the pod mid-wait. */}}
+            initialDelaySeconds: {{ max 90 (.Values.webhook.livenessProbe.initialDelaySeconds | int) }}
+            {{- else }}
             initialDelaySeconds: {{ .Values.webhook.livenessProbe.initialDelaySeconds }}
+            {{- end }}
             periodSeconds: {{ .Values.webhook.livenessProbe.periodSeconds }}
             failureThreshold: {{ .Values.webhook.livenessProbe.failureThreshold }}
       volumes:
         - name: tls
           secret:
             secretName: {{ $fullname }}-tls
+            {{- if $selfRotate }}
+            # The pod starts before the first pair is minted; the mount
+            # fills when the rotation loop writes the Secret.
+            optional: true
+            {{- end }}
         {{- with .Values.webhook.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -230,7 +398,16 @@ spec:
     - ports:
         - port: {{ .Values.webhook.port }}
           protocol: TCP
+  {{- if $selfRotate }}
+  # selfRotate calls the API server (lease, secret, caBundle); the API
+  # server has no stable selector, so the rule is port-shaped.
+  egress:
+    - ports:
+        - { port: 443, protocol: TCP }
+        - { port: 6443, protocol: TCP }
+  {{- else }}
   egress: []
+  {{- end }}
 {{- end }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -250,7 +427,7 @@ metadata:
 webhooks:
   - name: inject.dynamic-config.rs
     clientConfig:
-      {{- if not .Values.webhook.certManager.enabled }}
+      {{- if and (not .Values.webhook.certManager.enabled) (not $selfRotate) }}
       caBundle: {{ $tls.ca }}
       {{- end }}
       service:

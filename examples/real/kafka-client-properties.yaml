@@ -1,0 +1,54 @@
+# A Kafka client, the real thing: the JVM ecosystem reads
+# client.properties files, and operators in the Strimzi mold read
+# Kubernetes SECRETS — so this uses both halves of the operator's
+# Secret target. The Render keeps a Secret reconciled from the store;
+# the client mounts it as a file; a Secret-watching consumer would
+# react to updates with no restart at all.
+#
+# Store document (consul key kafka/client.json):
+#   {"bootstrap": {"servers": "kafka-0.kafka:9092"},
+#    "security": {"protocol": "SASL_PLAINTEXT"}}
+apiVersion: dynamic-config.rs/v1alpha1
+kind: DynamicConfigClass
+metadata:
+  name: infra-consul
+spec:
+  source: consul
+  endpoint: http://consul.infra.svc:8500
+---
+apiVersion: dynamic-config.rs/v1alpha1
+kind: DynamicConfigRender
+metadata:
+  name: kafka-client
+spec:
+  class: infra-consul
+  key: kafka/client.json
+  target:
+    secret: kafka-client-properties
+    file: client.properties      # .properties: the JVM dialect, first-class
+  intervalSeconds: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: consumer } }
+  template:
+    metadata:
+      labels: { app: consumer }
+    spec:
+      containers:
+        - name: consumer
+          image: bitnami/kafka:3.9
+          command: ["sh", "-c"]
+          args:
+            - kafka-console-consumer.sh
+              --bootstrap-server $(grep bootstrap.servers /config/client.properties | cut -d= -f2- | tr -d ' ')
+              --consumer.config /config/client.properties --topic events --from-beginning
+          volumeMounts:
+            - { name: client, mountPath: /config, readOnly: true }
+      volumes:
+        - name: client
+          secret: { secretName: kafka-client-properties }

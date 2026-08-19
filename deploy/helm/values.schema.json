@@ -53,9 +53,88 @@
             "cpuLimit": {
               "type": "string",
               "pattern": "^([0-9]+(\\.[0-9]+)?(m|k|K|M|G|T|Ki|Mi|Gi|Ti)?)?$"
+            },
+            "fileMode": {
+              "type": "string",
+              "pattern": "^(0o?)?[0-7]{0,4}$",
+              "description": "Fleet-default octal permissions for rendered files; empty = the agent's 0644."
+            },
+            "watchSeconds": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "pattern": "^[0-9]*$",
+              "description": "Fleet-default watch interval in whole seconds; empty = 15."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "",
+                "init",
+                "sidecar",
+                "both"
+              ],
+              "description": "Fleet-default injection mode; empty = sidecar."
+            },
+            "volumeMedium": {
+              "type": "string",
+              "enum": [
+                "",
+                "memory",
+                "disk"
+              ],
+              "description": "Fleet-default volume medium; empty = memory."
+            },
+            "nativeSidecar": {
+              "type": [
+                "string",
+                "boolean"
+              ],
+              "pattern": "^(true|false)?$",
+              "description": "Fleet-default native-sidecar shape; empty = false."
+            },
+            "runAsUser": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "pattern": "^[0-9]*$",
+              "description": "Fleet-default agent UID; empty = 65532, 0 refused."
+            },
+            "runAsGroup": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "pattern": "^[0-9]*$",
+              "description": "Fleet-default agent GID; empty = 65532, 0 refused."
+            },
+            "metricsPort": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "pattern": "^[0-9]*$",
+              "description": "Fleet-default agent metrics port; empty = no metrics endpoint."
+            },
+            "env": {
+              "type": "string",
+              "description": "Fleet-wide agent environment, 'NAME=value, NAME=value'; a pod's agent-env overrides name by name."
+            },
+            "perStore": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Per-store default knobs: {vault: 'watch-seconds=30, file-mode=0640'} \u2014 keys spelled as the annotations spell them."
             }
           },
           "additionalProperties": false
+        },
+        "pullSecret": {
+          "type": "string",
+          "description": "imagePullSecret name appended to injected pods; must exist in each injecting namespace"
         }
       },
       "additionalProperties": false
@@ -305,6 +384,28 @@
           "items": {
             "type": "object"
           }
+        },
+        "selfRotate": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The webhook mints and rotates its own certificate, and patches its own caBundle; mutually exclusive with certManager.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "agentEnvAllow": {
+          "type": "string",
+          "description": "Which agent-env names pods may set, per namespace: 'payments: HTTPS_PROXY, AWS_*; *: RUST_LOG'. Empty = refused everywhere."
+        },
+        "sourceAllow": {
+          "type": "string",
+          "description": "Which stores pods may use, per namespace; empty = every store everywhere."
+        },
+        "sourceDeny": {
+          "type": "string",
+          "description": "Stores turned off, per namespace; outranks sourceAllow."
         }
       },
       "additionalProperties": false

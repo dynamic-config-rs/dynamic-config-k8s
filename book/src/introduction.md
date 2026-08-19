@@ -26,10 +26,15 @@ integration exists for the pods that want files rendered *for* them:
 Java services reading `.properties`, anything that must not carry store
 credentials in-process, and fleets standardising one injection pattern.
 
+How a document REACHES a workload — a live file, real environment
+variables, or a native Kubernetes Secret — is its own decision, with a
+map and two honest comparison tables (Vault Agent Injector, External
+Secrets Operator) on [The Three Deliveries](injection-shapes.md).
+
 ## The three pieces, staged
 
 | piece | ships in | today |
 |---|---|---|
-| agent | 0.1.0 | built and tested — consul, vault, config-server, firestore, git, redis; etcd, nats and s3 join in 0.2.0 |
-| webhook | 0.2.0 | golden-tested; the annotation contract is v1 |
-| operator | 0.3.0 | CRDs settled and generated; reconcilers land here |
+| agent | 0.1.0 | all nine stores — the blocking six since 0.1.0, etcd/nats/s3 on the async path since 0.2.0 |
+| webhook | 0.1.0 | golden-tested; the annotation contract is v1; three TLS modes incl. selfRotate (0.3.0) |
+| operator | 0.3.0 | Render → ConfigMap reconciler shipped, Class watch wired, e2e-gated |
