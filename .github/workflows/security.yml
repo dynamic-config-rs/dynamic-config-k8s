@@ -44,6 +44,14 @@ jobs:
   # input; the agent and webhook appear in both — their libraries and
   # their binaries each carry the forbid.
   shared:
+    # The caller's grant must COVER every permission a called job asks
+    # for — the callee's dependency review comments on pull requests,
+    # and a callee cannot exceed what this block hands it. Leaving it
+    # off inherits the workflow's bare `contents: read` and fails the
+    # whole call at startup.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: dynamic-config-rs/.github/.github/workflows/reusable-security-rust.yml@main
     with:
       crates: dynamic-config-agent dynamic-config-webhook
