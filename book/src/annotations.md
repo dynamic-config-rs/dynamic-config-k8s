@@ -195,7 +195,7 @@ consul `kubernetes` needs `auth-mount`, a certificate needs its key).
 Those refusals land in the injected container's log and the pod's
 events.
 
-`DynamicConfigClass` (0.3.0) shrinks all of this to a class reference —
+`DynamicConfigClass` shrinks all of this to a class reference —
 the [operator page](operator.md) carries the shape.
 
 ## The agent-env gate

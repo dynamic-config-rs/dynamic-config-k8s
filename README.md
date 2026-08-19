@@ -19,11 +19,11 @@ Three pieces, all shipped:
 
 | | since | what it is |
 |---|---|---|
-| `dynamic-config-agent` | 0.1.0 | init/sidecar binary: store → resolved document → atomic file, any format — `.properties` and `.ini` included. **Nine stores** (consul, vault, config-server, firestore, git, redis; etcd, nats and s3 on the async path since 0.2.0), every auth method each store takes |
-| `dynamic-config-webhook` | 0.1.0 | the mutating admission webhook that writes the agent into annotated pods; terminates its own TLS — chart-minted by default, cert-manager optional, or **selfRotate** (0.3.0): the webhook mints, rotates and re-trusts its own pair |
-| `dynamic-config-operator` | 0.3.0 | `DynamicConfigClass` (store bundles) and `DynamicConfigRender` → ConfigMap reconciler, for sidecar-averse workloads; owner-reference cleanup, e2e-gated |
+| `dynamic-config-agent` | 0.1.0 | init/sidecar binary: store → resolved document → atomic file, any format — `.properties` and `.ini` included. **Nine stores** (consul, vault, config-server, firestore, git, redis; etcd, nats and s3 on the async path since 0.1.1), every auth method each store takes |
+| `dynamic-config-webhook` | 0.1.0 | the mutating admission webhook that writes the agent into annotated pods; terminates its own TLS — chart-minted by default, cert-manager optional, or **selfRotate** (0.1.1): the webhook mints, rotates and re-trusts its own pair |
+| `dynamic-config-operator` | 0.1.1 | `DynamicConfigClass` (store bundles) and `DynamicConfigRender` → ConfigMap reconciler, for sidecar-averse workloads; owner-reference cleanup, e2e-gated |
 | `deploy/` | — | the chart (full values reference in its README), the kustomize base + overlays, and the CRDs — one generated source, three drift-gated copies |
-| [`ROADMAP.md`](ROADMAP.md) | — | the ladder, every rung shipped: release machinery → async stores + identity-first auth → self-rotating webhook TLS → the operator's loops |
+| [`ROADMAP.md`](ROADMAP.md) | — | the original ladder shipped in full with 0.1.1; what remains there is demand-gated (admission-latency histogram, template functions) |
 | `examples/` | — | twenty-two ready-to-apply manifests + six real-software walkthroughs (Airflow, Grafana, Kafka, Postgres existingSecret, multi-tenant, and a four-component end-to-end shop stack): every store, every auth method, the native-sidecar Job, the template that renders an env file |
 
 Images: `ghcr.io/dynamic-config-rs/dynamic-config-{agent,webhook,operator}`,

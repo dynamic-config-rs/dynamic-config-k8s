@@ -30,7 +30,7 @@
 # Advanced
 
 - [GitOps: ArgoCD and Flux](gitops.md)
-- [The Operator (0.3.0)](operator.md)
+- [The Operator](operator.md)
 - [Observability](observability.md)
 - [Troubleshooting](troubleshooting.md)
 

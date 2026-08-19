@@ -1036,7 +1036,7 @@ fn two_templates_are_refused() {
 
 #[test]
 fn the_async_stores_are_admitted_since_0_2_0() {
-    // Since 0.2.0 the async stores are admitted like any other: the
+    // Since 0.1.1 the async stores are admitted like any other: the
     // refusal-by-name this test used to pin retired with the agent's
     // async path.
     for store in ["etcd", "nats", "s3"] {

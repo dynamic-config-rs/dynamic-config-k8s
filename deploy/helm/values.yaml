@@ -232,7 +232,7 @@ webhook:
 networkPolicy:
   enabled: false
 
-# ── The operator (0.3.0's half; the CRDs install either way) ─────────
+# ── The operator (optional; the CRDs install either way) ─────────────
 operator:
   enabled: false
   image: ghcr.io/dynamic-config-rs/dynamic-config-operator

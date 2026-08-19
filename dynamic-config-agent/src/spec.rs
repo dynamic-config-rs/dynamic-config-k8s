@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn the_async_stores_parse() {
-        // The 0.1 refusal-by-name retired with the 0.2.0 async path.
+        // The 0.1.0 refusal-by-name retired when the async path landed.
         for line in [
             "--source etcd --endpoint http://etcd:2379 --key app/config.json --out /z.json",
             "--source nats --endpoint nats://nats:4222 --key config/db.json --out /z.json",

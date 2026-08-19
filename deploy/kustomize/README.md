@@ -21,8 +21,8 @@ Composing (a Flux Kustomization or an Argo Application points here):
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/selfrotate?ref=v0.3.0
-  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/with-operator?ref=v0.3.0
+  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/selfrotate?ref=v0.1.1
+  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/with-operator?ref=v0.1.1
 ```
 
 ## cert-manager

@@ -35,6 +35,6 @@ Secrets Operator) on [The Three Deliveries](injection-shapes.md).
 
 | piece | ships in | today |
 |---|---|---|
-| agent | 0.1.0 | all nine stores — the blocking six since 0.1.0, etcd/nats/s3 on the async path since 0.2.0 |
-| webhook | 0.1.0 | golden-tested; the annotation contract is v1; three TLS modes incl. selfRotate (0.3.0) |
-| operator | 0.3.0 | Render → ConfigMap reconciler shipped, Class watch wired, e2e-gated |
+| agent | 0.1.1 | all nine stores — the blocking six since 0.1.0, etcd/nats/s3 on the async path since 0.1.1 |
+| webhook | 0.1.1 | golden-tested; the annotation contract is v1; three TLS modes incl. selfRotate |
+| operator | 0.1.1 | Render → ConfigMap reconciler shipped, Class watch wired, e2e-gated |

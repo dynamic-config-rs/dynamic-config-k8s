@@ -1,7 +1,7 @@
 # The aggregation front: the server holds the store credentials once
-# and speaks all nine stores — including etcd, NATS and S3, which reach
-# the agent directly in 0.2.0. The pod holds one short client token
-# scoped to one application.
+# and speaks all nine stores — every one of which the agent also
+# reaches directly. The pod holds one short client token scoped to
+# one application.
 apiVersion: v1
 kind: Secret
 metadata:

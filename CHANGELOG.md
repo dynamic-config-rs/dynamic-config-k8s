@@ -107,6 +107,13 @@ version — the contract is the API here.
 
 ### Fixed
 
+- **The version story told the truth late**: the async stores, the
+  selfRotate TLS mode and the operator's reconcilers all shipped in
+  0.1.1, but the README, the roadmap, the book's introduction,
+  operator/sources/config-server/stability pages, the kustomize README
+  refs and two comments still promised them for "0.2.0" and "0.3.0" —
+  versions that never existed. Every reference now says 0.1.1, and the
+  roadmap keeps only what is NOT yet built.
 - **s3 with `api-url` no longer needs an ambient region**: an explicit
   endpoint means a non-AWS server (MinIO, Ceph, R2) — there is no IMDS
   to ask, so the SDK's region lookup timed out and left the client
