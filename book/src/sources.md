@@ -33,7 +33,7 @@ self-contained with its Secret placeholders.
 
 ## etcd, NATS, S3 — the async three
 
-Since 0.2.0 the agent drives both of the engine's source traits: the
+Since 0.1.1 the agent drives both of the engine's source traits: the
 blocking six run under a blocking task, and [etcd](etcd.md),
 [NATS](nats.md) and [S3](s3.md) — whose clients are async — are driven
 directly by the agent's own runtime. The 0.1 refusal-by-name retired

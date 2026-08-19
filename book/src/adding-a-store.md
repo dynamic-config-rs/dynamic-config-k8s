@@ -27,7 +27,7 @@ dialect is.
 
 ## The walkthrough, with GCP Secret Manager as the worked example
 
-The 0.2.0 change that landed etcd, NATS and S3 is the living template —
+The 0.1.1 change that landed etcd, NATS and S3 is the living template —
 `git log --grep "async three"` in the two repositories shows every
 touchpoint below with real diffs.
 

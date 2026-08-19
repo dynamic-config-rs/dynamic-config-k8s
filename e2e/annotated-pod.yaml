@@ -5,7 +5,9 @@ metadata:
   annotations:
     dynamic-config.rs/inject: "true"
     dynamic-config.rs/source: "consul"
-    dynamic-config.rs/endpoint: "http://consul:8500"
+    # The FQDN matches the address the smoke's install PINS — the pin
+    # rule lets the same value be restated, and this pod proves it.
+    dynamic-config.rs/endpoint: "http://consul.default.svc:8500"
     dynamic-config.rs/key: "myapp/config.json"
     dynamic-config.rs/path: "/config/rendered.toml"
     dynamic-config.rs/mode: "both"

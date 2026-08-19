@@ -1036,7 +1036,7 @@ fn two_templates_are_refused() {
 
 #[test]
 fn the_async_stores_are_admitted_since_0_2_0() {
-    // Since 0.2.0 the async stores are admitted like any other: the
+    // Since 0.1.1 the async stores are admitted like any other: the
     // refusal-by-name this test used to pin retired with the agent's
     // async path.
     for store in ["etcd", "nats", "s3"] {
@@ -1416,4 +1416,195 @@ fn fleet_environment_rides_under_the_pods_own() {
     assert!(env.contains(&json!({ "name": "HTTPS_PROXY", "value": "http://egress:3128" })));
     assert!(env.contains(&json!({ "name": "RUST_LOG", "value": "debug" })));
     assert!(!env.contains(&json!({ "name": "RUST_LOG", "value": "info" })));
+}
+
+/// The developer who knows nothing but "inject me": source, endpoint,
+/// key and path all arrive from the installation.
+#[test]
+fn a_pod_can_deploy_knowing_only_that_it_wants_config() {
+    let tiers = install(&[
+        ("DYNAMIC_CONFIG_AGENT_SOURCE", "consul"),
+        ("DYNAMIC_CONFIG_AGENT_PATH", "/config/rendered.toml"),
+        (
+            "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+            "consul: endpoint=http://consul.infra.svc:8500, key=myapp/config.json",
+        ),
+    ]);
+
+    let pod = json!({
+        "metadata": { "annotations": { "dynamic-config.rs/inject": "true" } },
+        "spec": { "containers": [ { "name": "app", "image": "app:1" } ] },
+    });
+
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(request.source, "consul");
+    assert_eq!(
+        request.endpoint.as_deref(),
+        Some("http://consul.infra.svc:8500")
+    );
+    assert_eq!(request.key, "myapp/config.json");
+    assert_eq!(request.path, "/config/rendered.toml");
+}
+
+/// Every store-shaped field can arrive from the per-store tier — auth,
+/// its mount and role, the CA, a section, a token Secret, a template.
+#[test]
+fn store_defaults_cover_every_store_shaped_field() {
+    let tiers = install(&[(
+        "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+        "vault: endpoint=https://vault.vault.svc:8200, section=db, \
+         auth=kubernetes, auth-mount=kubernetes, auth-role=myapp, \
+         ca-configmap=vault-ca, key=secret/myapp",
+    )]);
+
+    let pod = json!({
+        "metadata": {
+            "annotations": {
+                "dynamic-config.rs/inject": "true",
+                "dynamic-config.rs/source": "vault",
+                "dynamic-config.rs/path": "/config/rendered.yaml",
+            },
+        },
+        "spec": { "containers": [ { "name": "app", "image": "app:1" } ] },
+    });
+
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        request.endpoint.as_deref(),
+        Some("https://vault.vault.svc:8200")
+    );
+    assert_eq!(request.key, "secret/myapp");
+    assert_eq!(request.ca.as_ref().unwrap().name, "vault-ca");
+
+    for pair in [
+        ("--section", "db"),
+        ("--auth", "kubernetes"),
+        ("--auth-mount", "kubernetes"),
+        ("--auth-role", "myapp"),
+    ] {
+        assert!(
+            request
+                .arguments
+                .iter()
+                .any(|(flag, value)| (flag.as_str(), value.as_str()) == pair),
+            "{pair:?} missing from {:?}",
+            request.arguments
+        );
+    }
+}
+
+#[test]
+fn pinned_values_refuse_differing_annotations_and_pass_matching_ones() {
+    let tiers = install(&[(
+        "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+        "consul: watch-seconds=7!, endpoint=http://consul.infra.svc:8500!",
+    )]);
+
+    let mut differing = annotated("sidecar");
+    differing["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("9");
+
+    let error = dynamic_config_webhook::of_pod_with(&differing, &tiers).unwrap_err();
+    assert!(error.contains("pins"), "{error}");
+
+    // The same value restated is not a conflict…
+    let mut matching = annotated("sidecar");
+    matching["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("7");
+    matching["metadata"]["annotations"]["dynamic-config.rs/endpoint"] =
+        json!("http://consul.infra.svc:8500");
+    assert!(dynamic_config_webhook::of_pod_with(&matching, &tiers).is_ok());
+
+    // …and a pinned endpoint cannot be sidestepped through the pair's
+    // other half.
+    let mut sidestep = annotated("sidecar");
+    sidestep["metadata"]["annotations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("dynamic-config.rs/endpoint");
+    sidestep["metadata"]["annotations"]["dynamic-config.rs/endpoint-secret"] = json!("evil/url");
+
+    let error = dynamic_config_webhook::of_pod_with(&sidestep, &tiers).unwrap_err();
+    assert!(error.contains("answers as one"), "{error}");
+}
+
+#[test]
+fn overridable_false_pins_the_set_and_spares_the_unset() {
+    let tiers = install(&[
+        ("DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE", "false"),
+        ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "0640"),
+        ("DYNAMIC_CONFIG_AGENT_WATCH_SECONDS", "30?"),
+    ]);
+
+    // file-mode is installation-set and unmarked: pinned by the flag.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/file-mode"] = json!("0600");
+    let error = dynamic_config_webhook::of_pod_with(&pod, &tiers).unwrap_err();
+    assert!(error.contains("pins"), "{error}");
+
+    // watch-seconds carries "?": overridable even under the flag.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("5");
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.watch_seconds, 5);
+
+    // metrics-port was never installation-set: still the pod's.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/metrics-port"] = json!("9102");
+    assert!(dynamic_config_webhook::of_pod_with(&pod, &tiers).is_ok());
+}
+
+#[test]
+fn a_pinned_fleet_source_refuses_a_different_store() {
+    let tiers = install(&[("DYNAMIC_CONFIG_AGENT_SOURCE", "consul!")]);
+
+    let error = dynamic_config_webhook::of_pod_with(&vault_kubernetes_pod(), &tiers).unwrap_err();
+    assert!(error.contains("pins"), "{error}");
+
+    // Restating consul, or saying nothing, both pass.
+    assert!(dynamic_config_webhook::of_pod_with(&annotated("sidecar"), &tiers).is_ok());
+}
+
+/// The override ladder inside one store's group: `overridable=false`
+/// pins that store's values, a `?` marker reopens one of them, and
+/// other stores stay untouched.
+#[test]
+fn a_store_can_pin_its_own_group() {
+    let tiers = install(&[(
+        "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+        "consul: overridable=false, watch-seconds=7, file-mode=0640?; \
+         redis: watch-seconds=9",
+    )]);
+
+    // watch-seconds is pinned by the store's flag…
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("30");
+    let error = dynamic_config_webhook::of_pod_with(&pod, &tiers).unwrap_err();
+    assert!(error.contains("pins"), "{error}");
+
+    // …file-mode carries "?" and stays the pod's…
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/file-mode"] = json!("0600");
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.file_mode.as_deref(), Some("600"));
+
+    // …and redis pods override their watch freely: the flag was
+    // consul's, not the fleet's.
+    let mut pod = annotated("sidecar");
+    let notes = &mut pod["metadata"]["annotations"];
+    notes["dynamic-config.rs/source"] = json!("redis");
+    notes["dynamic-config.rs/endpoint"] = json!("redis://redis.infra.svc:6379");
+    notes["dynamic-config.rs/watch-seconds"] = json!("30");
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+    assert_eq!(request.watch_seconds, 30);
 }

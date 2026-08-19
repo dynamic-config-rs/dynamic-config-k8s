@@ -60,6 +60,10 @@ pub(crate) const SOURCES: &[&str] = &[
     "s3",
 ];
 
+/// A borrowed accessor into one tier's knobs — the type behind the
+/// per-key pick tables.
+type Pick<'a, T> = &'a dyn Fn(&KnobDefaults) -> Option<T>;
+
 /// Names grouped by namespace — the shape every gate shares. Grammar:
 /// semicolons between groups, an optional `namespace:` head on each
 /// (absent means every namespace), commas between names. What counts
@@ -301,6 +305,38 @@ struct KnobDefaults {
     run_as_user: Option<u32>,
     run_as_group: Option<u32>,
     metrics_port: Option<u16>,
+    /// The rendered file's location — fleet or per store.
+    path: Option<String>,
+    /// The store-shaped strings, per-store tiers only (the fleet's
+    /// environment variables cannot set them): the address, the
+    /// document, credentials' Secret names, auth flags, templates.
+    endpoint: Option<String>,
+    endpoint_secret: Option<String>,
+    key: Option<String>,
+    token_secret: Option<String>,
+    password_secret: Option<String>,
+    ca_configmap: Option<String>,
+    tls_secret: Option<String>,
+    ssh_secret: Option<String>,
+    aws_secret: Option<String>,
+    section: Option<String>,
+    auth: Option<String>,
+    auth_mount: Option<String>,
+    auth_role: Option<String>,
+    auth_username: Option<String>,
+    auth_token_path: Option<String>,
+    namespace: Option<String>,
+    reference: Option<String>,
+    api_url: Option<String>,
+    template: Option<String>,
+    template_configmap: Option<String>,
+    /// This tier's own override mode (`overridable=false` inside a
+    /// store's group): pins every value THIS tier sets, unless a
+    /// per-value marker says otherwise.
+    overridable: Option<bool>,
+    /// Explicit `!`/`?` markers: `(knob key, overridable)`. A knob
+    /// with no entry follows this tier's flag, then the installation's.
+    rules: Vec<(String, bool)>,
 }
 
 /// The knob keys, spelled exactly as the annotations spell them — one
@@ -308,12 +344,33 @@ struct KnobDefaults {
 const KNOBS: &str = "agent-cpu-request, agent-memory-request, \
      agent-cpu-limit, agent-memory-limit, file-mode, watch-seconds, \
      mode, volume-medium, native-sidecar, agent-run-as-user, \
-     agent-run-as-group, metrics-port";
+     agent-run-as-group, metrics-port, path, overridable — and, per \
+     store, every \
+     store-shaped annotation: endpoint, endpoint-secret, key, \
+     token-secret, password-secret, ca-configmap, tls-secret, \
+     ssh-secret, aws-secret, section, auth, auth-mount, auth-role, \
+     auth-username, auth-token-path, namespace, ref, api-url, \
+     template, template-configmap";
 
 impl KnobDefaults {
     /// One `key=value`, validated exactly as the matching annotation
-    /// would be. The context names where the value came from.
+    /// would be. The context names where the value came from. A value
+    /// ending in `!` is PINNED (a differing annotation is refused); one
+    /// ending in `?` stays overridable even under `overridable:
+    /// "false"`; unmarked values follow that flag.
     fn set(&mut self, context: &str, key: &str, value: &str) -> Result<(), String> {
+        let (value, rule) = match value.strip_suffix('!') {
+            Some(value) => (value.trim_end(), Some(false)),
+            None => match value.strip_suffix('?') {
+                Some(value) => (value.trim_end(), Some(true)),
+                None => (value, None),
+            },
+        };
+
+        if let Some(overridable) = rule {
+            self.rules.push((key.to_owned(), overridable));
+        }
+
         match key {
             "agent-cpu-request"
             | "agent-memory-request"
@@ -392,6 +449,64 @@ impl KnobDefaults {
                         format!("{context}: metrics-port is {value:?}: a port number")
                     })?);
             }
+            "path" => {
+                if !value.starts_with('/') {
+                    return Err(format!("{context}: path is {value:?}: an absolute path"));
+                }
+
+                self.path = Some(value.to_owned());
+            }
+            "overridable" => {
+                self.overridable = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "{context}: overridable is {other:?}: \"true\" or \"false\""
+                        ))
+                    }
+                });
+            }
+            "endpoint" | "endpoint-secret" | "key" | "token-secret" | "password-secret"
+            | "ca-configmap" | "tls-secret" | "ssh-secret" | "aws-secret" | "section" | "auth"
+            | "auth-mount" | "auth-role" | "auth-username" | "auth-token-path" | "namespace"
+            | "ref" | "api-url" | "template" | "template-configmap" => {
+                if value.is_empty() {
+                    return Err(format!("{context}: {key} is empty"));
+                }
+
+                if matches!(key, "token-secret" | "password-secret" | "endpoint-secret")
+                    && !value.contains('/')
+                {
+                    return Err(format!(
+                        "{context}: {key} is {value:?}: the form is <secret-name>/<key>"
+                    ));
+                }
+
+                let slot = match key {
+                    "endpoint" => &mut self.endpoint,
+                    "endpoint-secret" => &mut self.endpoint_secret,
+                    "key" => &mut self.key,
+                    "token-secret" => &mut self.token_secret,
+                    "password-secret" => &mut self.password_secret,
+                    "ca-configmap" => &mut self.ca_configmap,
+                    "tls-secret" => &mut self.tls_secret,
+                    "ssh-secret" => &mut self.ssh_secret,
+                    "aws-secret" => &mut self.aws_secret,
+                    "section" => &mut self.section,
+                    "auth" => &mut self.auth,
+                    "auth-mount" => &mut self.auth_mount,
+                    "auth-role" => &mut self.auth_role,
+                    "auth-username" => &mut self.auth_username,
+                    "auth-token-path" => &mut self.auth_token_path,
+                    "namespace" => &mut self.namespace,
+                    "ref" => &mut self.reference,
+                    "api-url" => &mut self.api_url,
+                    "template" => &mut self.template,
+                    _ => &mut self.template_configmap,
+                };
+                *slot = Some(value.to_owned());
+            }
             other => {
                 return Err(format!(
                     "{context}: {other:?} is not a defaultable knob; the knobs \
@@ -421,6 +536,7 @@ const FLEET_KNOBS: &[(&str, &str)] = &[
     ("DYNAMIC_CONFIG_AGENT_RUN_AS_USER", "agent-run-as-user"),
     ("DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP", "agent-run-as-group"),
     ("DYNAMIC_CONFIG_AGENT_METRICS_PORT", "metrics-port"),
+    ("DYNAMIC_CONFIG_AGENT_PATH", "path"),
 ];
 
 /// Everything an installation decides: fleet defaults, per-store
@@ -432,6 +548,18 @@ const FLEET_KNOBS: &[(&str, &str)] = &[
 pub struct Installation {
     fleet: KnobDefaults,
     per_store: Vec<(String, KnobDefaults)>,
+    /// A fleet default SOURCE: a pod may say only `key` and `path`,
+    /// and the installation answers where they live. Covers the
+    /// default render only — a named render is an explicit construct
+    /// and keeps naming its own store.
+    source: Option<String>,
+    /// The source's own `!`/`?` marker, when one was given.
+    source_rule: Option<bool>,
+    /// The default override mode: `true` (the default) lets pod
+    /// annotations override installation values; `false` pins every
+    /// installation-SET value. Either way, per-value `!`/`?` markers
+    /// win, and knobs the installation never set stay the pod's.
+    overridable: bool,
     /// `DYNAMIC_CONFIG_AGENT_ENV`: environment every injected agent
     /// gets. Installer-set, so no allowlist applies; a pod's own
     /// `agent-env` overrides it name by name.
@@ -503,6 +631,39 @@ impl Installation {
             per_store.push((store.to_owned(), defaults));
         }
 
+        let overridable = match var("DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE").as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(other) => {
+                return Err(format!(
+                    "DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE is {other:?}: \
+                     \"true\" or \"false\""
+                ))
+            }
+        };
+
+        let (source, source_rule) = match var("DYNAMIC_CONFIG_AGENT_SOURCE") {
+            None => (None, None),
+            Some(text) => {
+                let (name, rule) = match text.strip_suffix('!') {
+                    Some(name) => (name.trim_end(), Some(false)),
+                    None => match text.strip_suffix('?') {
+                        Some(name) => (name.trim_end(), Some(true)),
+                        None => (text.as_str(), None),
+                    },
+                };
+
+                if !SOURCES.contains(&name) {
+                    return Err(format!(
+                        "DYNAMIC_CONFIG_AGENT_SOURCE is {name:?}: not a store \
+                         this contract knows"
+                    ));
+                }
+
+                (Some(name.to_owned()), rule)
+            }
+        };
+
         let agent_env = match var("DYNAMIC_CONFIG_AGENT_ENV") {
             None => Vec::new(),
             Some(text) => env_entries("DYNAMIC_CONFIG_AGENT_ENV", &text)?,
@@ -520,6 +681,9 @@ impl Installation {
         Ok(Installation {
             fleet,
             per_store,
+            source,
+            source_rule,
+            overridable,
             agent_env,
             agent_env_allow: scoped(
                 "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
@@ -550,9 +714,84 @@ impl Installation {
         source: Option<&str>,
         pick: impl Fn(&KnobDefaults) -> Option<T>,
     ) -> Option<T> {
+        self.supplied(source, "", pick).map(|(value, _)| value)
+    }
+
+    /// The value the installation supplies for a knob, and whether it
+    /// is PINNED against a differing annotation. The rule comes from
+    /// the tier that supplied the value: its own `!`/`?` marker when
+    /// one was given, the `overridable` flag otherwise.
+    fn supplied<T: Clone>(
+        &self,
+        source: Option<&str>,
+        key: &str,
+        pick: impl Fn(&KnobDefaults) -> Option<T>,
+    ) -> Option<(T, bool)> {
+        let tier = |knobs: &KnobDefaults| {
+            pick(knobs).map(|value| {
+                // Per-value marker, then the tier's own overridable
+                // flag, then the installation's — closest word wins.
+                let overridable = knobs
+                    .rules
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, overridable)| *overridable)
+                    .or(knobs.overridable)
+                    .unwrap_or(self.overridable);
+
+                (value, !overridable)
+            })
+        };
+
         self.store(source)
-            .and_then(&pick)
-            .or_else(|| pick(&self.fleet))
+            .and_then(tier)
+            .or_else(|| tier(&self.fleet))
+    }
+
+    /// Every string-typed store-shaped default this installation
+    /// supplies for a source, with each value's pin: the raw material
+    /// for the annotation-else-default lookup and the conflict walk.
+    fn store_strings(&self, source: Option<&str>) -> Vec<(&'static str, String, bool)> {
+        let mut out: Vec<(&'static str, String, bool)> = Vec::new();
+
+        let picks: &[(&'static str, Pick<String>)] = &[
+            ("endpoint", &|k| k.endpoint.clone()),
+            ("endpoint-secret", &|k| k.endpoint_secret.clone()),
+            ("key", &|k| k.key.clone()),
+            ("path", &|k| k.path.clone()),
+            ("token-secret", &|k| k.token_secret.clone()),
+            ("password-secret", &|k| k.password_secret.clone()),
+            ("ca-configmap", &|k| k.ca_configmap.clone()),
+            ("tls-secret", &|k| k.tls_secret.clone()),
+            ("ssh-secret", &|k| k.ssh_secret.clone()),
+            ("aws-secret", &|k| k.aws_secret.clone()),
+            ("section", &|k| k.section.clone()),
+            ("auth", &|k| k.auth.clone()),
+            ("auth-mount", &|k| k.auth_mount.clone()),
+            ("auth-role", &|k| k.auth_role.clone()),
+            ("auth-username", &|k| k.auth_username.clone()),
+            ("auth-token-path", &|k| k.auth_token_path.clone()),
+            ("namespace", &|k| k.namespace.clone()),
+            ("ref", &|k| k.reference.clone()),
+            ("api-url", &|k| k.api_url.clone()),
+            ("template", &|k| k.template.clone()),
+            ("template-configmap", &|k| k.template_configmap.clone()),
+        ];
+
+        for (key, pick) in picks {
+            if let Some((value, pinned)) = self.supplied(source, key, pick) {
+                out.push((key, value, pinned));
+            }
+        }
+
+        out
+    }
+
+    /// The fleet source and whether IT is pinned.
+    fn supplied_source(&self) -> Option<(&str, bool)> {
+        self.source
+            .as_deref()
+            .map(|source| (source, !self.source_rule.unwrap_or(self.overridable)))
     }
 
     /// Is this source turned off here outright?
@@ -880,22 +1119,105 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         _ => {}
     }
 
-    let required = |name: &str| {
-        get(name)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("{PREFIX}inject is true, so {PREFIX}{name} is required"))
-    };
-
-    // Every knob below resolves annotation → this store's installation
+    // Every value below resolves annotation → this store's installation
     // default → the fleet's → the built-in. Pod-wide knobs (mode,
     // volume, resources, identity) take the DEFAULT render's store.
-    let source_name = get("source");
+    // A pinned installation value (`!`, or `overridable: "false"`)
+    // refuses a DIFFERING annotation — never silently outvotes it,
+    // because a value the author wrote and did not get is a debugging
+    // session; the SAME value restated passes.
+    let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        format!(
+            "{PREFIX}{key} is {pod:?}, but the installation pins it to \
+             {tier:?} — match it or drop the annotation (the installer \
+             opens the value with a \"?\" marker, or everything with \
+             overridable \"true\")"
+        )
+    };
+
+    // The pod's source, else the fleet's; a pinned fleet source
+    // refuses a pod that names a different one.
+    if let (Some(pod_source), Some((fleet_source, true))) =
+        (get("source"), install.supplied_source())
+    {
+        if pod_source != fleet_source {
+            return Err(pinned("source", pod_source, fleet_source));
+        }
+    }
+
+    let source_name = get("source").or_else(|| install.supplied_source().map(|(s, _)| s));
+
+    // The store-shaped strings this installation supplies for that
+    // source, resolved once: the lookup below reads annotation first,
+    // these second — and the walk here refuses a pinned conflict.
+    let supplied_strings = install.store_strings(source_name);
+
+    for (key, tier, is_pinned) in &supplied_strings {
+        if !is_pinned {
+            continue;
+        }
+
+        if let Some(pod_value) = get(key) {
+            if pod_value != tier {
+                return Err(pinned(key, pod_value, tier));
+            }
+        }
+    }
+
+    let defaulted = |name: &str| -> Option<&str> {
+        get(name).or_else(|| {
+            supplied_strings
+                .iter()
+                .find(|(key, _, _)| *key == name)
+                .map(|(_, value, _)| value.as_str())
+        })
+    };
+
+    // The two either-or pairs resolve as a LEVEL, so a pinned half must
+    // also refuse the pod answering with the OTHER half — otherwise a
+    // pinned endpoint is sidestepped by an endpoint-secret.
+    for (a, b) in [
+        ("endpoint", "endpoint-secret"),
+        ("endpoint-secret", "endpoint"),
+        ("template", "template-configmap"),
+        ("template-configmap", "template"),
+    ] {
+        let a_pinned = supplied_strings
+            .iter()
+            .any(|(key, _, is_pinned)| *key == a && *is_pinned);
+
+        if a_pinned && get(a).is_none() && get(b).is_some() {
+            return Err(format!(
+                "{PREFIX}{b} is set, but the installation pins {PREFIX}{a} — \
+                 the pair answers as one, and this half is not the pod's \
+                 to choose"
+            ));
+        }
+    }
 
     let mode = match get("mode") {
-        Some("init") => Mode::Init,
-        Some("sidecar") => Mode::Sidecar,
-        Some("both") => Mode::Both,
-        Some(other) => return Err(format!("{PREFIX}mode is {other:?}: init, sidecar or both")),
+        Some(text) => {
+            let mode = match text {
+                "init" => Mode::Init,
+                "sidecar" => Mode::Sidecar,
+                "both" => Mode::Both,
+                other => return Err(format!("{PREFIX}mode is {other:?}: init, sidecar or both")),
+            };
+
+            if let Some((tier, true)) = install.supplied(source_name, "mode", |k| k.mode) {
+                if tier != mode {
+                    let name = |m: Mode| match m {
+                        Mode::Init => "init",
+                        Mode::Sidecar => "sidecar",
+                        Mode::Both => "both",
+                    };
+
+                    return Err(pinned("mode", name(mode), name(tier)));
+                }
+            }
+
+            mode
+        }
         None => install
             .knob(source_name, |k| k.mode)
             .unwrap_or(Mode::Sidecar),
@@ -903,14 +1225,26 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
 
     let watch_seconds = match get("watch-seconds") {
         None => install.knob(source_name, |k| k.watch_seconds).unwrap_or(15),
-        Some(text) => text
-            .parse()
-            .map_err(|_| format!("{PREFIX}watch-seconds is {text:?}: whole seconds"))?,
+        Some(text) => {
+            let seconds: u64 = text
+                .parse()
+                .map_err(|_| format!("{PREFIX}watch-seconds is {text:?}: whole seconds"))?;
+
+            if let Some((tier, true)) =
+                install.supplied(source_name, "watch-seconds", |k| k.watch_seconds)
+            {
+                if tier != seconds {
+                    return Err(pinned("watch-seconds", text, &tier.to_string()));
+                }
+            }
+
+            seconds
+        }
     };
 
     // "name/key", split once; the slash the form needs is the first one.
-    let secret_ref = |name: &str| -> Result<Option<SecretRef>, String> {
-        match get(name) {
+    let secret_ref = |text: Option<&str>, name: &str| -> Result<Option<SecretRef>, String> {
+        match text {
             None => Ok(None),
             Some(text) => {
                 let (secret, key) = text.split_once('/').ok_or(format!(
@@ -927,7 +1261,7 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
 
     // "name" or "name/key" — a default key exists for these.
     let object_ref = |name: &str, default_key: &str| -> Option<ObjectRef> {
-        get(name).map(|text| match text.split_once('/') {
+        defaulted(name).map(|text| match text.split_once('/') {
             Some((object, key)) => ObjectRef {
                 name: object.to_owned(),
                 key: key.to_owned(),
@@ -939,27 +1273,48 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         })
     };
 
+    // The address pair resolves as a LEVEL: any pod-side answer mutes
+    // both installation defaults — a pod that chose endpoint-secret
+    // must not also inherit the store's plain endpoint.
+    let (endpoint_text, endpoint_secret_text) =
+        if get("endpoint").is_some() || get("endpoint-secret").is_some() {
+            (get("endpoint"), get("endpoint-secret"))
+        } else {
+            (defaulted("endpoint"), defaulted("endpoint-secret"))
+        };
+
     let mut secret_env = Vec::new();
 
-    for (annotation, variable) in [
-        ("token-secret", "DYNAMIC_CONFIG_AGENT_TOKEN"),
-        ("password-secret", "DYNAMIC_CONFIG_AGENT_PASSWORD"),
-        ("endpoint-secret", "DYNAMIC_CONFIG_AGENT_ENDPOINT"),
+    for (text, annotation, variable) in [
+        (
+            defaulted("token-secret"),
+            "token-secret",
+            "DYNAMIC_CONFIG_AGENT_TOKEN",
+        ),
+        (
+            defaulted("password-secret"),
+            "password-secret",
+            "DYNAMIC_CONFIG_AGENT_PASSWORD",
+        ),
+        (
+            endpoint_secret_text,
+            "endpoint-secret",
+            "DYNAMIC_CONFIG_AGENT_ENDPOINT",
+        ),
     ] {
-        if let Some(reference) = secret_ref(annotation)? {
+        if let Some(reference) = secret_ref(text, annotation)? {
             secret_env.push((variable.to_owned(), reference));
         }
     }
 
-    let endpoint = get("endpoint").map(str::to_owned);
-    let endpoint_from_secret = secret_env
-        .iter()
-        .any(|(variable, _)| variable == "DYNAMIC_CONFIG_AGENT_ENDPOINT");
+    let endpoint = endpoint_text.map(str::to_owned);
+    let endpoint_from_secret = endpoint_secret_text.is_some();
 
     if endpoint.is_none() && !endpoint_from_secret {
         return Err(format!(
             "{PREFIX}inject is true, so {PREFIX}endpoint is required \
-             (or {PREFIX}endpoint-secret, when the address carries a password)"
+             (or {PREFIX}endpoint-secret when the address carries a \
+             password, or a per-store default endpoint)"
         ));
     }
 
@@ -987,13 +1342,13 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         ("ref", "--ref"),
         ("api-url", "--api-url"),
     ] {
-        if let Some(value) = get(annotation) {
+        if let Some(value) = defaulted(annotation) {
             arguments.push((flag.to_owned(), value.to_owned()));
         }
     }
 
     if let Some(ssh) = &ssh {
-        match get("auth") {
+        match defaulted("auth") {
             // An ssh key was mounted and nothing else claimed the auth
             // method: the key is clearly the intent.
             None => arguments.push(("--auth".to_owned(), "ssh-key".to_owned())),
@@ -1017,12 +1372,30 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     }
 
     let volume_memory = match get("volume-medium") {
-        Some("memory") => true,
-        Some("disk") => false,
-        Some(other) => {
-            return Err(format!(
-                "{PREFIX}volume-medium is {other:?}: memory (default) or disk"
-            ))
+        Some(text) => {
+            let memory = match text {
+                "memory" => true,
+                "disk" => false,
+                other => {
+                    return Err(format!(
+                        "{PREFIX}volume-medium is {other:?}: memory (default) or disk"
+                    ))
+                }
+            };
+
+            if let Some((tier, true)) =
+                install.supplied(source_name, "volume-medium", |k| k.volume_memory)
+            {
+                if tier != memory {
+                    return Err(pinned(
+                        "volume-medium",
+                        text,
+                        if tier { "memory" } else { "disk" },
+                    ));
+                }
+            }
+
+            memory
         }
         None => install
             .knob(source_name, |k| k.volume_memory)
@@ -1030,12 +1403,30 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     };
 
     let native_sidecar = match get("native-sidecar") {
-        Some("true") => true,
-        Some("false") => false,
-        Some(other) => {
-            return Err(format!(
-                "{PREFIX}native-sidecar is {other:?}: \"true\" or \"false\""
-            ))
+        Some(text) => {
+            let native = match text {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(format!(
+                        "{PREFIX}native-sidecar is {other:?}: \"true\" or \"false\""
+                    ))
+                }
+            };
+
+            if let Some((tier, true)) =
+                install.supplied(source_name, "native-sidecar", |k| k.native_sidecar)
+            {
+                if tier != native {
+                    return Err(pinned(
+                        "native-sidecar",
+                        text,
+                        if tier { "true" } else { "false" },
+                    ));
+                }
+            }
+
+            native
         }
         None => install
             .knob(source_name, |k| k.native_sidecar)
@@ -1058,6 +1449,30 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
             ))
         }
     };
+
+    // The quantity knobs share one pin walk: a pinned tier value
+    // refuses a differing annotation before the fallback resolution.
+    for (key, pick) in [
+        (
+            "agent-cpu-request",
+            &(|k: &KnobDefaults| k.cpu_request.clone()) as Pick<String>,
+        ),
+        ("agent-memory-request", &|k: &KnobDefaults| {
+            k.memory_request.clone()
+        }),
+        ("agent-cpu-limit", &|k: &KnobDefaults| k.cpu_limit.clone()),
+        ("agent-memory-limit", &|k: &KnobDefaults| {
+            k.memory_limit.clone()
+        }),
+    ] {
+        if let (Some(pod_value), Some((tier, true))) =
+            (get(key), install.supplied(source_name, key, pick))
+        {
+            if pod_value != tier {
+                return Err(pinned(key, pod_value, &tier));
+            }
+        }
+    }
 
     let cpu_request = install
         .knob(source_name, |k| k.cpu_request.clone())
@@ -1088,7 +1503,19 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // file. Octal-validated here so the refusal lands at admission.
     let file_mode = match get("file-mode") {
         None => install.knob(source_name, |k| k.file_mode.clone()),
-        Some(text) => Some(octal_mode(&format!("{PREFIX}file-mode"), text)?),
+        Some(text) => {
+            let mode = octal_mode(&format!("{PREFIX}file-mode"), text)?;
+
+            if let Some((tier, true)) =
+                install.supplied(source_name, "file-mode", |k| k.file_mode.clone())
+            {
+                if tier != mode {
+                    return Err(pinned("file-mode", text, &format!("0{tier}")));
+                }
+            }
+
+            Some(mode)
+        }
     };
 
     let identity = |name: &str| -> Result<Option<u32>, String> {
@@ -1097,6 +1524,22 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
             Some(text) => Ok(Some(nonroot_id(&format!("{PREFIX}{name}"), text)?)),
         }
     };
+
+    for (key, pick) in [
+        (
+            "agent-run-as-user",
+            &(|k: &KnobDefaults| k.run_as_user) as Pick<u32>,
+        ),
+        ("agent-run-as-group", &|k: &KnobDefaults| k.run_as_group),
+    ] {
+        if let (Some(pod_value), Some((tier, true))) =
+            (identity(key)?, install.supplied(source_name, key, pick))
+        {
+            if pod_value != tier {
+                return Err(pinned(key, &pod_value.to_string(), &tier.to_string()));
+            }
+        }
+    }
 
     let run_as_user =
         identity("agent-run-as-user")?.or_else(|| install.knob(source_name, |k| k.run_as_user));
@@ -1138,23 +1581,37 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         ));
     }
 
-    let aws_secret = get("aws-secret").map(str::to_owned);
+    let aws_secret = defaulted("aws-secret").map(str::to_owned);
 
-    if aws_secret.is_some() && get("source") != Some("s3") {
+    if aws_secret.is_some() && source_name != Some("s3") {
         return Err(format!(
             "{PREFIX}aws-secret is the s3 source's flag; the source here is {:?}",
-            get("source").unwrap_or("unset")
+            source_name.unwrap_or("unset")
         ));
     }
 
     let metrics_port = match get("metrics-port") {
         None => install.knob(source_name, |k| k.metrics_port),
-        // "0" is the per-pod opt-OUT of an installation-wide default.
-        Some("0") => None,
-        Some(text) => Some(
-            text.parse::<u16>()
-                .map_err(|_| format!("{PREFIX}metrics-port is {text:?}: a port number"))?,
-        ),
+        Some(text) => {
+            let port: u16 = text
+                .parse()
+                .map_err(|_| format!("{PREFIX}metrics-port is {text:?}: a port number"))?;
+
+            if let Some((tier, true)) =
+                install.supplied(source_name, "metrics-port", |k| k.metrics_port)
+            {
+                if tier != port {
+                    return Err(pinned("metrics-port", text, &tier.to_string()));
+                }
+            }
+
+            // "0" is the per-pod opt-OUT of an (unpinned) default.
+            if port == 0 {
+                None
+            } else {
+                Some(port)
+            }
+        }
     };
 
     // The format is validated here; whether the NAMES may pass at all
@@ -1232,13 +1689,30 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
 
     // A whole `kubernetes.io/tls` Secret: no key to choose, that type
     // fixed its two names years ago.
-    let tls = get("tls-secret").map(str::to_owned);
+    let tls = defaulted("tls-secret").map(str::to_owned);
 
     // Output templating: a one-liner inline, or a ConfigMap for
     // anything worth reviewing. One template, one place.
-    let template = object_ref("template-configmap", "template");
+    // The template pair resolves as a LEVEL too, like the address.
+    let (template_inline, template_configmap_text) =
+        if get("template").is_some() || get("template-configmap").is_some() {
+            (get("template"), get("template-configmap"))
+        } else {
+            (defaulted("template"), defaulted("template-configmap"))
+        };
 
-    match (get("template"), &template) {
+    let template = template_configmap_text.map(|text| match text.split_once('/') {
+        Some((object, key)) => ObjectRef {
+            name: object.to_owned(),
+            key: key.to_owned(),
+        },
+        None => ObjectRef {
+            name: text.to_owned(),
+            key: "template".to_owned(),
+        },
+    });
+
+    match (template_inline, &template) {
         (Some(_), Some(_)) => {
             return Err(format!(
                 "{PREFIX}template and {PREFIX}template-configmap are both set: \
@@ -1264,21 +1738,40 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
 
     let mut extra = Vec::new();
 
+    let resolved_path = defaulted("path");
+
     for suffix in &extra_names {
         extra.push(extra_render(
             suffix,
             &|name| get(&format!("{name}.{suffix}")),
             pod,
-            get("path"),
+            resolved_path,
             install,
         )?);
     }
 
+    let resolved = |name: &str| {
+        defaulted(name).map(str::to_owned).ok_or_else(|| {
+            format!(
+                "{PREFIX}inject is true, so {PREFIX}{name} is required \
+                 (per annotation, or as an installation default)"
+            )
+        })
+    };
+
+    let path = resolved("path")?;
+
     Ok(Some(Request {
-        source: required("source")?,
+        source: source_name.map(str::to_owned).ok_or_else(|| {
+            format!(
+                "{PREFIX}inject is true, so {PREFIX}source is required \
+                 (per annotation, or DYNAMIC_CONFIG_AGENT_SOURCE — the \
+                 chart's agent.defaults.source)"
+            )
+        })?,
         endpoint,
-        key: required("key")?,
-        path: required("path")?,
+        key: resolved("key")?,
+        path: path.clone(),
         mode,
         watch_seconds,
         arguments,
@@ -1331,7 +1824,69 @@ fn extra_render<'a>(
         ));
     }
 
-    let key = required("key")?;
+    // The same tiers the default render gets, against THIS render's
+    // store — and the same pin walk, refusing suffixed conflicts.
+    let supplied_strings = install.store_strings(Some(&source));
+
+    let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        format!(
+            "{} is {pod:?}, but the installation pins it to {tier:?} — \
+             match it or drop the annotation",
+            label(key)
+        )
+    };
+
+    for (key, tier, is_pinned) in &supplied_strings {
+        if !is_pinned || *key == "path" {
+            continue;
+        }
+
+        if let Some(pod_value) = get(key) {
+            if pod_value != tier {
+                return Err(pinned(key, pod_value, tier));
+            }
+        }
+    }
+
+    let defaulted = |name: &str| -> Option<&str> {
+        get(name).or_else(|| {
+            supplied_strings
+                .iter()
+                .find(|(key, _, _)| *key == name)
+                .map(|(_, value, _)| value.as_str())
+        })
+    };
+
+    for (a, b) in [
+        ("endpoint", "endpoint-secret"),
+        ("endpoint-secret", "endpoint"),
+        ("template", "template-configmap"),
+        ("template-configmap", "template"),
+    ] {
+        let a_pinned = supplied_strings
+            .iter()
+            .any(|(key, _, is_pinned)| *key == a && *is_pinned);
+
+        if a_pinned && get(a).is_none() && get(b).is_some() {
+            return Err(format!(
+                "{} is set, but the installation pins {} — the pair \
+                 answers as one, and this half is not the pod's to choose",
+                label(b),
+                label(a)
+            ));
+        }
+    }
+
+    let key = defaulted("key").map(str::to_owned).ok_or_else(|| {
+        format!(
+            "render {suffix:?} exists, so {} is required (per annotation, \
+             or as a per-store default)",
+            label("key")
+        )
+    })?;
+    // A named render's PATH stays its own: two renders sharing one
+    // defaulted path would fight over one file, so no tier answers
+    // for it here.
     let path = required("path")?;
 
     // One shared volume, so one shared directory: every named render's
@@ -1360,13 +1915,25 @@ fn extra_render<'a>(
         None => install
             .knob(Some(&source), |k| k.watch_seconds)
             .unwrap_or(15),
-        Some(text) => text
-            .parse()
-            .map_err(|_| format!("{} is {text:?}: whole seconds", label("watch-seconds")))?,
+        Some(text) => {
+            let seconds: u64 = text
+                .parse()
+                .map_err(|_| format!("{} is {text:?}: whole seconds", label("watch-seconds")))?;
+
+            if let Some((tier, true)) =
+                install.supplied(Some(&source), "watch-seconds", |k| k.watch_seconds)
+            {
+                if tier != seconds {
+                    return Err(pinned("watch-seconds", text, &tier.to_string()));
+                }
+            }
+
+            seconds
+        }
     };
 
-    let secret_ref = |name: &str| -> Result<Option<SecretRef>, String> {
-        match get(name) {
+    let secret_ref = |text: Option<&str>, name: &str| -> Result<Option<SecretRef>, String> {
+        match text {
             None => Ok(None),
             Some(text) => {
                 let (secret, key) = text.split_once('/').ok_or(format!(
@@ -1383,7 +1950,7 @@ fn extra_render<'a>(
     };
 
     let object_ref = |name: &str, default_key: &str| -> Option<ObjectRef> {
-        get(name).map(|text| match text.split_once('/') {
+        defaulted(name).map(|text| match text.split_once('/') {
             Some((object, key)) => ObjectRef {
                 name: object.to_owned(),
                 key: key.to_owned(),
@@ -1395,22 +1962,41 @@ fn extra_render<'a>(
         })
     };
 
+    // The address pair resolves as a LEVEL, exactly as on the default
+    // render: a pod-side answer mutes both installation defaults.
+    let (endpoint_text, endpoint_secret_text) =
+        if get("endpoint").is_some() || get("endpoint-secret").is_some() {
+            (get("endpoint"), get("endpoint-secret"))
+        } else {
+            (defaulted("endpoint"), defaulted("endpoint-secret"))
+        };
+
     let mut secret_env = Vec::new();
 
-    for (annotation, variable) in [
-        ("token-secret", "DYNAMIC_CONFIG_AGENT_TOKEN"),
-        ("password-secret", "DYNAMIC_CONFIG_AGENT_PASSWORD"),
-        ("endpoint-secret", "DYNAMIC_CONFIG_AGENT_ENDPOINT"),
+    for (text, annotation, variable) in [
+        (
+            defaulted("token-secret"),
+            "token-secret",
+            "DYNAMIC_CONFIG_AGENT_TOKEN",
+        ),
+        (
+            defaulted("password-secret"),
+            "password-secret",
+            "DYNAMIC_CONFIG_AGENT_PASSWORD",
+        ),
+        (
+            endpoint_secret_text,
+            "endpoint-secret",
+            "DYNAMIC_CONFIG_AGENT_ENDPOINT",
+        ),
     ] {
-        if let Some(reference) = secret_ref(annotation)? {
+        if let Some(reference) = secret_ref(text, annotation)? {
             secret_env.push((variable.to_owned(), reference));
         }
     }
 
-    let endpoint = get("endpoint").map(str::to_owned);
-    let endpoint_from_secret = secret_env
-        .iter()
-        .any(|(variable, _)| variable == "DYNAMIC_CONFIG_AGENT_ENDPOINT");
+    let endpoint = endpoint_text.map(str::to_owned);
+    let endpoint_from_secret = endpoint_secret_text.is_some();
 
     if endpoint.is_none() && !endpoint_from_secret {
         return Err(format!(
@@ -1442,13 +2028,13 @@ fn extra_render<'a>(
         ("ref", "--ref"),
         ("api-url", "--api-url"),
     ] {
-        if let Some(value) = get(annotation) {
+        if let Some(value) = defaulted(annotation) {
             arguments.push((flag.to_owned(), value.to_owned()));
         }
     }
 
     if let Some(ssh) = &ssh {
-        match get("auth") {
+        match defaulted("auth") {
             None => arguments.push(("--auth".to_owned(), "ssh-key".to_owned())),
             Some("ssh-key") => {}
             Some(other) => {
@@ -1475,17 +2061,46 @@ fn extra_render<'a>(
 
     let file_mode = match get("file-mode") {
         None => install.knob(Some(&source), |k| k.file_mode.clone()),
-        Some(text) => Some(octal_mode(&label("file-mode"), text)?),
+        Some(text) => {
+            let mode = octal_mode(&label("file-mode"), text)?;
+
+            if let Some((tier, true)) =
+                install.supplied(Some(&source), "file-mode", |k| k.file_mode.clone())
+            {
+                if tier != mode {
+                    return Err(pinned("file-mode", text, &format!("0{tier}")));
+                }
+            }
+
+            Some(mode)
+        }
     };
 
     if let Some(mode) = file_mode {
         arguments.push(("--file-mode".to_owned(), format!("0{mode}")));
     }
 
-    let tls = get("tls-secret").map(str::to_owned);
-    let template = object_ref("template-configmap", "template");
+    let tls = defaulted("tls-secret").map(str::to_owned);
 
-    match (get("template"), &template) {
+    let (template_inline, template_configmap_text) =
+        if get("template").is_some() || get("template-configmap").is_some() {
+            (get("template"), get("template-configmap"))
+        } else {
+            (defaulted("template"), defaulted("template-configmap"))
+        };
+
+    let template = template_configmap_text.map(|text| match text.split_once('/') {
+        Some((object, key)) => ObjectRef {
+            name: object.to_owned(),
+            key: key.to_owned(),
+        },
+        None => ObjectRef {
+            name: text.to_owned(),
+            key: "template".to_owned(),
+        },
+    });
+
+    match (template_inline, &template) {
         (Some(_), Some(_)) => {
             return Err(format!(
                 "{} and {} are both set: one template, one place",

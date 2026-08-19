@@ -18,7 +18,7 @@ Two reasons to put it between the pods and the stores:
 
 ## Kubernetes auth: the pod's own identity, end to end
 
-Since 0.3.0 the server indirection is zero-secret too:
+Since 0.1.1 the server indirection is zero-secret too:
 `auth: "kubernetes"` makes the agent present the pod's projected
 service-account token as the bearer (re-read every fetch — it
 rotates), and the server's `[kubernetes]` TokenReview grants map

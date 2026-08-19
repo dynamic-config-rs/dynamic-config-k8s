@@ -12,7 +12,7 @@ metadata:
 ---
 {{- end }}
 {{- if .Values.operator.rbac.create }}
-# Least privilege for what the 0.3.0 reconcilers will do: watch the two
+# Least privilege for what the reconcilers do: watch the two
 # CRDs, own the ConfigMaps they render, record events. Nothing cluster-
 # shaping — no pods, no secrets beyond reads the classes name.
 apiVersion: rbac.authorization.k8s.io/v1

@@ -1,6 +1,6 @@
 # The Operator
 
-Shipped as of 0.3.0: a `DynamicConfigRender` becomes a ConfigMap,
+Shipped as of 0.1.1: a `DynamicConfigRender` becomes a ConfigMap,
 reconciled through the SAME source construction and rendering the
 sidecar agent uses — one implementation, no drift between the two
 paths a document can take into a pod. The CRDs stay generated from the
@@ -31,7 +31,7 @@ A pod then says only what is its own:
 metadata:
   annotations:
     dynamic-config.rs/inject: "true"
-    dynamic-config.rs/class: "infra-consul"      # 0.3.0
+    dynamic-config.rs/class: "infra-consul"
     dynamic-config.rs/key: "myapp/config.json"
     dynamic-config.rs/path: "/config/rendered.toml"
 ```
