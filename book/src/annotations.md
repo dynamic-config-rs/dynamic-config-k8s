@@ -46,6 +46,9 @@ is the ready-to-apply shape.
 | `dynamic-config.rs/file-mode` | umask's answer (0644) | the rendered file's octal permissions, e.g. `"0640"` — set on the scratch file **before** the atomic rename, so a reader never sees the final path in a mode it will not keep |
 | `dynamic-config.rs/agent-run-as-user` | `65532` | the injected container's UID, so the rendered file's **owner** matches what the app runs as; `0` is refused — the agent stays nonroot in every configuration |
 | `dynamic-config.rs/agent-run-as-group` | `65532` | its GID, same rule |
+| `dynamic-config.rs/aws-secret` | none | s3 only: a Secret whose `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` keys become exactly those variables on the agent — static credentials for S3-compatibles that are not AWS (MinIO, Ceph, R2); on AWS, IRSA needs none of it |
+| `dynamic-config.rs/metrics-port` | none | the agent serves Prometheus text on this port ([the series](observability.md#the-agents-metrics)); only meaningful with a watching agent, and `"0"` opts out of an installation-wide default |
+| `dynamic-config.rs/agent-env` | none | comma-separated `NAME=value` pairs, set as environment on **every** injected agent — SDK knobs like `RUST_LOG`, `AWS_CA_BUNDLE`, proxy variables. Gated: only names the installation's allowlist permits in this namespace pass admission ([the gate](#the-agent-env-gate)) |
 | `dynamic-config.rs/env-inject` | none | a container name: its command is wrapped in `set -a; . <path>; set +a; exec …`, so the rendered dotenv is the process's REAL environment. Needs `mode: init` or `both` (env freezes at container start — Kubernetes' rule) and an explicit `command` (an ENTRYPOINT is invisible to the webhook); both refusals name the fix |
 | `dynamic-config.rs/env-restart` | `"false"` | with `env-inject` and `mode: both`: when the sidecar re-renders the dotenv, the kubelet restarts JUST the app container (a liveness probe compares the file against the fingerprint the wrapper exported at start) and the wrapper re-sources the new file — the closest thing to a live env update the kernel permits: seconds, no pod recreation, no new IP. Refused if the container already has its own livenessProbe |
 | `dynamic-config.rs/template` | none | an inline minijinja template; [it owns the output bytes](rendering.md#templates) |
@@ -171,6 +174,14 @@ verbatim from the tests:
   have, or a container with no explicit `command`
 - `env-restart` without `env-inject`, without `mode: both`, or on a
   container that already owns a `livenessProbe`
+- `agent-env` entries that are not `NAME=value`, names that are not
+  UPPER_SNAKE, a name set twice, or a name that shadows what
+  `aws-secret` already sets
+- an `agent-env` name outside the installation's allowlist for the
+  pod's namespace — the refusal names the chart value that opens it
+- a source `sourceDeny` turns off in the pod's namespace, or one
+  missing from a non-empty `sourceAllow` — checked on every render,
+  named suffixes included
 - any `dynamic-config.rs/*` key the contract does not list
 - `template` and `template-configmap` both set — one template, one
   place
@@ -183,3 +194,75 @@ events.
 
 `DynamicConfigClass` (0.3.0) shrinks all of this to a class reference —
 the [operator page](operator.md) carries the shape.
+
+## The agent-env gate
+
+`agent-env` puts variables on the container that holds store
+credentials, and environment steers SDKs — `HTTPS_PROXY` reroutes the
+agent's traffic, `AWS_CA_BUNDLE` and `SSL_CERT_FILE` swap its trust
+roots. So the names that may pass are the **installer's** decision,
+declared once:
+
+```yaml
+# values.yaml
+webhook:
+  agentEnvAllow: "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"
+```
+
+Semicolons separate groups; each group takes an optional
+`namespace:` head (absent or `*` means every namespace); a trailing
+`*` on a name is a prefix glob. Empty — the default — refuses the
+annotation everywhere. Kustomize installs set the same grammar in the
+`DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW` variable, and either way the
+webhook validates it at startup and refuses to serve on a typo.
+
+The gate is NOT a namespace annotation, by design: whoever edits a
+namespace is usually the tenant being gated, and a gate its subject
+can open is not a gate. It is also not read from the namespace object
+at admission time — the webhook holds no RBAC and asks the API server
+for nothing; the pod's namespace arrives inside the AdmissionReview,
+and the ruling comes from the webhook's own configuration.
+
+## The source gates
+
+The same authority model gates which STORES a pod may use:
+
+```yaml
+webhook:
+  sourceAllow: "payments: vault, s3; *: consul"   # empty = every store
+  sourceDeny: "sandbox: git"                       # subtractive, wins
+```
+
+`sourceAllow` empty means every store everywhere — the safe default
+for an upgrade; non-empty means ONLY the listed, per namespace.
+`sourceDeny` turns stores off outright and outranks the allowlist.
+Both cover every render on the pod — a denied store cannot ride in on
+a [named suffix](#several-documents-one-pod) — and both refusals name
+the namespace and the value that opens the gate. Kustomize sets
+`DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW` / `_SOURCE_DENY`; a name that is
+not a real store fails webhook startup, so a typo cannot silently
+gate nothing.
+
+## Defaults come in tiers
+
+Every default in the table above is only the LAST tier of four:
+
+```text
+annotation  >  per-store default  >  fleet default  >  built-in
+```
+
+The middle tiers are the installation's ([the full
+list](install.md#fleet-wide-defaults-validated-at-the-door)): fleet
+defaults cover every knob — resources, `file-mode`, `watch-seconds`,
+`mode`, `volume-medium`, `native-sidecar`, `agent-run-as-user`/`-group`,
+`metrics-port`, and a fleet-wide agent environment — and
+`agent.defaults.perStore` sets the same knobs one store at a time
+(`vault: "watch-seconds=30, file-mode=0640"`). Pod-wide knobs (mode,
+volume, resources, identity) take the DEFAULT render's store tier;
+per-render knobs (`watch-seconds`, `file-mode`) resolve against each
+render's own store. Every tier is validated with the SAME rules as the
+annotation it stands in for, at webhook startup.
+
+[Installation Defaults and Gates](installation-defaults.md) carries
+the full knob table, a per-store example for all nine stores, and the
+gates in depth.

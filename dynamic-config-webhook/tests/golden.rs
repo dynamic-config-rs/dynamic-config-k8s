@@ -493,6 +493,49 @@ fn env_inject_wraps_the_named_command() {
 }
 
 #[test]
+fn an_aws_secret_lands_as_the_two_standard_variables() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source".to_owned(), json!("s3"));
+    notes.insert(
+        "dynamic-config.rs/endpoint".to_owned(),
+        json!("myapp-config"),
+    );
+    notes.insert(
+        "dynamic-config.rs/api-url".to_owned(),
+        json!("http://minio.infra.svc:9000"),
+    );
+    notes.insert(
+        "dynamic-config.rs/aws-secret".to_owned(),
+        json!("minio-cred"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+    let agent = patches
+        .iter()
+        .find(|p| p["path"] == "/spec/containers/-")
+        .unwrap();
+    let env = agent["value"]["env"].as_array().unwrap();
+    let names: Vec<&str> = env.iter().filter_map(|e| e["name"].as_str()).collect();
+
+    assert!(names.contains(&"AWS_ACCESS_KEY_ID"));
+    assert!(names.contains(&"AWS_SECRET_ACCESS_KEY"));
+    assert!(env.iter().all(
+        |e| e["valueFrom"]["secretKeyRef"]["name"] == json!("minio-cred")
+            || e["name"] != json!("AWS_ACCESS_KEY_ID")
+    ));
+
+    // …and on any other source it is refused by name.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/aws-secret"] = json!("minio-cred");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+#[test]
 fn named_renders_multiply_the_agents() {
     let mut pod = annotated("sidecar");
     let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
@@ -1044,4 +1087,333 @@ fn regenerate() {
         serde_json::to_string_pretty(&response).expect("serialises"),
     )
     .expect("written");
+}
+
+/// An [`Installation`] from pairs, the way the server builds one from
+/// its environment — same validation, same defaults.
+fn install(pairs: &[(&str, &str)]) -> dynamic_config_webhook::Installation {
+    dynamic_config_webhook::Installation::from_lookup(&|name| {
+        pairs
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    })
+    .expect("a valid installation")
+}
+
+/// `annotated`, plus an agent-env annotation and a namespace on the
+/// review — the gate judges names against where the pod is landing.
+fn agent_env_review(namespace: &str, entries: &str) -> Value {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-env"] = json!(entries);
+
+    let mut review = review(pod);
+    review["request"]["namespace"] = json!(namespace);
+    review
+}
+
+#[test]
+fn agent_env_is_refused_until_the_installer_opens_the_gate() {
+    // No allowlist configured: the default installation refuses every
+    // agent-env, and the message names the chart value that opens it.
+    let response =
+        dynamic_config_webhook::admission_response(&agent_env_review("default", "RUST_LOG=debug"));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(message.contains("agentEnvAllow"), "{message}");
+    assert!(message.contains("RUST_LOG"), "{message}");
+}
+
+#[test]
+fn agent_env_flows_once_allowed_and_lands_on_every_agent() {
+    let allow = install(&[(
+        "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+        "*: RUST_LOG, AWS_*",
+    )]);
+    let response = dynamic_config_webhook::admission_response_with(
+        &agent_env_review(
+            "default",
+            "RUST_LOG=debug, AWS_CA_BUNDLE=/etc/ssl/private-ca.pem",
+        ),
+        &allow,
+    );
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let patches = decoded_patches(&response);
+    let agents: Vec<&Value> = patches
+        .iter()
+        .filter_map(|p| p.pointer("/value"))
+        .filter(|v| {
+            v.pointer("/name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.starts_with("dynamic-config-"))
+        })
+        .collect();
+
+    assert!(!agents.is_empty());
+
+    for agent in agents {
+        let env = agent.pointer("/env").and_then(Value::as_array).unwrap();
+
+        assert!(env.contains(&json!({ "name": "RUST_LOG", "value": "debug" })));
+        assert!(env.contains(&json!({
+            "name": "AWS_CA_BUNDLE", "value": "/etc/ssl/private-ca.pem",
+        })));
+    }
+}
+
+#[test]
+fn agent_env_gate_is_namespace_scoped() {
+    let allow = install(&[(
+        "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+        "payments: HTTPS_PROXY",
+    )]);
+    let entries = "HTTPS_PROXY=http://egress.infra.svc:3128";
+
+    let inside = dynamic_config_webhook::admission_response_with(
+        &agent_env_review("payments", entries),
+        &allow,
+    );
+    assert_eq!(inside.pointer("/response/allowed"), Some(&json!(true)));
+
+    let outside = dynamic_config_webhook::admission_response_with(
+        &agent_env_review("default", entries),
+        &allow,
+    );
+    assert_eq!(outside.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = outside
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(message.contains("\"default\""), "{message}");
+}
+
+#[test]
+fn agent_env_entries_must_be_name_value_pairs() {
+    for (entries, expected) in [
+        ("RUST_LOG", "NAME=value"),
+        ("rust-log=debug", "UPPER_SNAKE"),
+        ("RUST_LOG=a, RUST_LOG=b", "twice"),
+        (" ", "names nothing"),
+    ] {
+        let response =
+            dynamic_config_webhook::admission_response(&agent_env_review("default", entries));
+
+        assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(message.contains(expected), "{entries:?}: {message}");
+    }
+}
+
+#[test]
+fn agent_env_does_not_shadow_what_aws_secret_sets() {
+    let mut pod = annotated("sidecar");
+    let notes = &mut pod["metadata"]["annotations"];
+    notes["dynamic-config.rs/source"] = json!("s3");
+    notes["dynamic-config.rs/aws-secret"] = json!("minio-cred");
+    notes["dynamic-config.rs/agent-env"] = json!("AWS_ACCESS_KEY_ID=stolen");
+
+    let allow = install(&[("DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW", "*: *")]);
+    let response = dynamic_config_webhook::admission_response_with(&review(pod), &allow);
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(message.contains("one credential, one place"), "{message}");
+}
+
+fn namespaced_review(namespace: &str, pod: Value) -> Value {
+    let mut review = review(pod);
+    review["request"]["namespace"] = json!(namespace);
+    review
+}
+
+#[test]
+fn a_denied_source_is_refused_where_the_deny_says() {
+    let gates = install(&[("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", "sandbox: consul")]);
+
+    let refused = dynamic_config_webhook::admission_response_with(
+        &namespaced_review("sandbox", annotated("sidecar")),
+        &gates,
+    );
+    assert_eq!(refused.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = refused
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(message.contains("sourceDeny"), "{message}");
+
+    let elsewhere = dynamic_config_webhook::admission_response_with(
+        &namespaced_review("default", annotated("sidecar")),
+        &gates,
+    );
+    assert_eq!(elsewhere.pointer("/response/allowed"), Some(&json!(true)));
+}
+
+#[test]
+fn a_source_allowlist_admits_only_what_it_names() {
+    let gates = install(&[(
+        "DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW",
+        "payments: vault; *: consul",
+    )]);
+
+    // consul is open everywhere; vault only in payments.
+    let consul = dynamic_config_webhook::admission_response_with(
+        &namespaced_review("default", annotated("sidecar")),
+        &gates,
+    );
+    assert_eq!(consul.pointer("/response/allowed"), Some(&json!(true)));
+
+    let vault_outside = dynamic_config_webhook::admission_response_with(
+        &namespaced_review("default", vault_kubernetes_pod()),
+        &gates,
+    );
+    assert_eq!(
+        vault_outside.pointer("/response/allowed"),
+        Some(&json!(false))
+    );
+
+    let message = vault_outside
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(message.contains("sourceAllow"), "{message}");
+    assert!(
+        message.contains("consul"),
+        "names the allowed set: {message}"
+    );
+
+    let vault_inside = dynamic_config_webhook::admission_response_with(
+        &namespaced_review("payments", vault_kubernetes_pod()),
+        &gates,
+    );
+    assert_eq!(
+        vault_inside.pointer("/response/allowed"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
+fn the_deny_gate_covers_named_renders_too() {
+    let gates = install(&[("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", "*: redis")]);
+
+    let mut pod = annotated("sidecar");
+    let notes = &mut pod["metadata"]["annotations"];
+    notes["dynamic-config.rs/source.cache"] = json!("redis");
+    notes["dynamic-config.rs/endpoint.cache"] = json!("redis://redis:6379");
+    notes["dynamic-config.rs/key.cache"] = json!("myapp");
+    notes["dynamic-config.rs/path.cache"] = json!("/config/cache.toml");
+
+    let response =
+        dynamic_config_webhook::admission_response_with(&namespaced_review("default", pod), &gates);
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// The resolution ladder: annotation over store default over fleet
+/// default over built-in — checked on the rendered agent container.
+#[test]
+fn store_defaults_sit_between_annotations_and_fleet_defaults() {
+    let tiers = install(&[
+        ("DYNAMIC_CONFIG_AGENT_WATCH_SECONDS", "60"),
+        ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "0600"),
+        ("DYNAMIC_CONFIG_AGENT_RUN_AS_USER", "2000"),
+        ("DYNAMIC_CONFIG_AGENT_METRICS_PORT", "9102"),
+        (
+            "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+            "consul: watch-seconds=7, file-mode=0640",
+        ),
+    ]);
+
+    let request = dynamic_config_webhook::of_pod_with(&annotated("sidecar"), &tiers)
+        .unwrap()
+        .unwrap();
+
+    // consul has a store default: it wins over the fleet's 60/0600.
+    assert_eq!(request.watch_seconds, 7);
+    assert_eq!(request.file_mode.as_deref(), Some("640"));
+    // No consul entry for these: the fleet default holds.
+    assert_eq!(request.run_as_user, Some(2000));
+    assert_eq!(request.metrics_port, Some(9102));
+
+    // And the annotation still outranks both tiers.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("3");
+    pod["metadata"]["annotations"]["dynamic-config.rs/metrics-port"] = json!("0");
+
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(request.watch_seconds, 3);
+    // metrics-port "0" is the per-pod opt-out of the fleet default.
+    assert_eq!(request.metrics_port, None);
+}
+
+#[test]
+fn fleet_defaults_cover_mode_volume_and_sidecar_shape() {
+    let tiers = install(&[
+        ("DYNAMIC_CONFIG_AGENT_MODE", "both"),
+        ("DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM", "disk"),
+        ("DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR", "true"),
+    ]);
+
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("dynamic-config.rs/mode");
+
+    let request = dynamic_config_webhook::of_pod_with(&pod, &tiers)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(request.mode, dynamic_config_webhook::Mode::Both);
+    assert!(!request.volume_memory);
+    assert!(request.native_sidecar);
+}
+
+#[test]
+fn fleet_environment_rides_under_the_pods_own() {
+    let tiers = install(&[
+        (
+            "DYNAMIC_CONFIG_AGENT_ENV",
+            "HTTPS_PROXY=http://egress:3128, RUST_LOG=info",
+        ),
+        ("DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW", "*: RUST_LOG"),
+    ]);
+
+    // The pod overrides RUST_LOG; HTTPS_PROXY arrives from the fleet
+    // without needing the allowlist — the installer set it themselves.
+    let response = dynamic_config_webhook::admission_response_with(
+        &agent_env_review("default", "RUST_LOG=debug"),
+        &tiers,
+    );
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let patches = decoded_patches(&response);
+    let agent = patches
+        .iter()
+        .filter_map(|p| p.pointer("/value"))
+        .find(|v| v.pointer("/name") == Some(&json!("dynamic-config-agent")))
+        .unwrap();
+    let env = agent.pointer("/env").and_then(Value::as_array).unwrap();
+
+    assert!(env.contains(&json!({ "name": "HTTPS_PROXY", "value": "http://egress:3128" })));
+    assert!(env.contains(&json!({ "name": "RUST_LOG", "value": "debug" })));
+    assert!(!env.contains(&json!({ "name": "RUST_LOG", "value": "info" })));
 }

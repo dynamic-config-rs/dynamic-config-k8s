@@ -36,6 +36,19 @@ values reference.
 | `agent.defaults.memoryRequest` | `32Mi` | — |
 | `agent.defaults.memoryLimit` | `64Mi` | — |
 | `agent.defaults.cpuLimit` | `""` | empty on purpose: throttling a config agent buys nothing |
+| `agent.defaults.fileMode` | `""` | fleet-default octal permissions for rendered files (empty = the agent's 0644); per-pod `file-mode` still wins |
+| `agent.defaults.watchSeconds` | `""` | fleet-default watch interval, whole seconds (empty = 15); per-pod `watch-seconds` still wins |
+| `agent.defaults.mode` | `""` | fleet-default injection mode `init`/`sidecar`/`both` (empty = sidecar) |
+| `agent.defaults.volumeMedium` | `""` | fleet-default volume medium `memory`/`disk` (empty = memory) |
+| `agent.defaults.nativeSidecar` | `""` | `"true"` makes native sidecars the fleet default (empty = false) |
+| `agent.defaults.runAsUser` | `""` | fleet-default agent UID (empty = 65532; 0 refused) |
+| `agent.defaults.runAsGroup` | `""` | fleet-default agent GID (same rule) |
+| `agent.defaults.metricsPort` | `""` | serve agent metrics on this port by default; pods opt out with `metrics-port: "0"` |
+| `agent.defaults.env` | `""` | fleet-wide agent environment, `NAME=value, …`; a pod's `agent-env` overrides name by name |
+| `agent.defaults.perStore` | `{}` | per-STORE defaults, one tier above the fleet's: `vault: "watch-seconds=30, file-mode=0640"` — keys spelled as the annotations spell them |
+| `webhook.agentEnvAllow` | `""` | which `agent-env` names pods may set, per namespace: `"payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"`; empty = refused everywhere |
+| `webhook.sourceAllow` | `""` | which stores pods may use, per namespace (empty = every store everywhere; non-empty = ONLY the listed) |
+| `webhook.sourceDeny` | `""` | stores turned off, per namespace; outranks `sourceAllow` |
 
 Per-pod `dynamic-config.rs/agent-*` annotations override these.
 

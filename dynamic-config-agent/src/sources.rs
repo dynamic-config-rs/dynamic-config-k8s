@@ -444,7 +444,17 @@ async fn s3(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
 
     let store = match &spec.api_url {
         Some(url) => {
-            let config = aws_config::from_env().endpoint_url(url).load().await;
+            // An explicit endpoint means a non-AWS S3 (MinIO, Ceph, R2).
+            // There is no IMDS there, so the SDK's region lookup would
+            // hang and then leave the client region-less — which the SDK
+            // refuses. The value itself is ignored by these servers.
+            let region = aws_config::meta::region::RegionProviderChain::default_provider()
+                .or_else("us-east-1");
+            let config = aws_config::from_env()
+                .region(region)
+                .endpoint_url(url)
+                .load()
+                .await;
 
             S3::with_config(&config, spec.endpoint.as_str(), spec.key.as_str())
         }

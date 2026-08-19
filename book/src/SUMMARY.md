@@ -5,6 +5,7 @@
 # Guide
 
 - [Install](install.md)
+- [Installation Defaults and Gates](installation-defaults.md)
 - [The Annotation Contract](annotations.md)
 - [Secrets, Certificates, and What Shows Where](secrets-and-tls.md)
 - [The Security Posture](security.md)
@@ -30,6 +31,7 @@
 
 - [GitOps: ArgoCD and Flux](gitops.md)
 - [The Operator (0.3.0)](operator.md)
+- [Observability](observability.md)
 - [Troubleshooting](troubleshooting.md)
 
 # Reference

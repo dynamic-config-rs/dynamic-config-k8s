@@ -36,9 +36,56 @@ agent:
     memoryRequest: 32Mi
     memoryLimit: 64Mi
     cpuLimit: ""
+    # The rendered file's octal permissions when a pod does not say
+    # (empty = the agent's own 0644); `file-mode` still wins per pod.
+    fileMode: ""
+    # The default watch interval, whole seconds (empty = 15);
+    # `watch-seconds` still wins per pod.
+    watchSeconds: ""
+    # The default injection mode: init | sidecar | both (empty = sidecar).
+    mode: ""
+    # The shared volume's default medium: memory | disk (empty = memory).
+    volumeMedium: ""
+    # "true" runs watching agents as native sidecars by default
+    # (Kubernetes 1.29+); empty = false.
+    nativeSidecar: ""
+    # The injected container's default UID/GID (empty = 65532);
+    # 0 is refused — the agent stays nonroot in every configuration.
+    runAsUser: ""
+    runAsGroup: ""
+    # Serve agent metrics on this port by default (empty = no metrics
+    # endpoint); a pod opts out with `metrics-port: "0"`.
+    metricsPort: ""
+    # Environment every injected agent gets, installer-set so no
+    # allowlist applies; a pod's own `agent-env` overrides it name by
+    # name. Same NAME=value grammar: "HTTPS_PROXY=http://egress:3128"
+    env: ""
+    # Per-STORE defaults, one tier above the fleet's: the value is the
+    # same key=value grammar, keys spelled as the annotations spell
+    # them. A pod's annotation still outranks both tiers.
+    #   perStore:
+    #     vault: "watch-seconds=30, file-mode=0640"
+    #     s3: "agent-memory-limit=128Mi"
+    perStore: {}
 
 # ── The webhook ──────────────────────────────────────────────────────
 webhook:
+  # Which `agent-env` variable names pods may set on their injected
+  # agents, and where. Empty = the annotation is refused everywhere.
+  # Grammar: semicolons between groups, an optional `namespace:` head
+  # on each (absent or `*` = every namespace), commas between names,
+  # a trailing `*` on a name is a prefix glob. The webhook validates
+  # this at startup and refuses to serve on a typo.
+  #   agentEnvAllow: "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"
+  agentEnvAllow: ""
+  # Which STORES pods may use, and where — same grammar, names from
+  # the source list. Empty = every store, everywhere; non-empty = ONLY
+  # the listed. `sourceDeny` is the subtractive twin and outranks the
+  # allowlist. Both validated at webhook startup.
+  #   sourceAllow: "payments: vault, s3; *: consul"
+  #   sourceDeny: "sandbox: git"
+  sourceAllow: ""
+  sourceDeny: ""
   image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
   tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""

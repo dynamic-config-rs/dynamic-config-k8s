@@ -14,6 +14,9 @@ metadata:
     dynamic-config.rs/file-mode: "0640"
     dynamic-config.rs/agent-run-as-user: "1000"
     dynamic-config.rs/agent-run-as-group: "1000"
+    # Allowlisted by the smoke's install (`default: RUST_LOG`); the
+    # refused half of the gate is exercised in smoke.sh itself.
+    dynamic-config.rs/agent-env: "RUST_LOG=debug"
 spec:
   containers:
     - name: app

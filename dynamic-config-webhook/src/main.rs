@@ -114,6 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    // A mistyped fleet default (a file mode of "888", an allowlist
+    // entry that is not a variable name) stops the process here, at
+    // install time — never at the first admission.
+    dynamic_config_webhook::verify_installation()?;
+
     // The serving path names its provider per-config, but the selfRotate
     // mode's kube client uses the process default — which, with ring and
     // aws-lc both reachable, must be stated or rustls panics mid-handshake.

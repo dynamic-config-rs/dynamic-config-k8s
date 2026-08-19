@@ -38,6 +38,13 @@ fn agent_pull_secret() -> Option<&'static str> {
 
 /// The whole webhook: a review's response, allowed or patched or refused.
 pub fn admission_response(review: &Value) -> Value {
+    admission_response_with(review, annotations::installation())
+}
+
+/// [`admission_response`] with the installation made explicit — the
+/// server feeds its own; tests construct theirs through
+/// [`Installation::from_lookup`](annotations::Installation::from_lookup).
+pub fn admission_response_with(review: &Value, install: &annotations::Installation) -> Value {
     let uid = review
         .pointer("/request/uid")
         .and_then(Value::as_str)
@@ -47,9 +54,82 @@ pub fn admission_response(review: &Value) -> Value {
         return respond(uid, json!({ "allowed": true }));
     };
 
-    match annotations::of_pod(pod) {
+    match annotations::of_pod_with(pod, install) {
         Ok(None) => respond(uid, json!({ "allowed": true })),
         Ok(Some(request)) => {
+            // Everything below passed the FORMAT checks in parsing;
+            // whether it may pass AT ALL is the installer's policy,
+            // judged against the namespace this pod is landing in.
+            let namespace = review
+                .pointer("/request/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let refuse = |message: String| {
+                respond(
+                    uid,
+                    json!({
+                        "allowed": false,
+                        "status": { "message": message, "code": 400 },
+                    }),
+                )
+            };
+
+            // The source gates cover EVERY render — a denied store must
+            // not ride in on a named suffix.
+            let sources = std::iter::once(request.source.as_str())
+                .chain(request.extra.iter().map(|extra| extra.source.as_str()));
+
+            for source in sources {
+                if install.source_denied(namespace, source) {
+                    return refuse(format!(
+                        "source {source} is turned off in namespace \
+                         {namespace:?} by this installation \
+                         (webhook.sourceDeny in the chart; the \
+                         DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY variable, for \
+                         kustomize)"
+                    ));
+                }
+
+                if !install.source_allowed(namespace, source) {
+                    let permitted = install.source_listing(namespace);
+                    let here = if permitted.is_empty() {
+                        "no source is currently allowed here".to_owned()
+                    } else {
+                        format!("allowed here: {permitted}")
+                    };
+
+                    return refuse(format!(
+                        "source {source} is not on this installation's \
+                         allowlist for namespace {namespace:?} — {here} \
+                         (webhook.sourceAllow in the chart; the \
+                         DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW variable, for \
+                         kustomize)"
+                    ));
+                }
+            }
+
+            for (name, _) in &request.agent_env {
+                if !install.agent_env_allowed(namespace, name) {
+                    let permitted = install.agent_env_listing(namespace);
+                    let here = if permitted.is_empty() {
+                        "nothing is currently allowed here".to_owned()
+                    } else {
+                        format!("allowed here: {permitted}")
+                    };
+
+                    return refuse(format!(
+                        "{}agent-env sets {name}, and this installation \
+                         does not allow it in namespace {namespace:?} — \
+                         {here}. The gate belongs to whoever installed \
+                         the webhook: webhook.agentEnvAllow in the chart \
+                         (the DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW \
+                         variable, for kustomize)",
+                        annotations::PREFIX
+                    ));
+                }
+            }
+
             let patches = patches_for(pod, &request);
             let encoded = base64(&serde_json::to_vec(&patches).expect("patches serialise"));
 
@@ -475,6 +555,32 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 .collect();
         }
 
+        if let Some(secret) = &request.aws_secret {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+                env.push(json!({
+                    "name": key,
+                    "valueFrom": { "secretKeyRef": { "name": secret, "key": key } },
+                }));
+            }
+
+            container["env"] = json!(env);
+        }
+
+        // The installer's fleet environment first, then the pod's own
+        // (allowlisted by the admission before any patch was cut) —
+        // overlaps were already resolved in the pod's favour.
+        if !request.fleet_env.is_empty() || !request.agent_env.is_empty() {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for (name, value) in request.fleet_env.iter().chain(&request.agent_env) {
+                env.push(json!({ "name": name, "value": value }));
+            }
+
+            container["env"] = json!(env);
+        }
+
         container
     };
 
@@ -585,6 +691,18 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                     })
                 })
                 .collect();
+        }
+
+        // agent-env is pod-wide, like resources and identity: every
+        // render's agent runs with the same environment.
+        if !request.fleet_env.is_empty() || !request.agent_env.is_empty() {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for (name, value) in request.fleet_env.iter().chain(&request.agent_env) {
+                env.push(json!({ "name": name, "value": value }));
+            }
+
+            container["env"] = json!(env);
         }
 
         container

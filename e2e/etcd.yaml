@@ -68,9 +68,15 @@ spec:
             - containerPort: 2379
           volumeMounts:
             - { name: tls, mountPath: /etc/etcd-tls, readOnly: true }
+            # The CLIENT pair too, so the seeding etcdctl inside this pod
+            # can present a certificate the server's clientAuth check
+            # accepts — the server's own pair (serverAuth EKU) cannot.
+            - { name: client-tls, mountPath: /etc/etcd-client, readOnly: true }
       volumes:
         - name: tls
           secret: { secretName: etcd-server-tls }
+        - name: client-tls
+          secret: { secretName: etcd-client-tls }
 ---
 apiVersion: v1
 kind: Service

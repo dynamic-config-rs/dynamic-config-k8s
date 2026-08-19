@@ -125,7 +125,8 @@ annotation values**: endpoints and role names belong in the cluster,
 not in every log aggregator downstream. Pods that never asked are
 counted but not logged.
 
-`GET /metrics` on the serving port exposes the counters in Prometheus
+`GET /metrics` on the serving port exposes the counters
+([Observability](observability.md) is the full map) in Prometheus
 text format:
 
 ```text
@@ -185,7 +186,33 @@ opt-in.
 The injected container's resource defaults come from the chart
 (`agent.defaults.*`), not from a constant in a binary — platform teams
 set the fleet's floor once, and the per-pod annotations still override
-it. The same values file pins the agent image the webhook injects.
+it. The same is true of the rendered file's permissions
+(`agent.defaults.fileMode`) and the watch interval
+(`agent.defaults.watchSeconds`); the same values file pins the agent
+image the webhook injects. Every fleet default is validated when the
+webhook STARTS — a mistyped octal stops the process at install, never
+at the first admission — which also covers kustomize installs, where
+no chart schema stands in front of the env vars.
+
+## The source gates are the installer's too
+
+`webhook.sourceAllow` / `webhook.sourceDeny` decide which stores may
+be rendered from, per namespace — an allowlist that admits only what
+it names, and a subtractive deny that outranks it. Empty allow means
+every store, so an upgrade changes nothing until the installer says
+so. The check covers every render on the pod, named suffixes
+included, and a gate entry that is not a real store name fails
+webhook startup instead of silently gating nothing.
+
+## The agent-env gate is the installer's
+
+[`agent-env`](annotations.md#the-agent-env-gate) lets a pod put
+environment on its injected agent, and agent environment steers SDKs
+(proxies, trust roots). Which names may pass, and in which namespaces,
+is declared in `webhook.agentEnvAllow` — owned by whoever installs the
+webhook, not by the pod author and not by a namespace annotation the
+tenant could edit for themselves. The default is empty: everything
+refused.
 
 ## Supply chain
 

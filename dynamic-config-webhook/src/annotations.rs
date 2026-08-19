@@ -46,35 +46,561 @@ pub struct Resources {
     pub memory_limit: String,
 }
 
-/// The fleet-wide defaults, read once — an admission decision must not
-/// change between two requests because the environment moved.
-struct Defaults {
-    cpu_request: String,
-    memory_request: String,
-    cpu_limit: Option<String>,
-    memory_limit: String,
+/// Every store the agent speaks — the one list the source annotation,
+/// the per-store defaults and the source gates all validate against.
+pub(crate) const SOURCES: &[&str] = &[
+    "consul",
+    "vault",
+    "config-server",
+    "firestore",
+    "git",
+    "redis",
+    "etcd",
+    "nats",
+    "s3",
+];
+
+/// Names grouped by namespace — the shape every gate shares. Grammar:
+/// semicolons between groups, an optional `namespace:` head on each
+/// (absent means every namespace), commas between names. What counts
+/// as a valid NAME differs per gate, so parsing takes the validator.
+#[derive(Debug, Default, PartialEq)]
+pub struct ScopedNames {
+    /// `(namespace, names)` — namespace `*` matches every one.
+    groups: Vec<(String, Vec<String>)>,
 }
 
-fn defaults() -> &'static Defaults {
-    static DEFAULTS: std::sync::OnceLock<Defaults> = std::sync::OnceLock::new();
+impl ScopedNames {
+    /// The empty list.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
 
-    DEFAULTS.get_or_init(|| {
-        let var = |name: &str, fallback: &str| {
-            std::env::var(name)
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| fallback.to_owned())
+    fn parse(spec: &str, valid: &impl Fn(&str) -> bool, kind: &str) -> Result<Self, String> {
+        let mut groups = Vec::new();
+
+        for group in spec.split(';').map(str::trim).filter(|g| !g.is_empty()) {
+            let (namespace, names) = match group.split_once(':') {
+                Some((namespace, names)) => (namespace.trim(), names),
+                None => ("*", group),
+            };
+
+            let namespace_ok = namespace == "*"
+                || (!namespace.is_empty()
+                    && namespace
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+
+            if !namespace_ok {
+                return Err(format!(
+                    "{namespace:?} is not a namespace (lowercase RFC 1123) or \"*\""
+                ));
+            }
+
+            let mut list = Vec::new();
+
+            for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                if !(name == "*" || valid(name)) {
+                    return Err(format!("{name:?} is not {kind}"));
+                }
+
+                list.push(name.to_owned());
+            }
+
+            if list.is_empty() {
+                return Err(format!("the group for {namespace:?} names nothing"));
+            }
+
+            groups.push((namespace.to_owned(), list));
+        }
+
+        Ok(Self { groups })
+    }
+
+    /// Environment variable names: UPPER_SNAKE, an optional trailing
+    /// `*` as a prefix glob.
+    pub fn env_names(spec: &str) -> Result<Self, String> {
+        Self::parse(
+            spec,
+            &|name| {
+                let stem = name.strip_suffix('*').unwrap_or(name);
+
+                stem.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+                    && stem
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            },
+            "a variable name (UPPER_SNAKE, an optional trailing \"*\")",
+        )
+    }
+
+    /// Store names, each from [`SOURCES`] — a typo in a security gate
+    /// must not silently gate nothing.
+    pub fn sources(spec: &str) -> Result<Self, String> {
+        Self::parse(
+            spec,
+            &|name| SOURCES.contains(&name),
+            "a store this contract knows",
+        )
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    #[must_use]
+    pub fn allows(&self, namespace: &str, name: &str) -> bool {
+        self.groups
+            .iter()
+            .filter(|(scope, _)| scope == "*" || scope == namespace)
+            .flat_map(|(_, names)| names)
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) if pattern != "*" => name.starts_with(prefix),
+                Some(_) => true,
+                None => pattern == name,
+            })
+    }
+
+    /// What THIS namespace gets — for refusals, which should name the
+    /// fix. Only the asking namespace's rules: one tenant's refusal
+    /// must not enumerate another's.
+    #[must_use]
+    pub fn listing(&self, namespace: &str) -> String {
+        let names: Vec<&str> = self
+            .groups
+            .iter()
+            .filter(|(scope, _)| scope == "*" || scope == namespace)
+            .flat_map(|(_, names)| names)
+            .map(String::as_str)
+            .collect();
+
+        names.join(", ")
+    }
+}
+
+/// Octal permissions, validated the same wherever they come from — the
+/// context names whoever supplied the value, so the refusal lands where
+/// the mistake was made.
+fn octal_mode(context: &str, text: &str) -> Result<String, String> {
+    let octal = text.strip_prefix("0o").unwrap_or(text);
+    let value = u32::from_str_radix(octal, 8)
+        .map_err(|_| format!("{context} is {text:?}: octal, like \"0640\""))?;
+
+    if value > 0o777 {
+        return Err(format!(
+            "{context} is {text:?}: at most 0777 — setuid bits \
+             on a configuration file answer no question"
+        ));
+    }
+
+    if value & 0o400 == 0 {
+        return Err(format!(
+            "{context} is {text:?}: the owner must at least \
+             read it, or the file is write-only noise"
+        ));
+    }
+
+    Ok(format!("{value:o}"))
+}
+
+/// A Kubernetes quantity, loosely: the API server owns the grammar and
+/// would reject the pod anyway; this puts the obvious nonsense where
+/// whoever wrote it is looking.
+fn sane_quantity(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+}
+
+/// A nonzero UID or GID — the agent stays nonroot in every
+/// configuration; an injector that relaxes a pod's posture is a
+/// finding, not a feature.
+fn nonroot_id(context: &str, text: &str) -> Result<u32, String> {
+    let id: u32 = text
+        .parse()
+        .map_err(|_| format!("{context} is {text:?}: a numeric UID/GID"))?;
+
+    if id == 0 {
+        return Err(format!(
+            "{context} is 0: the agent stays nonroot in every configuration"
+        ));
+    }
+
+    Ok(id)
+}
+
+/// `NAME=value` pairs, comma-separated — the grammar `agent-env` and
+/// the fleet's `DYNAMIC_CONFIG_AGENT_ENV` share.
+fn env_entries(context: &str, text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for entry in text.split(',') {
+        let entry = entry.trim();
+
+        if entry.is_empty() {
+            continue;
+        }
+
+        let Some((name, value)) = entry.split_once('=') else {
+            return Err(format!(
+                "{context} holds {entry:?}: comma-separated NAME=value \
+                 pairs (a value itself cannot contain a comma)"
+            ));
         };
 
-        Defaults {
-            cpu_request: var("DYNAMIC_CONFIG_AGENT_CPU_REQUEST", "10m"),
-            memory_request: var("DYNAMIC_CONFIG_AGENT_MEMORY_REQUEST", "32Mi"),
-            cpu_limit: std::env::var("DYNAMIC_CONFIG_AGENT_CPU_LIMIT")
-                .ok()
-                .filter(|v| !v.is_empty()),
-            memory_limit: var("DYNAMIC_CONFIG_AGENT_MEMORY_LIMIT", "64Mi"),
+        let name = name.trim();
+        let head = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_');
+
+        if !head
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(format!(
+                "{context} names {name:?}: variable names are UPPER_SNAKE, \
+                 like \"RUST_LOG\""
+            ));
         }
-    })
+
+        if entries.iter().any(|(existing, _)| existing == name) {
+            return Err(format!("{context} sets {name} twice"));
+        }
+
+        entries.push((name.to_owned(), value.to_owned()));
+    }
+
+    if entries.is_empty() {
+        return Err(format!(
+            "{context} is present and names nothing: drop it or fill it"
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// One tier of defaults — the fleet's, or one store's. Every knob a pod
+/// could otherwise only set per annotation; `None` falls through to the
+/// next tier (store → fleet → built-in).
+#[derive(Debug, Default)]
+struct KnobDefaults {
+    cpu_request: Option<String>,
+    memory_request: Option<String>,
+    cpu_limit: Option<String>,
+    memory_limit: Option<String>,
+    file_mode: Option<String>,
+    watch_seconds: Option<u64>,
+    mode: Option<Mode>,
+    volume_memory: Option<bool>,
+    native_sidecar: Option<bool>,
+    run_as_user: Option<u32>,
+    run_as_group: Option<u32>,
+    metrics_port: Option<u16>,
+}
+
+/// The knob keys, spelled exactly as the annotations spell them — one
+/// vocabulary, whether a value arrives per pod or per installation.
+const KNOBS: &str = "agent-cpu-request, agent-memory-request, \
+     agent-cpu-limit, agent-memory-limit, file-mode, watch-seconds, \
+     mode, volume-medium, native-sidecar, agent-run-as-user, \
+     agent-run-as-group, metrics-port";
+
+impl KnobDefaults {
+    /// One `key=value`, validated exactly as the matching annotation
+    /// would be. The context names where the value came from.
+    fn set(&mut self, context: &str, key: &str, value: &str) -> Result<(), String> {
+        match key {
+            "agent-cpu-request"
+            | "agent-memory-request"
+            | "agent-cpu-limit"
+            | "agent-memory-limit" => {
+                if !sane_quantity(value) {
+                    return Err(format!(
+                        "{context}: {key} is {value:?}: a Kubernetes quantity, \
+                         like \"50m\" or \"64Mi\""
+                    ));
+                }
+
+                let slot = match key {
+                    "agent-cpu-request" => &mut self.cpu_request,
+                    "agent-memory-request" => &mut self.memory_request,
+                    "agent-cpu-limit" => &mut self.cpu_limit,
+                    _ => &mut self.memory_limit,
+                };
+                *slot = Some(value.to_owned());
+            }
+            "file-mode" => {
+                self.file_mode = Some(octal_mode(&format!("{context}: file-mode"), value)?);
+            }
+            "watch-seconds" => {
+                self.watch_seconds = Some(value.parse().map_err(|_| {
+                    format!("{context}: watch-seconds is {value:?}: whole seconds")
+                })?);
+            }
+            "mode" => {
+                self.mode = Some(match value {
+                    "init" => Mode::Init,
+                    "sidecar" => Mode::Sidecar,
+                    "both" => Mode::Both,
+                    other => {
+                        return Err(format!(
+                            "{context}: mode is {other:?}: init, sidecar or both"
+                        ))
+                    }
+                });
+            }
+            "volume-medium" => {
+                self.volume_memory = Some(match value {
+                    "memory" => true,
+                    "disk" => false,
+                    other => {
+                        return Err(format!(
+                            "{context}: volume-medium is {other:?}: memory or disk"
+                        ))
+                    }
+                });
+            }
+            "native-sidecar" => {
+                self.native_sidecar = Some(match value {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "{context}: native-sidecar is {other:?}: \"true\" or \"false\""
+                        ))
+                    }
+                });
+            }
+            "agent-run-as-user" => {
+                self.run_as_user =
+                    Some(nonroot_id(&format!("{context}: agent-run-as-user"), value)?);
+            }
+            "agent-run-as-group" => {
+                self.run_as_group = Some(nonroot_id(
+                    &format!("{context}: agent-run-as-group"),
+                    value,
+                )?);
+            }
+            "metrics-port" => {
+                self.metrics_port =
+                    Some(value.parse().map_err(|_| {
+                        format!("{context}: metrics-port is {value:?}: a port number")
+                    })?);
+            }
+            other => {
+                return Err(format!(
+                    "{context}: {other:?} is not a defaultable knob; the knobs \
+                     are {KNOBS}"
+                ))
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// The environment variable each fleet-wide knob reads from.
+const FLEET_KNOBS: &[(&str, &str)] = &[
+    ("DYNAMIC_CONFIG_AGENT_CPU_REQUEST", "agent-cpu-request"),
+    (
+        "DYNAMIC_CONFIG_AGENT_MEMORY_REQUEST",
+        "agent-memory-request",
+    ),
+    ("DYNAMIC_CONFIG_AGENT_CPU_LIMIT", "agent-cpu-limit"),
+    ("DYNAMIC_CONFIG_AGENT_MEMORY_LIMIT", "agent-memory-limit"),
+    ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "file-mode"),
+    ("DYNAMIC_CONFIG_AGENT_WATCH_SECONDS", "watch-seconds"),
+    ("DYNAMIC_CONFIG_AGENT_MODE", "mode"),
+    ("DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM", "volume-medium"),
+    ("DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR", "native-sidecar"),
+    ("DYNAMIC_CONFIG_AGENT_RUN_AS_USER", "agent-run-as-user"),
+    ("DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP", "agent-run-as-group"),
+    ("DYNAMIC_CONFIG_AGENT_METRICS_PORT", "metrics-port"),
+];
+
+/// Everything an installation decides: fleet defaults, per-store
+/// defaults, fleet-wide agent environment, and the gates. Read once —
+/// an admission decision must not change between two requests because
+/// the environment moved — and validated in FULL at startup, so a
+/// mistyped value stops the install, never the first admission.
+#[derive(Debug)]
+pub struct Installation {
+    fleet: KnobDefaults,
+    per_store: Vec<(String, KnobDefaults)>,
+    /// `DYNAMIC_CONFIG_AGENT_ENV`: environment every injected agent
+    /// gets. Installer-set, so no allowlist applies; a pod's own
+    /// `agent-env` overrides it name by name.
+    agent_env: Vec<(String, String)>,
+    agent_env_allow: ScopedNames,
+    /// Empty = every source, everywhere. Non-empty = ONLY these.
+    source_allow: ScopedNames,
+    /// Always subtractive, and it outranks the allowlist.
+    source_deny: ScopedNames,
+}
+
+impl Installation {
+    /// From any lookup, so the tests can feed a map where the server
+    /// feeds `std::env::var`. Every refusal names the variable it is
+    /// about — the reader is an installer staring at a chart.
+    pub fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let var = |name: &str| lookup(name).filter(|v| !v.is_empty());
+
+        let mut fleet = KnobDefaults::default();
+
+        for (variable, knob) in FLEET_KNOBS {
+            if let Some(text) = var(variable) {
+                fleet.set(variable, knob, &text)?;
+            }
+        }
+
+        let mut per_store: Vec<(String, KnobDefaults)> = Vec::new();
+
+        for group in var("DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS")
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+        {
+            let context = "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS";
+
+            let Some((store, knobs)) = group.split_once(':') else {
+                return Err(format!(
+                    "{context}: {group:?} has no `store:` head; the form is \
+                     \"vault: watch-seconds=30, file-mode=0640; s3: …\""
+                ));
+            };
+
+            let store = store.trim();
+
+            if !SOURCES.contains(&store) {
+                return Err(format!(
+                    "{context}: {store:?} is not a store this contract knows"
+                ));
+            }
+
+            if per_store.iter().any(|(name, _)| name == store) {
+                return Err(format!("{context}: {store} appears twice"));
+            }
+
+            let mut defaults = KnobDefaults::default();
+
+            for pair in knobs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return Err(format!(
+                        "{context}: {pair:?} under {store} is not key=value"
+                    ));
+                };
+
+                defaults.set(&format!("{context} ({store})"), key.trim(), value.trim())?;
+            }
+
+            per_store.push((store.to_owned(), defaults));
+        }
+
+        let agent_env = match var("DYNAMIC_CONFIG_AGENT_ENV") {
+            None => Vec::new(),
+            Some(text) => env_entries("DYNAMIC_CONFIG_AGENT_ENV", &text)?,
+        };
+
+        let scoped = |variable: &str,
+                      parse: fn(&str) -> Result<ScopedNames, String>|
+         -> Result<ScopedNames, String> {
+            match var(variable) {
+                None => Ok(ScopedNames::none()),
+                Some(spec) => parse(&spec).map_err(|e| format!("{variable}: {e}")),
+            }
+        };
+
+        Ok(Installation {
+            fleet,
+            per_store,
+            agent_env,
+            agent_env_allow: scoped(
+                "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+                ScopedNames::env_names,
+            )?,
+            source_allow: scoped("DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW", ScopedNames::sources)?,
+            source_deny: scoped("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", ScopedNames::sources)?,
+        })
+    }
+
+    fn from_environment() -> Result<Self, String> {
+        Self::from_lookup(&|name| std::env::var(name).ok())
+    }
+
+    fn store(&self, source: Option<&str>) -> Option<&KnobDefaults> {
+        let source = source?;
+
+        self.per_store
+            .iter()
+            .find(|(name, _)| name == source)
+            .map(|(_, defaults)| defaults)
+    }
+
+    /// Store default, then fleet default — the per-annotation value is
+    /// resolved at the parse site, above both.
+    fn knob<T: Clone>(
+        &self,
+        source: Option<&str>,
+        pick: impl Fn(&KnobDefaults) -> Option<T>,
+    ) -> Option<T> {
+        self.store(source)
+            .and_then(&pick)
+            .or_else(|| pick(&self.fleet))
+    }
+
+    /// Is this source turned off here outright?
+    #[must_use]
+    pub fn source_denied(&self, namespace: &str, source: &str) -> bool {
+        self.source_deny.allows(namespace, source)
+    }
+
+    /// Does the allowlist (when one exists) admit this source here?
+    #[must_use]
+    pub fn source_allowed(&self, namespace: &str, source: &str) -> bool {
+        self.source_allow.is_empty() || self.source_allow.allows(namespace, source)
+    }
+
+    /// May a pod in this namespace set this agent-env name?
+    #[must_use]
+    pub fn agent_env_allowed(&self, namespace: &str, name: &str) -> bool {
+        self.agent_env_allow.allows(namespace, name)
+    }
+
+    /// The agent-env names this namespace may set, for the refusal.
+    #[must_use]
+    pub fn agent_env_listing(&self, namespace: &str) -> String {
+        self.agent_env_allow.listing(namespace)
+    }
+
+    /// The sources this namespace may use, for the refusal.
+    #[must_use]
+    pub fn source_listing(&self, namespace: &str) -> String {
+        self.source_allow.listing(namespace)
+    }
+}
+
+/// Startup-time validation: a fleet default the installer mistyped must
+/// stop the webhook BEFORE it serves. Helm and kustomize both land
+/// here — the chart cannot validate an env var a kustomize patch set,
+/// so the process door is the one gate every install path walks
+/// through.
+pub fn verify_installation() -> Result<(), String> {
+    Installation::from_environment().map(|_| ())
+}
+
+pub(crate) fn installation() -> &'static Installation {
+    static INSTALLATION: std::sync::OnceLock<Installation> = std::sync::OnceLock::new();
+
+    // `verify_installation` ran before serving, so this cannot fail in
+    // a server; a test with a broken environment fails loudly instead.
+    INSTALLATION.get_or_init(|| Installation::from_environment().expect("verified at startup"))
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,6 +662,21 @@ pub struct Request {
     pub env_restart: bool,
     /// `metrics-port`: the agent serves its Prometheus text here.
     pub metrics_port: Option<u16>,
+    /// `aws-secret`: a Secret whose `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY` keys become exactly those variables on
+    /// the agent — static credentials for S3-compatible stores that are
+    /// not AWS (MinIO, Ceph, R2). On AWS itself, IRSA needs none of it.
+    pub aws_secret: Option<String>,
+    /// `agent-env`: extra environment on the injected agent container
+    /// (SDK knobs: proxies, `RUST_LOG`, `AWS_CA_BUNDLE`). Pod-wide —
+    /// every render's agent gets it — and admitted only through the
+    /// installation's allowlist, checked against the pod's namespace.
+    pub agent_env: Vec<(String, String)>,
+    /// The installer's fleet-wide agent environment
+    /// (`DYNAMIC_CONFIG_AGENT_ENV`), already merged: pod-set names
+    /// removed, `aws-secret`-owned names removed. No allowlist applies
+    /// — the installer owns both the values and the gate.
+    pub fleet_env: Vec<(String, String)>,
     /// The named renders beyond the default one: `source.db`,
     /// `key.db`, `path.db` … — one more agent per name, every file in
     /// the SAME directory as the default `path` (one shared volume,
@@ -187,6 +728,13 @@ pub enum Mode {
 /// silently not injecting is how a pod starts without the configuration
 /// it declared it needs.
 pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
+    of_pod_with(pod, installation())
+}
+
+/// [`of_pod`] with the installation made explicit — the server feeds
+/// its own; tests construct theirs through
+/// [`Installation::from_lookup`].
+pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request>, String> {
     let annotations = pod
         .pointer("/metadata/annotations")
         .and_then(Value::as_object);
@@ -250,6 +798,8 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         "env-inject",
         "env-restart",
         "metrics-port",
+        "aws-secret",
+        "agent-env",
         "template",
         "template-configmap",
     ];
@@ -321,16 +871,13 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
     // scheduling. The admission is earlier and the message lands where
     // the operator is already looking.
     match get("source") {
-        Some(
-            "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" | "etcd"
-            | "nats" | "s3",
-        )
-        | None => {}
-        Some(other) => {
+        Some(source) if !SOURCES.contains(&source) => {
             return Err(format!(
-                "{PREFIX}source is {other:?}: one of consul, vault,                  config-server, firestore, git, redis, etcd, nats, s3"
+                "{PREFIX}source is {source:?}: one of {}",
+                SOURCES.join(", ")
             ))
         }
+        _ => {}
     }
 
     let required = |name: &str| {
@@ -339,15 +886,23 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
             .ok_or_else(|| format!("{PREFIX}inject is true, so {PREFIX}{name} is required"))
     };
 
-    let mode = match get("mode").unwrap_or("sidecar") {
-        "init" => Mode::Init,
-        "sidecar" => Mode::Sidecar,
-        "both" => Mode::Both,
-        other => return Err(format!("{PREFIX}mode is {other:?}: init, sidecar or both")),
+    // Every knob below resolves annotation → this store's installation
+    // default → the fleet's → the built-in. Pod-wide knobs (mode,
+    // volume, resources, identity) take the DEFAULT render's store.
+    let source_name = get("source");
+
+    let mode = match get("mode") {
+        Some("init") => Mode::Init,
+        Some("sidecar") => Mode::Sidecar,
+        Some("both") => Mode::Both,
+        Some(other) => return Err(format!("{PREFIX}mode is {other:?}: init, sidecar or both")),
+        None => install
+            .knob(source_name, |k| k.mode)
+            .unwrap_or(Mode::Sidecar),
     };
 
     let watch_seconds = match get("watch-seconds") {
-        None => 15,
+        None => install.knob(source_name, |k| k.watch_seconds).unwrap_or(15),
         Some(text) => text
             .parse()
             .map_err(|_| format!("{PREFIX}watch-seconds is {text:?}: whole seconds"))?,
@@ -461,24 +1016,30 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         arguments.push(("--ca".to_owned(), format!("{CA_MOUNT}/{}", ca.key)));
     }
 
-    let volume_memory = match get("volume-medium").unwrap_or("memory") {
-        "memory" => true,
-        "disk" => false,
-        other => {
+    let volume_memory = match get("volume-medium") {
+        Some("memory") => true,
+        Some("disk") => false,
+        Some(other) => {
             return Err(format!(
                 "{PREFIX}volume-medium is {other:?}: memory (default) or disk"
             ))
         }
+        None => install
+            .knob(source_name, |k| k.volume_memory)
+            .unwrap_or(true),
     };
 
-    let native_sidecar = match get("native-sidecar").unwrap_or("false") {
-        "true" => true,
-        "false" => false,
-        other => {
+    let native_sidecar = match get("native-sidecar") {
+        Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
             return Err(format!(
                 "{PREFIX}native-sidecar is {other:?}: \"true\" or \"false\""
             ))
         }
+        None => install
+            .knob(source_name, |k| k.native_sidecar)
+            .unwrap_or(false),
     };
 
     // Light validation only — the API server owns the quantity grammar
@@ -498,72 +1059,49 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         }
     };
 
-    let fleet = defaults();
+    let cpu_request = install
+        .knob(source_name, |k| k.cpu_request.clone())
+        .unwrap_or_else(|| "10m".to_owned());
+    let memory_request = install
+        .knob(source_name, |k| k.memory_request.clone())
+        .unwrap_or_else(|| "32Mi".to_owned());
+    let memory_limit = install
+        .knob(source_name, |k| k.memory_limit.clone())
+        .unwrap_or_else(|| "64Mi".to_owned());
+    let cpu_limit = install.knob(source_name, |k| k.cpu_limit.clone());
 
     let resources = Resources {
-        cpu_request: quantity("agent-cpu-request", &fleet.cpu_request)?,
-        memory_request: quantity("agent-memory-request", &fleet.memory_request)?,
-        cpu_limit: match get("agent-cpu-limit").or(fleet.cpu_limit.as_deref()) {
+        cpu_request: quantity("agent-cpu-request", &cpu_request)?,
+        memory_request: quantity("agent-memory-request", &memory_request)?,
+        cpu_limit: match get("agent-cpu-limit").or(cpu_limit.as_deref()) {
             None => None,
             Some(_) => Some(quantity(
                 "agent-cpu-limit",
-                fleet.cpu_limit.as_deref().unwrap_or(""),
+                cpu_limit.as_deref().unwrap_or(""),
             )?),
         },
-        memory_limit: quantity("agent-memory-limit", &fleet.memory_limit)?,
+        memory_limit: quantity("agent-memory-limit", &memory_limit)?,
     };
 
     // The rendered file's permissions and the agent's identity — the
     // knobs that let a non-default app UID read a tighter-than-0644
     // file. Octal-validated here so the refusal lands at admission.
     let file_mode = match get("file-mode") {
-        None => None,
-        Some(text) => {
-            let octal = text.strip_prefix("0o").unwrap_or(text);
-            let value = u32::from_str_radix(octal, 8)
-                .map_err(|_| format!("{PREFIX}file-mode is {text:?}: octal, like \"0640\""))?;
-
-            if value > 0o777 {
-                return Err(format!(
-                    "{PREFIX}file-mode is {text:?}: at most 0777 — setuid bits \
-                     on a configuration file answer no question"
-                ));
-            }
-
-            if value & 0o400 == 0 {
-                return Err(format!(
-                    "{PREFIX}file-mode is {text:?}: the owner must at least \
-                     read it, or the file is write-only noise"
-                ));
-            }
-
-            Some(format!("{value:o}"))
-        }
+        None => install.knob(source_name, |k| k.file_mode.clone()),
+        Some(text) => Some(octal_mode(&format!("{PREFIX}file-mode"), text)?),
     };
 
     let identity = |name: &str| -> Result<Option<u32>, String> {
         match get(name) {
             None => Ok(None),
-            Some(text) => {
-                let id: u32 = text
-                    .parse()
-                    .map_err(|_| format!("{PREFIX}{name} is {text:?}: a numeric UID/GID"))?;
-
-                if id == 0 {
-                    return Err(format!(
-                        "{PREFIX}{name} is 0: the agent stays nonroot in every \
-                         configuration — an injector that relaxes a pod's \
-                         posture is a finding, not a feature"
-                    ));
-                }
-
-                Ok(Some(id))
-            }
+            Some(text) => Ok(Some(nonroot_id(&format!("{PREFIX}{name}"), text)?)),
         }
     };
 
-    let run_as_user = identity("agent-run-as-user")?;
-    let run_as_group = identity("agent-run-as-group")?;
+    let run_as_user =
+        identity("agent-run-as-user")?.or_else(|| install.knob(source_name, |k| k.run_as_user));
+    let run_as_group =
+        identity("agent-run-as-group")?.or_else(|| install.knob(source_name, |k| k.run_as_group));
     let env_inject = get("env-inject").map(str::to_owned);
 
     if env_inject.is_some() && mode == Mode::Sidecar {
@@ -600,13 +1138,57 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         ));
     }
 
+    let aws_secret = get("aws-secret").map(str::to_owned);
+
+    if aws_secret.is_some() && get("source") != Some("s3") {
+        return Err(format!(
+            "{PREFIX}aws-secret is the s3 source's flag; the source here is {:?}",
+            get("source").unwrap_or("unset")
+        ));
+    }
+
     let metrics_port = match get("metrics-port") {
-        None => None,
+        None => install.knob(source_name, |k| k.metrics_port),
+        // "0" is the per-pod opt-OUT of an installation-wide default.
+        Some("0") => None,
         Some(text) => Some(
             text.parse::<u16>()
                 .map_err(|_| format!("{PREFIX}metrics-port is {text:?}: a port number"))?,
         ),
     };
+
+    // The format is validated here; whether the NAMES may pass at all
+    // is the installation's allowlist, checked by the admission with
+    // the namespace in hand.
+    let agent_env = match get("agent-env") {
+        None => Vec::new(),
+        Some(text) => env_entries(&format!("{PREFIX}agent-env"), text)?,
+    };
+
+    for (name, _) in &agent_env {
+        if aws_secret.is_some()
+            && ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"].contains(&name.as_str())
+        {
+            return Err(format!(
+                "{PREFIX}agent-env sets {name}, and {PREFIX}aws-secret already \
+                 does: one credential, one place"
+            ));
+        }
+    }
+
+    // The installer's fleet-wide environment rides along under the
+    // pod's own: same name, the pod wins; the aws-secret names step
+    // aside for the Secret the pod chose.
+    let fleet_env: Vec<(String, String)> = install
+        .agent_env
+        .iter()
+        .filter(|(name, _)| !agent_env.iter().any(|(pod_name, _)| pod_name == name))
+        .filter(|(name, _)| {
+            aws_secret.is_none()
+                || !["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"].contains(&name.as_str())
+        })
+        .cloned()
+        .collect();
 
     if let Some(name) = &env_inject {
         let container = pod
@@ -688,6 +1270,7 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
             &|name| get(&format!("{name}.{suffix}")),
             pod,
             get("path"),
+            install,
         )?);
     }
 
@@ -713,6 +1296,9 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         env_inject,
         env_restart,
         metrics_port,
+        aws_secret,
+        agent_env,
+        fleet_env,
         extra,
     }))
 }
@@ -724,6 +1310,7 @@ fn extra_render<'a>(
     get: &impl Fn(&str) -> Option<&'a str>,
     _pod: &Value,
     default_path: Option<&str>,
+    install: &Installation,
 ) -> Result<ExtraRender, String> {
     let label = |name: &str| format!("{PREFIX}{name}.{suffix}");
 
@@ -735,16 +1322,13 @@ fn extra_render<'a>(
 
     let source = required("source")?;
 
-    match source.as_str() {
-        "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" | "etcd" | "nats"
-        | "s3" => {}
-        other => {
-            return Err(format!(
-                "{} is {other:?}: one of consul, vault, config-server, \
-                 firestore, git, redis, etcd, nats, s3",
-                label("source")
-            ))
-        }
+    if !SOURCES.contains(&source.as_str()) {
+        return Err(format!(
+            "{} is {:?}: one of {}",
+            label("source"),
+            source,
+            SOURCES.join(", ")
+        ));
     }
 
     let key = required("key")?;
@@ -771,8 +1355,11 @@ fn extra_render<'a>(
         }
     }
 
+    // Per-render knobs resolve against the RENDER's own store.
     let watch_seconds = match get("watch-seconds") {
-        None => 15,
+        None => install
+            .knob(Some(&source), |k| k.watch_seconds)
+            .unwrap_or(15),
         Some(text) => text
             .parse()
             .map_err(|_| format!("{} is {text:?}: whole seconds", label("watch-seconds")))?,
@@ -886,19 +1473,13 @@ fn extra_render<'a>(
         arguments.push(("--ca".to_owned(), format!("{CA_MOUNT}-{suffix}/{}", ca.key)));
     }
 
-    if let Some(text) = get("file-mode") {
-        let octal = text.strip_prefix("0o").unwrap_or(text);
-        let value = u32::from_str_radix(octal, 8)
-            .map_err(|_| format!("{} is {text:?}: octal, like \"0640\"", label("file-mode")))?;
+    let file_mode = match get("file-mode") {
+        None => install.knob(Some(&source), |k| k.file_mode.clone()),
+        Some(text) => Some(octal_mode(&label("file-mode"), text)?),
+    };
 
-        if value > 0o777 || value & 0o400 == 0 {
-            return Err(format!(
-                "{} is {text:?}: octal, at most 0777, owner-readable",
-                label("file-mode")
-            ));
-        }
-
-        arguments.push(("--file-mode".to_owned(), format!("0{value:o}")));
+    if let Some(mode) = file_mode {
+        arguments.push(("--file-mode".to_owned(), format!("0{mode}")));
     }
 
     let tls = get("tls-secret").map(str::to_owned);
@@ -949,4 +1530,200 @@ fn extra_render<'a>(
         tls,
         template,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup<'a>(pairs: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn installation_defaults_hold_without_environment() {
+        let install = Installation::from_lookup(&lookup(&[])).unwrap();
+
+        assert_eq!(install.fleet.cpu_request, None);
+        assert_eq!(install.fleet.file_mode, None);
+        assert!(install.per_store.is_empty());
+        assert!(install.agent_env.is_empty());
+        assert!(install.source_allowed("anywhere", "vault"));
+        assert!(!install.source_denied("anywhere", "vault"));
+        assert!(!install.agent_env_allowed("anywhere", "RUST_LOG"));
+    }
+
+    #[test]
+    fn installation_validates_every_knob() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "888", "octal"),
+            ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "7777", "at most 0777"),
+            ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "044", "owner"),
+            (
+                "DYNAMIC_CONFIG_AGENT_WATCH_SECONDS",
+                "soon",
+                "whole seconds",
+            ),
+            ("DYNAMIC_CONFIG_AGENT_CPU_REQUEST", "lots", "quantity"),
+            ("DYNAMIC_CONFIG_AGENT_CPU_LIMIT", "-1", "quantity"),
+            (
+                "DYNAMIC_CONFIG_AGENT_MODE",
+                "detached",
+                "init, sidecar or both",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM",
+                "tape",
+                "memory or disk",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR",
+                "yes",
+                "\"true\" or \"false\"",
+            ),
+            ("DYNAMIC_CONFIG_AGENT_RUN_AS_USER", "0", "nonroot"),
+            ("DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP", "root", "numeric"),
+            ("DYNAMIC_CONFIG_AGENT_METRICS_PORT", "http", "port"),
+            ("DYNAMIC_CONFIG_AGENT_ENV", "rust_log=1", "UPPER_SNAKE"),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "watch-seconds=30",
+                "no `store:` head",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "sql: watch-seconds=30",
+                "not a store",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "vault: color=red",
+                "not a defaultable knob",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "vault: file-mode=888",
+                "octal",
+            ),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "vault: mode=init; vault: mode=both",
+                "twice",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+                "rust_log",
+                "UPPER_SNAKE",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+                "Payments:X",
+                "namespace",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+                "payments:",
+                "names nothing",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW",
+                "payments: sql",
+                "not a store",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY",
+                "payments: VAULT",
+                "not a store",
+            ),
+        ];
+
+        for (name, value, expected) in cases {
+            let error = Installation::from_lookup(&lookup(&[(name, value)])).unwrap_err();
+
+            assert!(
+                error.contains(name) && error.contains(expected),
+                "{name}={value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn installation_accepts_the_documented_shapes() {
+        let install = Installation::from_lookup(&lookup(&[
+            ("DYNAMIC_CONFIG_AGENT_FILE_MODE", "0640"),
+            ("DYNAMIC_CONFIG_AGENT_WATCH_SECONDS", "30"),
+            ("DYNAMIC_CONFIG_AGENT_MODE", "both"),
+            ("DYNAMIC_CONFIG_AGENT_VOLUME_MEDIUM", "disk"),
+            ("DYNAMIC_CONFIG_AGENT_NATIVE_SIDECAR", "true"),
+            ("DYNAMIC_CONFIG_AGENT_RUN_AS_USER", "1000"),
+            ("DYNAMIC_CONFIG_AGENT_RUN_AS_GROUP", "1000"),
+            ("DYNAMIC_CONFIG_AGENT_METRICS_PORT", "9102"),
+            ("DYNAMIC_CONFIG_AGENT_ENV", "HTTPS_PROXY=http://egress:3128"),
+            (
+                "DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS",
+                "vault: watch-seconds=10, file-mode=0400; s3: agent-memory-limit=128Mi",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW",
+                "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG",
+            ),
+            (
+                "DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW",
+                "payments: vault, s3; *: consul",
+            ),
+            ("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", "sandbox: git"),
+        ]))
+        .unwrap();
+
+        assert_eq!(install.fleet.file_mode.as_deref(), Some("640"));
+        assert_eq!(install.fleet.mode, Some(Mode::Both));
+        assert_eq!(install.fleet.volume_memory, Some(false));
+        assert_eq!(install.fleet.run_as_user, Some(1000));
+        assert_eq!(install.fleet.metrics_port, Some(9102));
+        assert_eq!(install.agent_env.len(), 1);
+
+        // Store default outranks fleet; an unlisted store falls to fleet.
+        assert_eq!(install.knob(Some("vault"), |k| k.watch_seconds), Some(10));
+        assert_eq!(install.knob(Some("redis"), |k| k.watch_seconds), Some(30));
+        assert_eq!(
+            install
+                .knob(Some("vault"), |k| k.file_mode.clone())
+                .as_deref(),
+            Some("400")
+        );
+        assert_eq!(
+            install
+                .knob(Some("s3"), |k| k.memory_limit.clone())
+                .as_deref(),
+            Some("128Mi")
+        );
+
+        assert!(install.agent_env_allowed("payments", "AWS_CA_BUNDLE"));
+        assert!(!install.agent_env_allowed("elsewhere", "HTTPS_PROXY"));
+        assert!(install.source_allowed("payments", "vault"));
+        assert!(install.source_allowed("payments", "consul"));
+        assert!(!install.source_allowed("payments", "git"));
+        assert!(install.source_denied("sandbox", "git"));
+        assert!(!install.source_denied("payments", "git"));
+    }
+
+    #[test]
+    fn the_gates_scope_by_namespace_and_prefix() {
+        let allow = ScopedNames::env_names("payments: HTTPS_PROXY, AWS_*; *: RUST_LOG").unwrap();
+
+        assert!(allow.allows("payments", "AWS_CA_BUNDLE"));
+        assert!(allow.allows("anywhere", "RUST_LOG"));
+        assert!(!allow.allows("anywhere", "HTTPS_PROXY"));
+        assert!(!allow.allows("payments", "LD_PRELOAD"));
+        assert!(ScopedNames::none().listing("payments").is_empty());
+        assert_eq!(allow.listing("payments"), "HTTPS_PROXY, AWS_*, RUST_LOG");
+        assert!(ScopedNames::env_names("*: *")
+            .unwrap()
+            .allows("x", "ANYTHING"));
+    }
 }

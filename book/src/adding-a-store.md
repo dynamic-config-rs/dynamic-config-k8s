@@ -82,7 +82,7 @@ test pins the happy path.
 manifests, the identity-first default stated), a ready-to-apply file
 in `examples/`, a row in the annotation reference's source table, and
 — for a store with a live server in CI — an e2e leg shaped like
-`e2e/etcd-smoke.sh`.
+`e2e/stores-smoke.sh` — one cluster, every live store, a stage per source.
 
 **5. The gates** — `just check` in both repositories, the webhook
 goldens, the kind smoke. Nothing about the release train changes: the

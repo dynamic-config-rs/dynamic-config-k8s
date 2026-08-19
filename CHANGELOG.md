@@ -11,6 +11,48 @@ version — the contract is the API here.
 
 ### Added
 
+- **Source gates, global and per namespace**: `webhook.sourceAllow`
+  admits only the stores it names (empty = every store, so upgrades
+  change nothing); `webhook.sourceDeny` turns stores off outright and
+  outranks the allowlist. Judged against the pod's namespace on EVERY
+  render — a denied store cannot ride in on a named suffix — and a
+  gate entry that is not a real store fails webhook startup.
+- **"Observability" book page**: the three Prometheus endpoints
+  (webhook admissions by outcome, agent render counters and the
+  staleness gauge, operator reconciles), alert rules for the gauge,
+  PodMonitor and OTel-Collector scrape examples, the log contract,
+  and an honest paragraph on why there is no OTel SDK inside.
+- **"Installation Defaults and Gates" book page**: the tier model,
+  every knob with its validation, a per-store example for all nine
+  stores with every field filled, the three gates' semantics and
+  threat model, and the chart-value-to-env-variable table kustomize
+  installs work from.
+- **Per-store defaults, and the full knob set fleet-wide**: defaults
+  now come in tiers — annotation > per-store > fleet > built-in.
+  `agent.defaults.perStore` sets any knob one store at a time
+  (`vault: "watch-seconds=10, file-mode=0400"`), and the fleet tier
+  grows `mode`, `volumeMedium`, `nativeSidecar`, `runAsUser`,
+  `runAsGroup`, `metricsPort` (pods opt out with `metrics-port: "0"`)
+  and `env` — installer-set environment on every agent, overridden
+  name by name by a pod's own `agent-env`. One vocabulary, one set of
+  validators, all of it checked at webhook startup; kustomize patches
+  the same `DYNAMIC_CONFIG_AGENT_*` variables and walks through the
+  same door.
+- **`agent-env`, behind the installer's gate**: pods may set
+  environment on their injected agents (`RUST_LOG`, proxy variables,
+  `AWS_CA_BUNDLE`) — but only names the installation allowlists for
+  that namespace pass admission. The gate is `webhook.agentEnvAllow`
+  (`DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW` for kustomize):
+  namespace-scoped groups, prefix globs, empty means refused
+  everywhere. It is config, not a namespace annotation, because a gate
+  its subject can open is not a gate — and reading namespaces would
+  cost the webhook its zero-RBAC posture.
+- **Fleet defaults for `file-mode` and `watch-seconds`**
+  (`agent.defaults.fileMode` / `.watchSeconds`), joining the resource
+  defaults — and EVERY fleet default is now validated when the webhook
+  starts, so a mistyped octal stops the install instead of surfacing
+  at the first admission. Helm's values schema refuses the same
+  mistakes at render time; kustomize installs get the startup check.
 - **selfRotate: the webhook is its own certificate authority.** The
   third TLS mode (`webhook.selfRotate.enabled`), the
   Vault-agent-injector shape: a CA and leaf minted **in memory** at
@@ -49,6 +91,12 @@ version — the contract is the API here.
 
 ### Fixed
 
+- **s3 with `api-url` no longer needs an ambient region**: an explicit
+  endpoint means a non-AWS server (MinIO, Ceph, R2) — there is no IMDS
+  to ask, so the SDK's region lookup timed out and left the client
+  region-less, which it refuses. The agent now falls back to
+  `us-east-1` (ignored by those servers) after the normal chain, so
+  `AWS_REGION` still wins when set.
 - **The injected agent could not read its own TLS client credential.**
   `tls-secret` mounted at `defaultMode: 0400` — root-owned by the
   kubelet, owner-read only — while the agent runs nonroot, so every
@@ -63,6 +111,20 @@ version — the contract is the API here.
   and the server's new TokenReview auth maps the identity to
   applications. The last place a developer still held a client token,
   closed.
+- **`aws-secret`** — static S3 credentials as one annotation (the
+  Secret's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` keys onto the
+  agent), for the S3-compatibles that are not AWS; refused on any
+  other source. Closes the MinIO gap the book had hand-waved at.
+- **CI covers every feasible live store, in ONE leg**: kind stands up
+  etcd twice (password against one server, a REQUIRED client
+  certificate against another — v3 leaves with proper EKUs, because
+  Go's TLS is entitled to refuse a v1 or a serverAuth-only cert as a
+  client), plus vault, redis, NATS and MinIO, and renders through all
+  six annotated pods with one image build. Consul rides the PR smoke
+  and the operator leg; git, firestore and config-server clients are
+  the remote repository's container suites, and their agent arms are
+  identical flag plumbing — the exclusion is stated in the script, not
+  implied.
 - **Named renders — several documents, one pod.** Every store-shaped
   annotation takes a `.<name>` suffix (`source.cache`, `key.cache`,
   `path.cache` …); each name is one more injected agent writing one

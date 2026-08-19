@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [smoke, etcd-smoke, operator-smoke]
+        leg: [smoke, operator-smoke, stores-smoke]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
