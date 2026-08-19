@@ -5,8 +5,6 @@ name: Security
 # travels through pull requests, and a push twin under required checks
 # poisons the gate.
 on:
-  push:
-    branches: [main]
   pull_request:
   schedule:
     - cron: "23 6 * * 1"
