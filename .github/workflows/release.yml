@@ -153,14 +153,14 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ needs.decide.outputs.version }}
         run: |
-          ghcr=$(docker buildx imagetools inspect \
+          on_ghcr=$(docker buildx imagetools inspect \
             "${GHCR}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
-          hub=$(docker buildx imagetools inspect \
+          on_hub=$(docker buildx imagetools inspect \
             "${DOCKERHUB}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
 
-          echo "ghcr: $ghcr"
-          echo "hub:  $hub"
-          [ "$ghcr" = "$hub" ] && [ "$ghcr" = "\"${DIGEST}\"" ]
+          echo "ghcr: $on_ghcr"
+          echo "hub:  $on_hub"
+          [ "$on_ghcr" = "$on_hub" ] && [ "$on_ghcr" = "\"${DIGEST}\"" ]
 
   chart:
     name: chart to ghcr + ArtifactHub metadata
