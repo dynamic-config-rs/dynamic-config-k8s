@@ -74,6 +74,42 @@ jobs:
           tool: just
       - run: e2e/smoke.sh
 
+  e2e-etcd:
+    name: kind etcd, both auths
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      - run: e2e/etcd-smoke.sh
+
+  e2e-operator:
+    name: kind operator, render to ConfigMap
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      - run: e2e/operator-smoke.sh
+
   actionlint:
     name: workflows lint clean
     runs-on: ubuntu-latest
@@ -86,7 +122,7 @@ jobs:
 
   ci-ok:
     name: CI is green
-    needs: [fmt, clippy, test, e2e-smoke, actionlint]
+    needs: [fmt, clippy, test, e2e-smoke, e2e-etcd, e2e-operator, actionlint]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

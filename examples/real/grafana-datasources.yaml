@@ -1,0 +1,31 @@
+# Grafana, the real thing: provisioning is a YAML file under
+# /etc/grafana/provisioning/, and Grafana re-reads datasources on a
+# reload signal — a file consumer, so the sidecar keeps it LIVE with no
+# restart. The rendered file lands where Grafana already looks.
+#
+# Store document (consul key grafana/datasources.json):
+#   {"apiVersion": 1, "datasources": [{"name": "Prometheus",
+#     "type": "prometheus", "url": "http://prometheus.monitoring:9090"}]}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: grafana } }
+  template:
+    metadata:
+      labels: { app: grafana }
+      annotations:
+        dynamic-config.rs/inject: "true"
+        dynamic-config.rs/source: "consul"
+        dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+        dynamic-config.rs/key: "grafana/datasources.json"
+        dynamic-config.rs/path: "/etc/grafana/provisioning/datasources/store.yaml"
+        dynamic-config.rs/watch-seconds: "30"
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          ports:
+            - containerPort: 3000

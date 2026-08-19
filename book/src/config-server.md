@@ -13,8 +13,27 @@ Two reasons to put it between the pods and the stores:
   token is a fleet of tokens to rotate. The server holds the store
   credentials once; the pods hold short client tokens that grant
   exactly one application's sections.
-- **The async stores today.** etcd, NATS and S3 reach the agent in
-  0.2.0 — through the server they work now.
+- **Nine stores behind one address.** The server speaks every store,
+  so a pod's annotations name one endpoint whatever moves behind it.
+
+## Kubernetes auth: the pod's own identity, end to end
+
+Since 0.3.0 the server indirection is zero-secret too:
+`auth: "kubernetes"` makes the agent present the pod's projected
+service-account token as the bearer (re-read every fetch — it
+rotates), and the server's `[kubernetes]` TokenReview grants map
+`namespace:serviceaccount` to applications:
+
+```yaml
+    dynamic-config.rs/source: "config-server"
+    dynamic-config.rs/endpoint: "https://config.infra.svc:8443"
+    dynamic-config.rs/key: "shop/prod"
+    dynamic-config.rs/auth: "kubernetes"
+```
+
+No client token minted, distributed, mounted or rotated — the
+[remote book's server chapter](https://dynamic-config-rs.github.io/remote/config-server.html)
+carries the server-side TOML.
 
 ## The wiring
 

@@ -455,6 +455,342 @@ fn the_volume_is_memory_backed_unless_asked_otherwise() {
 }
 
 #[test]
+fn env_inject_wraps_the_named_command() {
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/path"] = json!("/config/app.env");
+    pod["metadata"]["annotations"]["dynamic-config.rs/template"] = json!("DB_HOST={{ db.host }}\n");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+    pod["spec"]["containers"][0]["command"] = json!(["airflow", "scheduler"]);
+    pod["spec"]["containers"][0]["args"] = json!(["--pid", "/tmp/pid"]);
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    let command = patches
+        .iter()
+        .find(|p| p["path"] == "/spec/containers/0/command")
+        .expect("the wrap");
+
+    assert_eq!(
+        command["value"],
+        json!([
+            "/bin/sh",
+            "-c",
+            "set -a; . /config/app.env; set +a; exec \"$@\"",
+            "dynamic-config-env",
+            "airflow",
+            "scheduler",
+            "--pid",
+            "/tmp/pid"
+        ])
+    );
+    assert!(
+        patches
+            .iter()
+            .any(|p| p["op"] == "remove" && p["path"] == "/spec/containers/0/args"),
+        "args folded into the wrap"
+    );
+}
+
+#[test]
+fn named_renders_multiply_the_agents() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source.cache".to_owned(), json!("redis"));
+    notes.insert(
+        "dynamic-config.rs/endpoint-secret.cache".to_owned(),
+        json!("redis-url/url"),
+    );
+    notes.insert(
+        "dynamic-config.rs/key.cache".to_owned(),
+        json!("myapp/cache.json"),
+    );
+    notes.insert(
+        "dynamic-config.rs/path.cache".to_owned(),
+        json!("/config/cache.toml"),
+    );
+    notes.insert(
+        "dynamic-config.rs/ca-configmap.cache".to_owned(),
+        json!("redis-ca"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    let agents: Vec<&Value> = patches
+        .iter()
+        .filter(|p| p["path"] == "/spec/containers/-")
+        .collect();
+
+    assert_eq!(agents.len(), 2, "the default agent and the named one");
+    assert_eq!(
+        agents[1]["value"]["name"],
+        json!("dynamic-config-agent-cache")
+    );
+
+    let args: Vec<&str> = agents[1]["value"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert!(args.contains(&"redis"));
+    assert!(args.contains(&"/config/cache.toml"));
+    assert!(
+        args.contains(&"/etc/dynamic-config/ca-cache/ca.crt"),
+        "the aux mount is suffixed: {args:?}"
+    );
+
+    // Its endpoint secret rides ITS container's env, nobody else's.
+    assert_eq!(
+        agents[1]["value"]["env"][0]["name"],
+        json!("DYNAMIC_CONFIG_AGENT_ENDPOINT")
+    );
+
+    // And the suffixed CA volume exists.
+    assert!(patches.iter().any(|p| {
+        p["path"] == "/spec/volumes/-" && p["value"]["name"] == "dynamic-config-ca-cache"
+    }));
+}
+
+#[test]
+fn a_named_render_outside_the_shared_directory_is_refused() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source.cache".to_owned(), json!("redis"));
+    notes.insert(
+        "dynamic-config.rs/endpoint.cache".to_owned(),
+        json!("redis://cache:6379"),
+    );
+    notes.insert(
+        "dynamic-config.rs/key.cache".to_owned(),
+        json!("myapp/cache.json"),
+    );
+    notes.insert(
+        "dynamic-config.rs/path.cache".to_owned(),
+        json!("/elsewhere/cache.toml"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("ONE volume"));
+}
+
+#[test]
+fn a_named_render_missing_its_key_is_refused_by_name() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source.cache".to_owned(), json!("redis"));
+    notes.insert(
+        "dynamic-config.rs/endpoint.cache".to_owned(),
+        json!("redis://cache:6379"),
+    );
+    notes.insert(
+        "dynamic-config.rs/path.cache".to_owned(),
+        json!("/config/cache.toml"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("key.cache"));
+}
+
+#[test]
+fn env_restart_exports_a_fingerprint_and_probes_it() {
+    let mut pod = annotated("both");
+    pod["metadata"]["annotations"]["dynamic-config.rs/path"] = json!("/config/app.env");
+    pod["metadata"]["annotations"]["dynamic-config.rs/template"] = json!("A={{ a }}\n");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-restart"] = json!("true");
+    pod["metadata"]["annotations"]["dynamic-config.rs/watch-seconds"] = json!("30");
+    pod["spec"]["containers"][0]["command"] = json!(["serve"]);
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    let command = patches
+        .iter()
+        .find(|p| p["path"] == "/spec/containers/0/command")
+        .expect("the wrap");
+    let script = command["value"][2].as_str().unwrap();
+
+    assert!(
+        script.contains("DYNAMIC_CONFIG_ENV_FINGERPRINT"),
+        "{script}"
+    );
+    assert!(script.contains("cksum < /config/app.env"), "{script}");
+
+    let probe = patches
+        .iter()
+        .find(|p| p["path"] == "/spec/containers/0/livenessProbe")
+        .expect("the restart trigger");
+
+    assert_eq!(probe["value"]["periodSeconds"], json!(30));
+    assert_eq!(probe["value"]["failureThreshold"], json!(1));
+    assert!(probe["value"]["exec"]["command"][2]
+        .as_str()
+        .unwrap()
+        .contains("$DYNAMIC_CONFIG_ENV_FINGERPRINT"));
+}
+
+#[test]
+fn env_restart_refusals_name_the_fix() {
+    // Without env-inject there is nothing to restart for.
+    let mut pod = annotated("both");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-restart"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    // Init alone never changes the file again.
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-restart"] = json!("true");
+    pod["spec"]["containers"][0]["command"] = json!(["serve"]);
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("both"));
+
+    // A livenessProbe the container already owns cannot be shared.
+    let mut pod = annotated("both");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-restart"] = json!("true");
+    pod["spec"]["containers"][0]["command"] = json!(["serve"]);
+    pod["spec"]["containers"][0]["livenessProbe"] =
+        json!({ "httpGet": { "path": "/health", "port": 8080 } });
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("livenessProbe"));
+}
+
+#[test]
+fn env_inject_refusals_name_the_fix() {
+    // Sidecar mode: the file would arrive after the app started.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+    pod["spec"]["containers"][0]["command"] = json!(["run"]);
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("mode"));
+
+    // No explicit command: the ENTRYPOINT is invisible to the webhook.
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("app");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("ENTRYPOINT"));
+
+    // A container the pod does not have.
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/env-inject"] = json!("nope");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+#[test]
+fn file_mode_and_identity_reach_the_agent() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/file-mode".to_owned(), json!("0640"));
+    notes.insert(
+        "dynamic-config.rs/agent-run-as-user".to_owned(),
+        json!("1000"),
+    );
+    notes.insert(
+        "dynamic-config.rs/agent-run-as-group".to_owned(),
+        json!("1000"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    let sidecar = patches
+        .iter()
+        .find(|p| p["path"] == "/spec/containers/-")
+        .unwrap();
+    let args: Vec<&str> = sidecar["value"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let mode_at = args.iter().position(|a| *a == "--file-mode").unwrap();
+
+    assert_eq!(args[mode_at + 1], "0640");
+
+    let security = &sidecar["value"]["securityContext"];
+
+    assert_eq!(security["runAsUser"], json!(1000));
+    assert_eq!(security["runAsGroup"], json!(1000));
+    assert_eq!(security["runAsNonRoot"], json!(true), "posture holds");
+}
+
+#[test]
+fn root_and_nonsense_modes_are_refused_at_admission() {
+    for (name, value, says) in [
+        ("dynamic-config.rs/agent-run-as-user", "0", "nonroot"),
+        ("dynamic-config.rs/file-mode", "888", "octal"),
+        ("dynamic-config.rs/file-mode", "0200", "read"),
+    ] {
+        let mut pod = annotated("sidecar");
+        pod["metadata"]["annotations"][name] = json!(value);
+
+        let response = dynamic_config_webhook::admission_response(&review(pod));
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&json!(false)),
+            "{name}={value}"
+        );
+
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(Value::as_str)
+            .unwrap();
+
+        assert!(message.contains(says), "{name}={value}: {message}");
+    }
+}
+
+#[test]
 fn resource_annotations_move_the_ask() {
     let mut pod = annotated("sidecar");
     let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
@@ -656,7 +992,10 @@ fn two_templates_are_refused() {
 }
 
 #[test]
-fn the_async_stores_are_refused_at_admission_not_at_crashloop() {
+fn the_async_stores_are_admitted_since_0_2_0() {
+    // Since 0.2.0 the async stores are admitted like any other: the
+    // refusal-by-name this test used to pin retired with the agent's
+    // async path.
     for store in ["etcd", "nats", "s3"] {
         let mut pod = annotated("sidecar");
         pod["metadata"]["annotations"]["dynamic-config.rs/source"] = json!(store);
@@ -665,15 +1004,9 @@ fn the_async_stores_are_refused_at_admission_not_at_crashloop() {
 
         assert_eq!(
             response.pointer("/response/allowed"),
-            Some(&json!(false)),
+            Some(&json!(true)),
             "{store}"
         );
-
-        let message = response
-            .pointer("/response/status/message")
-            .and_then(Value::as_str)
-            .unwrap();
-        assert!(message.contains("0.2.0"), "{store}: {message}");
     }
 }
 

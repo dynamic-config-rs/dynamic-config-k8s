@@ -21,8 +21,12 @@ imagePullSecrets: []
 # ── The agent (what gets injected) ───────────────────────────────────
 agent:
   image: ghcr.io/dynamic-config-rs/dynamic-config-agent
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""            # wins over tag when set — pin in production
+  # The pull secret injected pods get (appended to their own) when the
+  # agent image lives in a private mirror. Pull secrets are namespaced:
+  # the Secret must exist in every namespace that injects.
+  pullSecret: ""
   # Fleet-wide defaults for every injected container; the
   # `agent-cpu-request` (etc.) annotations still override per pod.
   # cpuLimit stays empty on purpose — throttling a config agent buys
@@ -36,7 +40,7 @@ agent:
 # ── The webhook ──────────────────────────────────────────────────────
 webhook:
   image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""
   imagePullPolicy: IfNotPresent
   replicas: 2
@@ -75,6 +79,22 @@ webhook:
   # Days of validity for the self-signed pair (certManager disabled).
   selfSignedDays: 3650
 
+  # `selfRotate.enabled: true` — the third mode: the webhook is its own
+  # certificate authority. It mints a CA and leaf IN MEMORY at rotation
+  # time, writes the pair to its own Secret (every replica serves it
+  # via the file hot-reload), and patches the webhook configuration's
+  # caBundle itself — the Vault-agent-injector shape. No dependency,
+  # AND it rotates: a fresh pair every 24h, leader-elected over a
+  # Lease so replicas do not race.
+  #
+  # The price, stated here beside failurePolicy because they are the
+  # same trade: the webhook gets a service-account token and three
+  # narrow permissions (its one Secret, its one webhook configuration
+  # by name, leases in this namespace) — the pure zero-RBAC posture of
+  # the other two modes is deliberately given up for rotation.
+  selfRotate:
+    enabled: false
+
   # `Ignore` fails OPEN: an unreachable webhook lets pods through
   # un-injected, and the pod that asked shows the gap loudly (its file
   # never appears). `Fail` closes the gap and couples pod CREATEs in
@@ -86,7 +106,7 @@ webhook:
   # Namespaces the webhook never touches, beyond its own, kube-system
   # and kube-node-lease.
   excludeNamespaces: []
-  # Istio-style opt-in: when true, only namespaces labeled
+  # Opt-in: when true, only namespaces labeled
   #   dynamic-config.rs/injection: enabled
   # are selected at all — and `failurePolicy: Fail` becomes a
   # per-namespace promise instead of a cluster-wide one.
@@ -148,7 +168,7 @@ networkPolicy:
 operator:
   enabled: false
   image: ghcr.io/dynamic-config-rs/dynamic-config-operator
-  tag: "0.1.0"
+  tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""
   imagePullPolicy: IfNotPresent
   serviceAccount:

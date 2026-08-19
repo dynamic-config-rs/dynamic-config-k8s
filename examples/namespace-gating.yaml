@@ -1,0 +1,37 @@
+# Istio-style opt-in: with `webhook.namespaceGating=true` on the chart,
+# ONLY namespaces carrying this label are selected at all — the blast
+# radius of the webhook is exactly the namespaces that asked, and
+# `failurePolicy: Fail` becomes a per-namespace promise instead of a
+# cluster-wide one.
+#
+#   helm upgrade dynamic-config deploy/helm --set webhook.namespaceGating=true
+#
+# A LABEL, and it could not be an annotation: the gate lives in the
+# webhook configuration's namespaceSelector, and Kubernetes selectors
+# match labels only. (kubectl one-liner for an existing namespace:
+#   kubectl label namespace payments dynamic-config.rs/injection=enabled)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payments
+  labels:
+    dynamic-config.rs/injection: enabled
+---
+# Inside a gated namespace the per-pod annotation is STILL required —
+# the namespace gate is an outer guard, never an implicit opt-in.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  namespace: payments
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "consul"
+    dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+    dynamic-config.rs/key: "payments/billing.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]

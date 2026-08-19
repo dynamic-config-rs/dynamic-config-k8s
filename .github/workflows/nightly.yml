@@ -1,0 +1,75 @@
+name: Nightly
+
+# The long legs PRs cannot afford: the selfRotate rotation soak —
+# hourly rotations under admission load, zero refused handshakes across
+# every rotation — and the full e2e ladder against a fresh kind.
+on:
+  schedule:
+    - cron: "40 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rotation-soak:
+    name: selfRotate soak, hourly rotations under load
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      - run: e2e/rotation-soak.sh
+        env:
+          SOAK_HOURS: "5"
+
+  e2e-ladder:
+    name: the full e2e ladder
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [smoke, etcd-smoke, operator-smoke]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      - run: e2e/${{ matrix.leg }}.sh
+
+  # The published images age between releases: base-image CVEs accrue
+  # while the tags stand still. This scans what users actually pull —
+  # every night, HIGH and CRITICAL with a fix available fail the job,
+  # and a red nightly here is the signal to cut a patch release.
+  image-cves:
+    name: published ${{ matrix.component }} image CVE scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [agent, webhook, operator]
+    steps:
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/dynamic-config-rs/dynamic-config-${{ matrix.component }}:latest
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

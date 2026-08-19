@@ -1,0 +1,27 @@
+# Several documents, one pod: each `.<name>` suffix is one more injected
+# agent writing one more file into the same shared directory — the
+# Vault-injector's multi-secret idiom, this contract's spelling.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    # the default render: the app's own document, from vault
+    dynamic-config.rs/source: "vault"
+    dynamic-config.rs/endpoint: "https://vault.vault.svc:8200"
+    dynamic-config.rs/key: "secret/myapp"
+    dynamic-config.rs/auth: "kubernetes"
+    dynamic-config.rs/auth-role: "myapp"
+    dynamic-config.rs/path: "/config/app.yaml"
+    # a second render named `cache`: the redis section, its own store
+    dynamic-config.rs/source.cache: "redis"
+    dynamic-config.rs/endpoint-secret.cache: "redis-url/url"
+    dynamic-config.rs/key.cache: "myapp/cache.json"
+    dynamic-config.rs/path.cache: "/config/cache.toml"
+    dynamic-config.rs/watch-seconds.cache: "30"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/app.yaml /config/cache.toml; sleep 30; done"]

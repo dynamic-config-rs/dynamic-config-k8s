@@ -23,3 +23,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 futures = "0.3"
 thiserror = "2"
+# The agent's machinery as a library: the reconciler builds sources and
+# renders documents through the SAME code the sidecar runs.
+dynamic-config-agent = { path = "../dynamic-config-agent" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# kube's rustls client needs ONE process-level provider; with both ring
+# and aws-lc reachable in the graph, rustls refuses to guess — main
+# installs ring explicitly.
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }

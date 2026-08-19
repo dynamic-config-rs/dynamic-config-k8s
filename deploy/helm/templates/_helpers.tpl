@@ -66,9 +66,14 @@ annotations:
 {{- end }}
 
 {{/* An image reference: digest wins over tag, latest is refused. */}}
+{{/* Takes (dict "component" <.Values.x> "root" $): an empty tag means
+     "the chart's appVersion, v-prefixed" — the tag release.yml pushes —
+     so a release bumps ONE number and the three images follow. */}}
 {{- define "dynamic-config.image" -}}
-{{- if eq .tag "latest" }}{{ fail "tag \"latest\" is not an identity — pin a version or a digest" }}{{- end }}
-{{- if .digest }}{{ printf "%s@%s" .image .digest }}{{- else }}{{ printf "%s:%s" .image .tag }}{{- end }}
+{{- $c := .component -}}
+{{- $tag := $c.tag | default (printf "v%s" .root.Chart.AppVersion) -}}
+{{- if eq $tag "latest" }}{{ fail "tag \"latest\" is not an identity — pin a version or a digest" }}{{- end }}
+{{- if $c.digest }}{{ printf "%s@%s" $c.image $c.digest }}{{- else }}{{ printf "%s:%s" $c.image $tag }}{{- end }}
 {{- end }}
 
 {{/* The restricted-PSS container security context, shared. */}}

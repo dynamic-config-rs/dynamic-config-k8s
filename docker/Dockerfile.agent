@@ -4,7 +4,7 @@
 FROM rust:1.88-slim AS build
 WORKDIR /src
 COPY . .
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler \
  && cargo build --release -p dynamic-config-agent
 
 FROM gcr.io/distroless/cc-debian12:nonroot

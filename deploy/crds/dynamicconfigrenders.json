@@ -29,7 +29,16 @@
                     "description": "The class naming the store.",
                     "type": "string"
                   },
-                  "interval_seconds": {
+                  "classKind": {
+                    "default": "DynamicConfigClass",
+                    "description": "`DynamicConfigClass` (default, this namespace) or `ClusterDynamicConfigClass` split between a namespaced store and a platform-owned one.",
+                    "enum": [
+                      "DynamicConfigClass",
+                      "ClusterDynamicConfigClass"
+                    ],
+                    "type": "string"
+                  },
+                  "intervalSeconds": {
                     "default": 15,
                     "description": "Poll interval, seconds.",
                     "format": "uint64",
@@ -43,17 +52,32 @@
                   "target": {
                     "description": "The ConfigMap to write, and the file name inside it (its extension picks the rendered format).",
                     "properties": {
-                      "config_map": {
+                      "configMap": {
+                        "description": "The ConfigMap to write. Exactly one of `configMap` and `secret`.",
+                        "nullable": true,
                         "type": "string"
                       },
                       "file": {
+                        "description": "The file name inside the target (its extension picks the rendered format). Required for the `file` shape; unused for `envEntries`, where the keys ARE the entries.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "secret": {
+                        "description": "The Secret to write \u2014 for consumers that read Kubernetes Secrets natively. Secret updates are live objects: a watcher reacts without any pod restart, and an `envFrom` consumer picks them up on its next start \u2014 environment variables freeze at container start, which is Kubernetes' rule rather than this operator's.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "shape": {
+                        "default": "file",
+                        "description": "`file` (default): one rendered document under `file`'s name. `envEntries`: every leaf, dotted paths upper-snaked (`db.pool_size` \u2192 `DB_POOL_SIZE`) \u2014 the shape `envFrom` consumes. `entries`: every leaf VERBATIM (`auth.postgres-password` stays so) \u2014 for Secret keys some other chart already named, the `existingSecret` contract.",
+                        "enum": [
+                          "file",
+                          "envEntries",
+                          "entries"
+                        ],
                         "type": "string"
                       }
                     },
-                    "required": [
-                      "config_map",
-                      "file"
-                    ],
                     "type": "object"
                   }
                 },
@@ -67,12 +91,44 @@
               "status": {
                 "nullable": true,
                 "properties": {
-                  "last_error": {
+                  "conditions": {
+                    "description": "The k8s-native shape of the two fields above: one `Ready` condition, so `kubectl wait --for=condition=Ready` and every conditions-reading tool work here the way they work everywhere.",
+                    "items": {
+                      "description": "`metav1.Condition`'s fields, spelled locally so the CRD schema stays generated from this crate's types like everything else.",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "lastTransitionTime",
+                        "message",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "lastError": {
                     "description": "The last failure, kind and path only \u2014 never a value, the same redaction rule as everywhere else in the organisation.",
                     "nullable": true,
                     "type": "string"
                   },
-                  "rendered_at": {
+                  "renderedAt": {
                     "description": "The last generation successfully rendered, and when.",
                     "nullable": true,
                     "type": "string"

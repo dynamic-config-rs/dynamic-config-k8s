@@ -8,4 +8,5 @@ resources:
   - pdb.yaml
   - webhook-configuration.yaml
   - crds/dynamicconfigclasses.json
+  - crds/clusterdynamicconfigclasses.json
   - crds/dynamicconfigrenders.json

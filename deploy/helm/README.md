@@ -2,7 +2,7 @@
 
 The injector chart: a mutating webhook that reads `dynamic-config.rs/*`
 annotations and writes a rendering agent into annotated pods, plus the
-operator's CRDs (reconcilers land in 0.3.0).
+operator's CRDs and, when enabled, the operator itself.
 
 ```sh
 helm install dynamic-config ./deploy/helm
@@ -10,7 +10,9 @@ helm install dynamic-config ./deploy/helm
 
 That is the whole install — no dependencies. The chart mints its own
 webhook certificate by default; `webhook.certManager.enabled=true`
-switches to cert-manager-issued, auto-renewed TLS. The
+switches to cert-manager-issued, auto-renewed TLS; and
+`webhook.selfRotate.enabled=true` is the third mode — the webhook
+mints, rotates and re-trusts its own pair, no dependency AND renewal. The
 [book](https://dynamic-config-rs.github.io/k8s/) carries the annotation
 contract, the store pages and the security posture; this page is the
 values reference.
@@ -29,7 +31,7 @@ values reference.
 
 | value | default | meaning |
 |---|---|---|
-| `agent.image` / `agent.tag` / `agent.digest` | ghcr, versioned | the injected image; `digest` wins over `tag`; `latest` is refused at render |
+| `agent.image` / `agent.tag` / `agent.digest` | ghcr; tag empty = `v<appVersion>` | the injected image; `digest` wins over `tag`; `latest` is refused at render |
 | `agent.defaults.cpuRequest` | `10m` | fleet-wide default for injected containers |
 | `agent.defaults.memoryRequest` | `32Mi` | — |
 | `agent.defaults.memoryLimit` | `64Mi` | — |
@@ -50,6 +52,7 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | `webhook.certManager.enabled` | `false` | `false`: chart-minted cert, Secret reused across upgrades; `true`: cert-manager issues and renews |
 | `webhook.certManager.issuerRef.name/kind` | — | required when enabled |
 | `webhook.certManager.duration/renewBefore` | cert-manager defaults | certificate lifetime knobs |
+| `webhook.selfRotate.enabled` | `false` | the third TLS mode: the webhook mints CA+leaf in memory, writes its own Secret, patches its own caBundle (two-CA transition window), rotates every 24h behind a Lease. Costs three name-scoped RBAC grants — stated beside the toggle in values.yaml. Mutually exclusive with certManager |
 | `webhook.selfSignedDays` | `3650` | validity of the chart-minted pair |
 | `webhook.failurePolicy` | `Ignore` | `Fail` couples pod CREATEs to webhook availability — the book's security page owns the trade |
 | `webhook.timeoutSeconds` | `5` | admission deadline |
@@ -68,7 +71,7 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | `webhook.extraEnv` / `.extraVolumes` / `.extraVolumeMounts` | `[]` | verbatim escape hatches |
 | `networkPolicy.enabled` | `false` | ingress 8443 only, **egress empty** — the webhook calls nobody |
 
-### Operator (0.3.0's half; CRDs install either way)
+### Operator (CRDs install either way)
 
 | value | default | meaning |
 |---|---|---|

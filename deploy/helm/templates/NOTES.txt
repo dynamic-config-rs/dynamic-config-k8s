@@ -1,7 +1,7 @@
 dynamic-config {{ .Chart.AppVersion }} is in.
 
   webhook   : {{ include "dynamic-config.webhook.fullname" . }}.{{ .Release.Namespace }}.svc (failurePolicy: {{ .Values.webhook.failurePolicy }})
-  TLS       : {{ if .Values.webhook.certManager.enabled }}cert-manager ({{ .Values.webhook.certManager.issuerRef.name }}){{ else }}chart-minted, Secret reused across upgrades{{ end }}
+  TLS       : {{ if .Values.webhook.certManager.enabled }}cert-manager ({{ .Values.webhook.certManager.issuerRef.name }}){{ else if .Values.webhook.selfRotate.enabled }}selfRotate — the webhook mints and rotates its own pair (24h, two-CA transition){{ else }}chart-minted, Secret reused across upgrades{{ end }}
   gating    : {{ if .Values.webhook.namespaceGating }}namespaces labeled dynamic-config.rs/injection=enabled{{ else }}all namespaces except the excluded{{ end }}
   operator  : {{ if .Values.operator.enabled }}enabled{{ else }}disabled (CRDs installed regardless){{ end }}
 

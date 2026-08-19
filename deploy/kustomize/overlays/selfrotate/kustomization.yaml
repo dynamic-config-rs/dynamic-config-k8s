@@ -1,0 +1,14 @@
+# The third TLS mode, kustomize-shaped: the webhook mints, rotates and
+# re-trusts its own pair. What this overlay adds is exactly the price
+# values.yaml states for the helm mode — a service-account token and
+# three name-scoped grants — plus the empty Secret vessel the rotation
+# loop fills (the webhook SSA-patches it; RBAC's patch/update verbs can
+# be name-scoped only against an object that exists).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - rbac.yaml
+  - tls-secret.yaml
+patches:
+  - path: deployment-patch.yaml

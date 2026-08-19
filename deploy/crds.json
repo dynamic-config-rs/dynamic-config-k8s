@@ -33,7 +33,7 @@
                     "description": "Which store speaks at the other end: etcd, consul, vault or config-server.",
                     "type": "string"
                   },
-                  "token_secret": {
+                  "tokenSecret": {
                     "description": "A Secret in this namespace holding the token, when the store wants one; its `token` key is what the agent receives.",
                     "nullable": true,
                     "type": "string"
@@ -50,6 +50,94 @@
               "spec"
             ],
             "title": "DynamicConfigClass",
+            "type": "object"
+          }
+        },
+        "served": true,
+        "storage": true,
+        "subresources": {}
+      }
+    ]
+  }
+}
+---
+{
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "kind": "CustomResourceDefinition",
+  "metadata": {
+    "name": "clusterdynamicconfigclasses.dynamic-config.rs"
+  },
+  "spec": {
+    "group": "dynamic-config.rs",
+    "names": {
+      "categories": [],
+      "kind": "ClusterDynamicConfigClass",
+      "plural": "clusterdynamicconfigclasses",
+      "shortNames": [],
+      "singular": "clusterdynamicconfigclass"
+    },
+    "scope": "Cluster",
+    "versions": [
+      {
+        "additionalPrinterColumns": [],
+        "name": "v1alpha1",
+        "schema": {
+          "openAPIV3Schema": {
+            "description": "Auto-generated derived type for ClusterDynamicConfigClassSpec via `CustomResource`",
+            "properties": {
+              "spec": {
+                "description": "The cluster-scoped class: the platform team defines stores (and holds their credentials) ONCE, and tenant namespaces reference them by name without ever seeing a credential. The credential Secret lives in an explicitly named namespace, and `namespaces` is the allowlist that keeps \"global\" from meaning \"anyone\".",
+                "properties": {
+                  "endpoint": {
+                    "description": "The store's address.",
+                    "type": "string"
+                  },
+                  "namespaces": {
+                    "description": "Namespaces whose Renders may use this class. Absent means every namespace — say so on purpose, not by omission.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "nullable": true,
+                    "type": "array"
+                  },
+                  "source": {
+                    "description": "Which store speaks at the other end.",
+                    "type": "string"
+                  },
+                  "tokenSecret": {
+                    "description": "The credential, when the store wants one — with the namespace it lives in named explicitly, because a cluster-scoped object has no namespace of its own to default to.",
+                    "nullable": true,
+                    "properties": {
+                      "key": {
+                        "default": "token",
+                        "description": "The key inside the Secret; `token` by default.",
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "namespace"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "source"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "spec"
+            ],
+            "title": "ClusterDynamicConfigClass",
             "type": "object"
           }
         },
@@ -92,7 +180,16 @@
                     "description": "The class naming the store.",
                     "type": "string"
                   },
-                  "interval_seconds": {
+                  "classKind": {
+                    "default": "DynamicConfigClass",
+                    "description": "`DynamicConfigClass` (default, this namespace) or `ClusterDynamicConfigClass` split between a namespaced store and a platform-owned one.",
+                    "enum": [
+                      "DynamicConfigClass",
+                      "ClusterDynamicConfigClass"
+                    ],
+                    "type": "string"
+                  },
+                  "intervalSeconds": {
                     "default": 15,
                     "description": "Poll interval, seconds.",
                     "format": "uint64",
@@ -106,17 +203,32 @@
                   "target": {
                     "description": "The ConfigMap to write, and the file name inside it (its extension picks the rendered format).",
                     "properties": {
-                      "config_map": {
+                      "configMap": {
+                        "description": "The ConfigMap to write. Exactly one of `configMap` and `secret`.",
+                        "nullable": true,
                         "type": "string"
                       },
                       "file": {
+                        "description": "The file name inside the target (its extension picks the rendered format). Required for the `file` shape; unused for `envEntries`, where the keys ARE the entries.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "secret": {
+                        "description": "The Secret to write — for consumers that read Kubernetes Secrets natively. Secret updates are live objects: a watcher reacts without any pod restart, and an `envFrom` consumer picks them up on its next start — environment variables freeze at container start, which is Kubernetes' rule rather than this operator's.",
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "shape": {
+                        "default": "file",
+                        "description": "`file` (default): one rendered document under `file`'s name. `envEntries`: every leaf, dotted paths upper-snaked (`db.pool_size` → `DB_POOL_SIZE`) — the shape `envFrom` consumes. `entries`: every leaf VERBATIM (`auth.postgres-password` stays so) — for Secret keys some other chart already named, the `existingSecret` contract.",
+                        "enum": [
+                          "file",
+                          "envEntries",
+                          "entries"
+                        ],
                         "type": "string"
                       }
                     },
-                    "required": [
-                      "config_map",
-                      "file"
-                    ],
                     "type": "object"
                   }
                 },
@@ -130,12 +242,44 @@
               "status": {
                 "nullable": true,
                 "properties": {
-                  "last_error": {
+                  "conditions": {
+                    "description": "The k8s-native shape of the two fields above: one `Ready` condition, so `kubectl wait --for=condition=Ready` and every conditions-reading tool work here the way they work everywhere.",
+                    "items": {
+                      "description": "`metav1.Condition`'s fields, spelled locally so the CRD schema stays generated from this crate's types like everything else.",
+                      "properties": {
+                        "lastTransitionTime": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "lastTransitionTime",
+                        "message",
+                        "reason",
+                        "status",
+                        "type"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "lastError": {
                     "description": "The last failure, kind and path only — never a value, the same redaction rule as everywhere else in the organisation.",
                     "nullable": true,
                     "type": "string"
                   },
-                  "rendered_at": {
+                  "renderedAt": {
                     "description": "The last generation successfully rendered, and when.",
                     "nullable": true,
                     "type": "string"

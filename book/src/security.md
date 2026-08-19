@@ -166,6 +166,20 @@ selected at all. Two things follow:
   team can fail closed for its opted-in tenants without coupling every
   pod CREATE in the cluster to this webhook.
 
+```sh
+kubectl label namespace team-a dynamic-config.rs/injection=enabled
+```
+
+**A label, and it could not be an annotation**: the gate lives in the
+webhook configuration's `namespaceSelector`, and Kubernetes selectors
+match labels only — annotations are invisible to them. The alternative
+(the webhook reading each pod's Namespace object to check an
+annotation) would hand the webhook API access it pointedly does not
+have; the zero-RBAC posture outranks the spelling preference. Either
+way the per-POD `dynamic-config.rs/inject: "true"` annotation is still
+required — the namespace gate is an outer guard, never an implicit
+opt-in.
+
 ## Fleet-wide agent defaults
 
 The injected container's resource defaults come from the chart

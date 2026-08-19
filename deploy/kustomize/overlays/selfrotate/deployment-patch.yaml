@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-config-webhook
+  namespace: dynamic-config
+spec:
+  template:
+    spec:
+      # selfRotate talks to the API server; the other modes talk to nobody.
+      automountServiceAccountToken: true
+      containers:
+        - name: webhook
+          env:
+            - name: DYNAMIC_CONFIG_WEBHOOK_SELF_ROTATE
+              value: "1"
+            - name: DYNAMIC_CONFIG_WEBHOOK_NAMESPACE
+              value: dynamic-config
+            - name: DYNAMIC_CONFIG_WEBHOOK_SERVICE
+              value: dynamic-config-webhook
+            - name: DYNAMIC_CONFIG_WEBHOOK_TLS_SECRET
+              value: dynamic-config-webhook-tls
+            - name: DYNAMIC_CONFIG_WEBHOOK_MWC
+              value: dynamic-config
+          # The first minted pair rides the kubelet's secret sync (up to
+          # a minute); a liveness clock tuned for mounted-at-start
+          # certificates would kill the pod mid-wait.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 90
+            periodSeconds: 20
+      volumes:
+        - name: tls
+          secret:
+            secretName: dynamic-config-webhook-tls
+            # The pod starts before the first pair is minted.
+            optional: true

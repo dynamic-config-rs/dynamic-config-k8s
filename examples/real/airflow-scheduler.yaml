@@ -1,0 +1,47 @@
+# Apache Airflow, the real thing: Airflow reads AIRFLOW__SECTION__KEY
+# environment variables and nothing else at boot. An init agent renders
+# the store document into exactly that dialect, and `env-inject` makes
+# it the scheduler's REAL environment — the developer writes
+# annotations; the store credential never appears anywhere near this
+# manifest.
+#
+# Store document (consul key airflow/scheduler.json):
+#   {"core": {"parallelism": 32, "dags_folder": "/opt/airflow/dags"},
+#    "webserver": {"base_url": "https://airflow.internal"}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-scheduler
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: airflow-scheduler } }
+  template:
+    metadata:
+      labels: { app: airflow-scheduler }
+      annotations:
+        dynamic-config.rs/inject: "true"
+        # `both`: the init half renders the file the scheduler starts
+        # from; the sidecar half keeps re-rendering it — and
+        # `env-restart` makes the kubelet restart JUST this container
+        # when it changes, so the scheduler comes back up on the new
+        # values in seconds. No pod recreation, no rescheduling, no new
+        # IP; the kernel's env-freeze rule honoured, not fought.
+        dynamic-config.rs/mode: "both"
+        dynamic-config.rs/env-restart: "true"
+        dynamic-config.rs/source: "consul"
+        dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+        dynamic-config.rs/key: "airflow/scheduler.json"
+        dynamic-config.rs/path: "/config/airflow.env"
+        dynamic-config.rs/template: |
+          AIRFLOW__CORE__PARALLELISM={{ core.parallelism }}
+          AIRFLOW__CORE__DAGS_FOLDER={{ core.dags_folder }}
+          AIRFLOW__WEBSERVER__BASE_URL={{ webserver.base_url }}
+        dynamic-config.rs/env-inject: "scheduler"
+    spec:
+      containers:
+        - name: scheduler
+          image: apache/airflow:2.10.4
+          # env-inject needs the explicit command; Airflow's own is one
+          # word, so nothing is lost by stating it.
+          command: ["airflow"]
+          args: ["scheduler"]

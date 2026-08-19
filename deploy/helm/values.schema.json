@@ -56,6 +56,10 @@
             }
           },
           "additionalProperties": false
+        },
+        "pullSecret": {
+          "type": "string",
+          "description": "imagePullSecret name appended to injected pods; must exist in each injecting namespace"
         }
       },
       "additionalProperties": false
@@ -304,6 +308,16 @@
           "type": "array",
           "items": {
             "type": "object"
+          }
+        },
+        "selfRotate": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The webhook mints and rotates its own certificate, and patches its own caBundle; mutually exclusive with certManager.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
           }
         }
       },

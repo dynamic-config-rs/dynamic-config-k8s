@@ -22,4 +22,5 @@ spec:
       restartPolicy: Never
       containers:
         - name: work
-          image: myapp-batch:1
+          image: busybox:1.36
+          command: ["sh", "-c", "echo batch run:; cat /config/rendered.toml; sleep 5"]

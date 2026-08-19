@@ -1,0 +1,26 @@
+# The rendered file's permissions and owner, matched to the app — the
+# Vault-agent-injector shape. The app runs as uid/gid 1000; the run-as
+# annotations make the injected agent write AS 1000, so a 0640 file is
+# readable by exactly the container it feeds and nobody wider. `0` is
+# refused at admission: the agent stays nonroot in every configuration.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "consul"
+    dynamic-config.rs/endpoint: "http://consul.infra.svc:8500"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+    dynamic-config.rs/file-mode: "0640"
+    dynamic-config.rs/agent-run-as-user: "1000"
+    dynamic-config.rs/agent-run-as-group: "1000"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000

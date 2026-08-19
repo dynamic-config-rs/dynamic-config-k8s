@@ -112,6 +112,54 @@ pub struct Request {
     /// and lets Jobs finish.
     pub native_sidecar: bool,
     pub resources: Resources,
+    /// `file-mode`: the rendered file's octal permissions, forwarded to
+    /// the agent as `--file-mode`. `None` leaves the agent's default.
+    pub file_mode: Option<String>,
+    /// `agent-run-as-user` / `agent-run-as-group`: the injected
+    /// container's UID/GID, so the rendered file's OWNER matches what
+    /// the app container runs as — the Vault-injector shape. Root is
+    /// refused; the restricted posture is not negotiable.
+    pub run_as_user: Option<u32>,
+    pub run_as_group: Option<u32>,
+    /// `env-inject`: the app container (by name) whose command gets
+    /// wrapped in `set -a; . <path>; set +a; exec …` — the rendered
+    /// dotenv becomes the process's real environment. Start-time only,
+    /// by Kubernetes' own rule: a running process's environ never
+    /// changes, so the honest pairing is `mode: init` or `both`.
+    pub env_inject: Option<String>,
+    /// `env-restart: "true"`: when the sidecar re-renders the dotenv,
+    /// the kubelet restarts JUST the app container (a liveness probe
+    /// compares the file against the fingerprint the wrapper exported
+    /// at start), and the wrapper re-sources the new file. The closest
+    /// thing to a live env update the kernel permits — seconds, no pod
+    /// recreation, no rescheduling, no new IP.
+    pub env_restart: bool,
+    /// `metrics-port`: the agent serves its Prometheus text here.
+    pub metrics_port: Option<u16>,
+    /// The named renders beyond the default one: `source.db`,
+    /// `key.db`, `path.db` … — one more agent per name, every file in
+    /// the SAME directory as the default `path` (one shared volume,
+    /// refused otherwise). Mode, resources, identity and volume are
+    /// pod-wide; everything store-shaped is per name.
+    pub extra: Vec<ExtraRender>,
+}
+
+/// One named render: the per-store subset of [`Request`], parsed from
+/// `<key>.<name>` annotations.
+#[derive(Debug, PartialEq)]
+pub struct ExtraRender {
+    pub name: String,
+    pub source: String,
+    pub endpoint: Option<String>,
+    pub key: String,
+    pub path: String,
+    pub watch_seconds: u64,
+    pub arguments: Vec<(String, String)>,
+    pub secret_env: Vec<(String, SecretRef)>,
+    pub ca: Option<ObjectRef>,
+    pub ssh: Option<ObjectRef>,
+    pub tls: Option<String>,
+    pub template: Option<ObjectRef>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -196,35 +244,91 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         "agent-memory-request",
         "agent-cpu-limit",
         "agent-memory-limit",
+        "file-mode",
+        "agent-run-as-user",
+        "agent-run-as-group",
+        "env-inject",
+        "env-restart",
+        "metrics-port",
         "template",
         "template-configmap",
     ];
+
+    /// The keys a NAMED render may carry — everything store-shaped;
+    /// mode, volume, resources and identity stay pod-wide.
+    const PER_RENDER: &[&str] = &[
+        "source",
+        "endpoint",
+        "endpoint-secret",
+        "key",
+        "path",
+        "watch-seconds",
+        "section",
+        "auth",
+        "auth-mount",
+        "auth-role",
+        "auth-username",
+        "auth-token-path",
+        "namespace",
+        "ref",
+        "api-url",
+        "token-secret",
+        "password-secret",
+        "ca-configmap",
+        "tls-secret",
+        "ssh-secret",
+        "template",
+        "template-configmap",
+        "file-mode",
+    ];
+
+    let valid_suffix = |suffix: &str| {
+        !suffix.is_empty()
+            && suffix.len() <= 32
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+
+    let mut extra_names: Vec<String> = Vec::new();
 
     for key in annotations.keys() {
         let Some(name) = key.strip_prefix(PREFIX) else {
             continue;
         };
 
-        if !KNOWN.contains(&name) {
-            return Err(format!(
-                "{PREFIX}{name} is not part of the contract; the reference                  lists every key it takes"
-            ));
+        if KNOWN.contains(&name) {
+            continue;
         }
+
+        if let Some((base, suffix)) = name.split_once('.') {
+            if PER_RENDER.contains(&base) && valid_suffix(suffix) {
+                if !extra_names.iter().any(|n| n == suffix) {
+                    extra_names.push(suffix.to_owned());
+                }
+                continue;
+            }
+        }
+
+        return Err(format!(
+            "{PREFIX}{name} is not part of the contract; the reference                  lists every key it takes"
+        ));
     }
+
+    extra_names.sort();
 
     // The agent would refuse these too — but at container start, after
     // scheduling. The admission is earlier and the message lands where
     // the operator is already looking.
     match get("source") {
-        Some("consul" | "vault" | "config-server" | "firestore" | "git" | "redis") | None => {}
-        Some(waiting @ ("etcd" | "nats" | "s3")) => {
-            return Err(format!(
-                "{PREFIX}source {waiting:?} lands in 0.2.0 (its client is async);                  consul, vault, config-server, firestore, git and redis are the                  0.1 stores"
-            ))
-        }
+        Some(
+            "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" | "etcd"
+            | "nats" | "s3",
+        )
+        | None => {}
         Some(other) => {
             return Err(format!(
-                "{PREFIX}source is {other:?}: one of consul, vault,                  config-server, firestore, git, redis"
+                "{PREFIX}source is {other:?}: one of consul, vault,                  config-server, firestore, git, redis, etcd, nats, s3"
             ))
         }
     }
@@ -409,6 +513,141 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         memory_limit: quantity("agent-memory-limit", &fleet.memory_limit)?,
     };
 
+    // The rendered file's permissions and the agent's identity — the
+    // knobs that let a non-default app UID read a tighter-than-0644
+    // file. Octal-validated here so the refusal lands at admission.
+    let file_mode = match get("file-mode") {
+        None => None,
+        Some(text) => {
+            let octal = text.strip_prefix("0o").unwrap_or(text);
+            let value = u32::from_str_radix(octal, 8)
+                .map_err(|_| format!("{PREFIX}file-mode is {text:?}: octal, like \"0640\""))?;
+
+            if value > 0o777 {
+                return Err(format!(
+                    "{PREFIX}file-mode is {text:?}: at most 0777 — setuid bits \
+                     on a configuration file answer no question"
+                ));
+            }
+
+            if value & 0o400 == 0 {
+                return Err(format!(
+                    "{PREFIX}file-mode is {text:?}: the owner must at least \
+                     read it, or the file is write-only noise"
+                ));
+            }
+
+            Some(format!("{value:o}"))
+        }
+    };
+
+    let identity = |name: &str| -> Result<Option<u32>, String> {
+        match get(name) {
+            None => Ok(None),
+            Some(text) => {
+                let id: u32 = text
+                    .parse()
+                    .map_err(|_| format!("{PREFIX}{name} is {text:?}: a numeric UID/GID"))?;
+
+                if id == 0 {
+                    return Err(format!(
+                        "{PREFIX}{name} is 0: the agent stays nonroot in every \
+                         configuration — an injector that relaxes a pod's \
+                         posture is a finding, not a feature"
+                    ));
+                }
+
+                Ok(Some(id))
+            }
+        }
+    };
+
+    let run_as_user = identity("agent-run-as-user")?;
+    let run_as_group = identity("agent-run-as-group")?;
+    let env_inject = get("env-inject").map(str::to_owned);
+
+    if env_inject.is_some() && mode == Mode::Sidecar {
+        return Err(format!(
+            "{PREFIX}env-inject needs the file to exist BEFORE the app \
+             starts: set {PREFIX}mode to \"init\" or \"both\" — environment \
+             variables freeze at container start, which is Kubernetes' \
+             rule, not this webhook's"
+        ));
+    }
+
+    let env_restart = match get("env-restart").unwrap_or("false") {
+        "true" => true,
+        "false" => false,
+        other => {
+            return Err(format!(
+                "{PREFIX}env-restart is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    if env_restart && env_inject.is_none() {
+        return Err(format!(
+            "{PREFIX}env-restart without {PREFIX}env-inject restarts nothing \
+             into nothing: name the container to wrap first"
+        ));
+    }
+
+    if env_restart && mode != Mode::Both {
+        return Err(format!(
+            "{PREFIX}env-restart needs {PREFIX}mode \"both\": the init half \
+             renders the file the app starts from, the sidecar half is what \
+             ever CHANGES it — with init alone there is nothing to restart for"
+        ));
+    }
+
+    let metrics_port = match get("metrics-port") {
+        None => None,
+        Some(text) => Some(
+            text.parse::<u16>()
+                .map_err(|_| format!("{PREFIX}metrics-port is {text:?}: a port number"))?,
+        ),
+    };
+
+    if let Some(name) = &env_inject {
+        let container = pod
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|c| c["name"].as_str() == Some(name));
+
+        let Some(container) = container else {
+            return Err(format!(
+                "{PREFIX}env-inject names container {name:?}, and the pod has \
+                 no such container"
+            ));
+        };
+
+        if container["command"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true)
+        {
+            return Err(format!(
+                "{PREFIX}env-inject: container {name:?} has no `command` — an \
+                 image ENTRYPOINT is invisible to the webhook, so there is \
+                 nothing to wrap. Set the command explicitly"
+            ));
+        }
+
+        if env_restart && container.get("livenessProbe").is_some() {
+            return Err(format!(
+                "{PREFIX}env-restart drives the kubelet through container \
+                 {name:?}'s livenessProbe, and it already has one — two \
+                 probes cannot share the slot. Drop yours or drop env-restart"
+            ));
+        }
+    }
+
+    if let Some(mode) = &file_mode {
+        arguments.push(("--file-mode".to_owned(), format!("0{mode}")));
+    }
+
     // A whole `kubernetes.io/tls` Secret: no key to choose, that type
     // fixed its two names years ago.
     let tls = get("tls-secret").map(str::to_owned);
@@ -441,6 +680,17 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         arguments.push(("--tls-key".to_owned(), format!("{TLS_MOUNT}/tls.key")));
     }
 
+    let mut extra = Vec::new();
+
+    for suffix in &extra_names {
+        extra.push(extra_render(
+            suffix,
+            &|name| get(&format!("{name}.{suffix}")),
+            pod,
+            get("path"),
+        )?);
+    }
+
     Ok(Some(Request {
         source: required("source")?,
         endpoint,
@@ -457,5 +707,246 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
         volume_memory,
         native_sidecar,
         resources,
+        file_mode,
+        run_as_user,
+        run_as_group,
+        env_inject,
+        env_restart,
+        metrics_port,
+        extra,
     }))
+}
+
+/// One named render's annotations, parsed with the same rules the
+/// default render gets — refusals name the suffixed key.
+fn extra_render<'a>(
+    suffix: &str,
+    get: &impl Fn(&str) -> Option<&'a str>,
+    _pod: &Value,
+    default_path: Option<&str>,
+) -> Result<ExtraRender, String> {
+    let label = |name: &str| format!("{PREFIX}{name}.{suffix}");
+
+    let required = |name: &str| {
+        get(name)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("render {suffix:?} exists, so {} is required", label(name)))
+    };
+
+    let source = required("source")?;
+
+    match source.as_str() {
+        "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" | "etcd" | "nats"
+        | "s3" => {}
+        other => {
+            return Err(format!(
+                "{} is {other:?}: one of consul, vault, config-server, \
+                 firestore, git, redis, etcd, nats, s3",
+                label("source")
+            ))
+        }
+    }
+
+    let key = required("key")?;
+    let path = required("path")?;
+
+    // One shared volume, so one shared directory: every named render's
+    // file lives beside the default one.
+    let parent = |p: &str| {
+        std::path::Path::new(p)
+            .parent()
+            .and_then(|d| d.to_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    if let Some(default_path) = default_path {
+        if parent(&path) != parent(default_path) {
+            return Err(format!(
+                "{} is {path:?}: every render shares ONE volume, so every \
+                 file lives in the default path's directory ({:?})",
+                label("path"),
+                parent(default_path)
+            ));
+        }
+    }
+
+    let watch_seconds = match get("watch-seconds") {
+        None => 15,
+        Some(text) => text
+            .parse()
+            .map_err(|_| format!("{} is {text:?}: whole seconds", label("watch-seconds")))?,
+    };
+
+    let secret_ref = |name: &str| -> Result<Option<SecretRef>, String> {
+        match get(name) {
+            None => Ok(None),
+            Some(text) => {
+                let (secret, key) = text.split_once('/').ok_or(format!(
+                    "{} is {text:?}: the form is <secret-name>/<key>",
+                    label(name)
+                ))?;
+
+                Ok(Some(SecretRef {
+                    name: secret.to_owned(),
+                    key: key.to_owned(),
+                }))
+            }
+        }
+    };
+
+    let object_ref = |name: &str, default_key: &str| -> Option<ObjectRef> {
+        get(name).map(|text| match text.split_once('/') {
+            Some((object, key)) => ObjectRef {
+                name: object.to_owned(),
+                key: key.to_owned(),
+            },
+            None => ObjectRef {
+                name: text.to_owned(),
+                key: default_key.to_owned(),
+            },
+        })
+    };
+
+    let mut secret_env = Vec::new();
+
+    for (annotation, variable) in [
+        ("token-secret", "DYNAMIC_CONFIG_AGENT_TOKEN"),
+        ("password-secret", "DYNAMIC_CONFIG_AGENT_PASSWORD"),
+        ("endpoint-secret", "DYNAMIC_CONFIG_AGENT_ENDPOINT"),
+    ] {
+        if let Some(reference) = secret_ref(annotation)? {
+            secret_env.push((variable.to_owned(), reference));
+        }
+    }
+
+    let endpoint = get("endpoint").map(str::to_owned);
+    let endpoint_from_secret = secret_env
+        .iter()
+        .any(|(variable, _)| variable == "DYNAMIC_CONFIG_AGENT_ENDPOINT");
+
+    if endpoint.is_none() && !endpoint_from_secret {
+        return Err(format!(
+            "render {suffix:?} exists, so {} is required (or {})",
+            label("endpoint"),
+            label("endpoint-secret")
+        ));
+    }
+
+    if endpoint.is_some() && endpoint_from_secret {
+        return Err(format!(
+            "{} and {} are both set: one address, one place",
+            label("endpoint"),
+            label("endpoint-secret")
+        ));
+    }
+
+    let ssh = object_ref("ssh-secret", "ssh-privatekey");
+    let mut arguments = Vec::new();
+
+    for (annotation, flag) in [
+        ("section", "--section"),
+        ("auth", "--auth"),
+        ("auth-mount", "--auth-mount"),
+        ("auth-role", "--auth-role"),
+        ("auth-username", "--auth-username"),
+        ("auth-token-path", "--auth-token-path"),
+        ("namespace", "--namespace"),
+        ("ref", "--ref"),
+        ("api-url", "--api-url"),
+    ] {
+        if let Some(value) = get(annotation) {
+            arguments.push((flag.to_owned(), value.to_owned()));
+        }
+    }
+
+    if let Some(ssh) = &ssh {
+        match get("auth") {
+            None => arguments.push(("--auth".to_owned(), "ssh-key".to_owned())),
+            Some("ssh-key") => {}
+            Some(other) => {
+                return Err(format!(
+                    "{} ({}) with {} {other:?}: an ssh key is auth \"ssh-key\"",
+                    label("ssh-secret"),
+                    ssh.name,
+                    label("auth")
+                ))
+            }
+        }
+
+        arguments.push((
+            "--ssh-key".to_owned(),
+            format!("{SSH_MOUNT}-{suffix}/{}", ssh.key),
+        ));
+    }
+
+    let ca = object_ref("ca-configmap", "ca.crt");
+
+    if let Some(ca) = &ca {
+        arguments.push(("--ca".to_owned(), format!("{CA_MOUNT}-{suffix}/{}", ca.key)));
+    }
+
+    if let Some(text) = get("file-mode") {
+        let octal = text.strip_prefix("0o").unwrap_or(text);
+        let value = u32::from_str_radix(octal, 8)
+            .map_err(|_| format!("{} is {text:?}: octal, like \"0640\"", label("file-mode")))?;
+
+        if value > 0o777 || value & 0o400 == 0 {
+            return Err(format!(
+                "{} is {text:?}: octal, at most 0777, owner-readable",
+                label("file-mode")
+            ));
+        }
+
+        arguments.push(("--file-mode".to_owned(), format!("0{value:o}")));
+    }
+
+    let tls = get("tls-secret").map(str::to_owned);
+    let template = object_ref("template-configmap", "template");
+
+    match (get("template"), &template) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{} and {} are both set: one template, one place",
+                label("template"),
+                label("template-configmap")
+            ))
+        }
+        (Some(inline), None) => {
+            arguments.push(("--template-inline".to_owned(), inline.to_owned()));
+        }
+        (None, Some(reference)) => {
+            arguments.push((
+                "--template".to_owned(),
+                format!("{TEMPLATE_MOUNT}-{suffix}/{}", reference.key),
+            ));
+        }
+        (None, None) => {}
+    }
+
+    if tls.is_some() {
+        arguments.push((
+            "--tls-cert".to_owned(),
+            format!("{TLS_MOUNT}-{suffix}/tls.crt"),
+        ));
+        arguments.push((
+            "--tls-key".to_owned(),
+            format!("{TLS_MOUNT}-{suffix}/tls.key"),
+        ));
+    }
+
+    Ok(ExtraRender {
+        name: suffix.to_owned(),
+        source,
+        endpoint,
+        key,
+        path,
+        watch_seconds,
+        arguments,
+        secret_env,
+        ca,
+        ssh,
+        tls,
+        template,
+    })
 }

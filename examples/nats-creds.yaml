@@ -1,0 +1,35 @@
+# NATS JetStream KV with a .creds file — the way a NATS account
+# authenticates. The bucket must already exist: a configuration reader
+# that provisions storage would hide a misconfigured deployment behind
+# an empty one.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nats-creds
+stringData:
+  nats.creds: REPLACE-WITH-THE-CREDS-FILE-CONTENT
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "nats"
+    dynamic-config.rs/endpoint: "nats://nats.infra.svc:4222"
+    dynamic-config.rs/key: "config/db.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+    dynamic-config.rs/auth-token-path: "/etc/nats/nats.creds"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]
+      volumeMounts:
+        - name: nats-creds
+          mountPath: /etc/nats
+          readOnly: true
+  volumes:
+    - name: nats-creds
+      secret:
+        secretName: nats-creds

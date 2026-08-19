@@ -12,9 +12,10 @@ use std::time::Duration;
 
 pub const USAGE: &str = "\
 usage: dynamic-config-agent
-           --source <consul|vault|config-server|firestore|git|redis>
+           --source <consul|vault|config-server|firestore|git|redis|etcd|nats|s3>
            --endpoint <address> --key <path> --out <file>
-           [--watch <seconds>] [--section <name>] [--token <bearer>]
+           [--watch <seconds>] [--section <name>] [--file-mode <octal>]
+           [--token <bearer>]
            [--auth <method>] [--auth-mount <mount>] [--auth-role <role>]
            [--auth-username <user>] [--auth-token-path <file>]
            [--namespace <vault-namespace>] [--ref <git-ref>]
@@ -24,14 +25,16 @@ usage: dynamic-config-agent
 
   --source      which store speaks at the other end
   --endpoint    the store's address: a url for consul, vault,
-                config-server and git; <project>[/<database>] for
-                firestore; a redis:// or rediss:// url for redis (use
+                config-server, git, etcd (comma-separated for several)
+                and nats; <project>[/<database>] for firestore; the
+                BUCKET for s3; a redis:// or rediss:// url for redis (use
                 DYNAMIC_CONFIG_AGENT_ENDPOINT when the url carries a
                 password)
   --key         the document's key/path in the store; for vault,
                 <mount>/<path>; for config-server,
                 <application>/<profile>; for git, the file's path in
-                the repository
+                the repository; for nats, <bucket>/<key>; for s3, the
+                object key
   --out         where the rendered document lands; the extension picks
                 the output format (.json .toml .yaml .ini .properties) —
                 unless a template is given, which then owns the bytes
@@ -39,14 +42,25 @@ usage: dynamic-config-agent
   --watch       poll interval in seconds; absent = one shot (init mode)
   --section     the section key the document nests under (default: the
                 whole document)
+  --file-mode   the rendered file's permissions, octal (e.g. 0640);
+                default: the umask's answer, typically 0644
+  --metrics-addr  serve Prometheus text (renders, failures, last render
+                timestamp) on this address, e.g. 0.0.0.0:9090
 
   --auth        how to authenticate; the methods each store takes:
                   consul     token | kubernetes | jwt
+                  etcd       (no --auth) --tls-cert/--tls-key client
+                             certificates, and/or --auth-username +
+                             DYNAMIC_CONFIG_AGENT_PASSWORD
+                  nats       (no --auth) a .creds file via
+                             --auth-token-path, or a token
+                  s3         (no --auth) the ambient AWS chain (IRSA)
                   vault      token | kubernetes | approle | jwt |
                              userpass | ldap | cert
                   firestore  metadata-server | access-token | emulator
                   git        anonymous | token | ssh | ssh-key
-                config-server takes a bearer token and nothing else;
+                config-server takes a bearer token — or kubernetes:
+                  the pod's projected SA token, reviewed by the server;
                 redis reads credentials from its url
   --auth-mount  vault: the auth method's mount path when it is not the
                 default; consul: the auth method's NAME (required for
@@ -91,6 +105,11 @@ pub struct Spec {
     pub key: String,
     pub out: PathBuf,
     pub watch: Option<Duration>,
+    /// `--file-mode`: the rendered file's permissions, octal. `None`
+    /// leaves the process umask's answer (0644, typically).
+    pub file_mode: Option<u32>,
+    /// `--metrics-addr`: a Prometheus text endpoint, opt-in.
+    pub metrics_addr: Option<String>,
     pub token: Option<String>,
     pub section: Option<String>,
     pub auth: Option<String>,
@@ -121,6 +140,8 @@ impl Spec {
         let mut watch = None;
         let mut token = std::env::var("DYNAMIC_CONFIG_AGENT_TOKEN").ok();
         let mut section = None;
+        let mut file_mode = None;
+        let mut metrics_addr = None;
         let mut auth = None;
         let mut auth_mount = None;
         let mut auth_role = None;
@@ -158,6 +179,25 @@ impl Spec {
                 }
                 "--token" => token = Some(value("--token")?),
                 "--section" => section = Some(value("--section")?),
+                "--metrics-addr" => metrics_addr = Some(value("--metrics-addr")?),
+                "--file-mode" => {
+                    let text = value("--file-mode")?;
+                    let octal = text.strip_prefix("0o").unwrap_or(&text);
+                    let mode = u32::from_str_radix(octal, 8)
+                        .map_err(|_| format!("--file-mode {text:?}: octal, like 0640"))?;
+
+                    if mode > 0o777 {
+                        return Err(format!("--file-mode {text:?}: at most 0777"));
+                    }
+
+                    if mode & 0o400 == 0 {
+                        return Err(format!(
+                            "--file-mode {text:?}: the owner must at least read it"
+                        ));
+                    }
+
+                    file_mode = Some(mode);
+                }
                 "--auth" => auth = Some(value("--auth")?),
                 "--auth-mount" => auth_mount = Some(value("--auth-mount")?),
                 "--auth-role" => auth_role = Some(value("--auth-role")?),
@@ -186,6 +226,8 @@ impl Spec {
             watch,
             token,
             section,
+            file_mode,
+            metrics_addr,
             auth,
             auth_mount,
             auth_role,
@@ -213,21 +255,12 @@ impl Spec {
     /// events, not as a store error twenty minutes later.
     fn validated(self) -> Result<Self, String> {
         match self.source.as_str() {
-            "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" => {}
-            // The async-trait stores. They join with the agent's async
-            // path in 0.2.0, and refusing them by name today beats a
-            // trait error nobody can act on.
-            "etcd" | "nats" | "s3" => {
-                return Err(format!(
-                    "--source {} lands in 0.2.0 (its client is async); consul, vault, \
-                     config-server, firestore, git and redis are the 0.1 stores",
-                    self.source
-                ))
-            }
+            "consul" | "vault" | "config-server" | "firestore" | "git" | "redis" | "etcd"
+            | "nats" | "s3" => {}
             other => {
                 return Err(format!(
                     "--source {other:?}: one of consul, vault, config-server, \
-                     firestore, git, redis"
+                     firestore, git, redis, etcd, nats, s3"
                 ))
             }
         }
@@ -249,9 +282,9 @@ impl Spec {
             ));
         }
 
-        if self.api_url.is_some() && self.source != "firestore" {
+        if self.api_url.is_some() && !matches!(self.source.as_str(), "firestore" | "s3") {
             return Err(format!(
-                "--api-url is firestore's flag; --source is {}",
+                "--api-url is firestore's and s3's flag; --source is {}",
                 self.source
             ));
         }
@@ -362,10 +395,18 @@ impl Spec {
             }
 
             ("config-server", None) => {} // a token if one is set
-            ("config-server", Some(_)) => {
-                return Err("config-server takes a bearer token and nothing else: \
-                     set DYNAMIC_CONFIG_AGENT_TOKEN and drop --auth"
-                    .to_owned())
+            ("config-server", Some("kubernetes")) => {
+                // The pod's own projected service-account token as the
+                // bearer — the server's [kubernetes] TokenReview auth.
+                // Nothing to validate: the default token path exists in
+                // every pod, and --auth-token-path overrides it.
+            }
+            ("config-server", Some(other)) => {
+                return Err(format!(
+                    "--auth {other:?} on config-server: \"kubernetes\" (the pod's \
+                     projected token, reviewed by the server) or drop --auth and \
+                     set DYNAMIC_CONFIG_AGENT_TOKEN"
+                ))
             }
 
             ("firestore", None | Some("metadata-server" | "emulator")) => {}
@@ -387,6 +428,49 @@ impl Spec {
             ("git", Some(other)) => {
                 return Err(format!(
                     "--auth {other:?} on git: anonymous, token, ssh or ssh-key"
+                ))
+            }
+
+            // etcd speaks exactly two methods, both first-class: TLS
+            // client certificates, and username/password. No --auth
+            // selector — the flags present ARE the method, and both
+            // present together is etcd's own "cert for the channel,
+            // password for the user" combination.
+            ("etcd", None) => {
+                if self.auth_username.is_some() {
+                    password_needed("user", "the password half")?;
+                }
+            }
+            ("etcd", Some(other)) => {
+                return Err(format!(
+                    "--auth {other:?} on etcd: drop --auth — client certificates \
+                     ride --tls-cert/--tls-key and a user rides \
+                     --auth-username + DYNAMIC_CONFIG_AGENT_PASSWORD"
+                ))
+            }
+
+            // NATS: a .creds file (the account idiom) via
+            // --auth-token-path, or a bare token; anonymous otherwise.
+            ("nats", None) => {
+                if !self.key.contains('/') {
+                    return Err("nats' --key is <bucket>/<key>".to_owned());
+                }
+            }
+            ("nats", Some(other)) => {
+                return Err(format!(
+                    "--auth {other:?} on nats: drop --auth — a .creds file rides \
+                     --auth-token-path, a token rides DYNAMIC_CONFIG_AGENT_TOKEN"
+                ))
+            }
+
+            // S3: the ambient chain — on EKS that is IRSA, the workload's
+            // own identity. There is nothing to configure here, which is
+            // the point.
+            ("s3", None) => {}
+            ("s3", Some(other)) => {
+                return Err(format!(
+                    "--auth {other:?} on s3: drop --auth — credentials come from \
+                     the ambient AWS chain (IRSA on EKS)"
                 ))
             }
 
@@ -453,15 +537,36 @@ mod tests {
     }
 
     #[test]
-    fn the_async_stores_are_refused_by_name() {
-        for store in ["etcd", "nats", "s3"] {
-            let error = Spec::from_args(args(&format!(
-                "--source {store} --endpoint x --key y --out /z.json"
-            )))
-            .expect_err("refused");
-
-            assert!(error.contains("0.2.0"), "{store}: {error}");
+    fn the_async_stores_parse() {
+        // The 0.1 refusal-by-name retired with the 0.2.0 async path.
+        for line in [
+            "--source etcd --endpoint http://etcd:2379 --key app/config.json --out /z.json",
+            "--source nats --endpoint nats://nats:4222 --key config/db.json --out /z.json",
+            "--source s3 --endpoint myapp-config --key prod/db.json --out /z.json",
+        ] {
+            Spec::from_args(args(line)).expect("parses");
         }
+    }
+
+    #[test]
+    fn etcd_a_user_without_a_password_is_refused() {
+        let error = Spec::from_args(args(
+            "--source etcd --endpoint http://etcd:2379 --key app/config.json \
+             --out /z.json --auth-username myapp",
+        ))
+        .expect_err("refused");
+
+        assert!(error.contains("DYNAMIC_CONFIG_AGENT_PASSWORD"), "{error}");
+    }
+
+    #[test]
+    fn nats_wants_a_bucket_and_a_key() {
+        let error = Spec::from_args(args(
+            "--source nats --endpoint nats://nats:4222 --key flat --out /z.json",
+        ))
+        .expect_err("refused");
+
+        assert!(error.contains("<bucket>/<key>"), "{error}");
     }
 
     #[test]

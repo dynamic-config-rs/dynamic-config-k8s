@@ -7,8 +7,8 @@ description: >-
   templating — plus the operator's CRDs. Zero dependencies by default:
   the chart mints its own webhook certificate; cert-manager is optional.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.1
+appVersion: "0.1.1"
 kubeVersion: ">=1.25.0-0"
 home: https://dynamic-config-rs.github.io/k8s/
 sources:
@@ -30,25 +30,25 @@ annotations:
   artifacthub.io/category: integration-delivery
   artifacthub.io/operator: "false"
   artifacthub.io/containsSecurityUpdates: "false"
-  artifacthub.io/prerelease: "true"
+  artifacthub.io/prerelease: "false"
   artifacthub.io/crds: |
     - kind: DynamicConfigClass
       version: v1alpha1
       name: dynamicconfigclasses.dynamic-config.rs
       displayName: DynamicConfigClass
-      description: A named store-plus-auth bundle pods reference instead of repeating endpoints (reconcilers land in 0.3.0).
+      description: A named store-plus-auth bundle pods reference instead of repeating endpoints.
     - kind: DynamicConfigRender
       version: v1alpha1
       name: dynamicconfigrenders.dynamic-config.rs
       displayName: DynamicConfigRender
-      description: A rendered document reconciled into a ConfigMap, for workloads that must not carry a sidecar (0.3.0).
+      description: A rendered document reconciled into a ConfigMap by the operator, for workloads that must not carry a sidecar.
   artifacthub.io/images: |
     - name: dynamic-config-webhook
-      image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:0.1.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.1.1
     - name: dynamic-config-agent
-      image: ghcr.io/dynamic-config-rs/dynamic-config-agent:0.1.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1
     - name: dynamic-config-operator
-      image: ghcr.io/dynamic-config-rs/dynamic-config-operator:0.1.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-operator:v0.1.1
   artifacthub.io/links: |
     - name: The book (annotation contract, stores, security posture)
       url: https://dynamic-config-rs.github.io/k8s/

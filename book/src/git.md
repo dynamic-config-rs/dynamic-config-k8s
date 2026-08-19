@@ -78,6 +78,15 @@ kubectl create secret generic config-deploy-key \
 key is offered with `IdentitiesOnly=yes`, so an agent holding other
 keys cannot exhaust the server's auth tries before the right one.
 
+**And the permission caveat, out loud:** the kubelet writes secret
+files as root, `0400` means owner-read only, and the agent runs
+nonroot — so the mounted key is readable only when the pod sets a
+`securityContext.fsGroup` (the kubelet then group-owns the files) and
+the custom image's ssh client tolerates a group-readable key, or when
+the pod runs the agent's uid. This combination is honest-but-untested:
+the e2e suite covers HTTPS and token auth; ssh in-pod is documented,
+not gated.
+
 **The stock image caveat, out loud:** git-over-SSH is carried by the
 `ssh` *program*, exactly as git itself does it — and the distroless
 agent image does not contain one. HTTPS works from the stock image;

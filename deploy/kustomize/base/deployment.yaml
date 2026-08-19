@@ -34,11 +34,11 @@ spec:
               app.kubernetes.io/component: webhook
       containers:
         - name: webhook
-          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:0.1.0
+          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.1.1
           imagePullPolicy: IfNotPresent
           env:
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
-              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:0.1.0
+              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
               value: "0.0.0.0:8443"
             - name: DYNAMIC_CONFIG_AGENT_CPU_REQUEST

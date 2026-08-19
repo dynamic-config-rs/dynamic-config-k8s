@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use dynamic_config::{load, Format, LoadSpec, RemoteSource, Source};
+use dynamic_config::{load, Format, LoadSpec, Source};
 
 use crate::spec::Spec;
 
@@ -43,12 +43,10 @@ impl OutputFormat {
     }
 }
 
-pub fn fetch_and_render(
-    source: &dyn RemoteSource,
+pub fn render_fetched(
+    fetched: &dynamic_config::Fetched,
     spec: &Spec,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let fetched = source.fetch()?;
-
     let document = resolve(&fetched.text, fetched.format, spec.section.as_deref())?;
 
     // A template owns the bytes. The file variant is re-read at every
@@ -103,7 +101,7 @@ fn templated(
 }
 
 /// Through the engine: the same parse, the same section semantics.
-fn resolve(
+pub fn resolve(
     text: &str,
     format: Format,
     section: Option<&str>,
@@ -190,6 +188,90 @@ fn flat(document: &serde_json::Value, dialect: Flat) -> Result<String, Box<dyn s
     Ok(out)
 }
 
+/// The resolved document as environment entries: dotted paths become
+/// `UPPER_SNAKE` names (`db.pool_size` → `DB_POOL_SIZE`), scalars render
+/// bare, and a list or table value becomes compact JSON — an env value
+/// is a string, and pretending otherwise would invent a dialect.
+///
+/// What the operator's `envEntries` Secret shape and an `envFrom`
+/// consumer agree on.
+pub fn env_entries(
+    document: &serde_json::Value,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+
+    walk_env(document, &mut Vec::new(), &mut |path, value| {
+        let name: String = path
+            .join("_")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        let rendered = match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+
+        entries.push((name, rendered));
+        Ok(())
+    })?;
+
+    Ok(entries)
+}
+
+/// Every leaf verbatim: dotted paths exactly as the document spells
+/// them (`auth.postgres-password` stays `auth.postgres-password`) —
+/// for Secret keys some OTHER chart already named, where any mangling
+/// breaks the contract. Kubernetes allows `[-._a-zA-Z0-9]` in data
+/// keys, which dotted paths satisfy.
+pub fn verbatim_entries(
+    document: &serde_json::Value,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+
+    walk_env(document, &mut Vec::new(), &mut |path, value| {
+        let rendered = match value {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+
+        entries.push((path.join("."), rendered));
+        Ok(())
+    })?;
+
+    Ok(entries)
+}
+
+/// `walk`, with one difference for the env dialect: an array is a leaf
+/// (compact JSON), because an env value is a string and the flat
+/// formats' "no arrays" refusal would make whole documents unmappable.
+fn walk_env(
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    emit: &mut impl FnMut(&[String], &serde_json::Value) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, inner) in map {
+                path.push(key.clone());
+                walk_env(inner, path, emit)?;
+                path.pop();
+            }
+
+            Ok(())
+        }
+        leaf => emit(path, leaf),
+    }
+}
+
 fn walk(
     value: &serde_json::Value,
     path: &mut Vec<String>,
@@ -245,7 +327,11 @@ fn ini_scalar(value: &serde_json::Value) -> Result<String, Box<dyn std::error::E
 
 /// Write-then-rename, the same courtesy every atomic-save editor pays:
 /// the application's watcher sees whole files, never half ones.
-pub fn write_atomically(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_atomically(
+    path: &Path,
+    content: &str,
+    mode: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let directory = path.parent().ok_or("--out needs a parent directory")?;
     let scratch = directory.join(format!(
         ".{}.tmp",
@@ -255,6 +341,19 @@ pub fn write_atomically(path: &Path, content: &str) -> Result<(), Box<dyn std::e
     ));
 
     std::fs::write(&scratch, content)?;
+
+    // Permissions land on the SCRATCH file, before the rename: a reader
+    // must never observe the final path in a mode it will not keep.
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(mode))?;
+    }
+
+    #[cfg(not(unix))]
+    let _ = mode;
+
     std::fs::rename(&scratch, path)?;
 
     Ok(())
@@ -369,9 +468,47 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let out = directory.path().join("rendered.toml");
 
-        write_atomically(&out, "a = 1\n").expect("writes");
+        write_atomically(&out, "a = 1\n", None).expect("writes");
 
         assert_eq!(std::fs::read_to_string(&out).expect("reads"), "a = 1\n");
         assert!(!directory.path().join(".rendered.toml.tmp").exists());
+    }
+
+    #[test]
+    fn entry_shapes_map_the_same_leaves_two_ways() {
+        let document = serde_json::json!({
+            "auth": { "postgres-password": "s3cr3t" },
+            "db": { "pool_size": 8, "replicas": [1, 2] },
+        });
+
+        let env = env_entries(&document).expect("maps");
+
+        assert!(env.contains(&("AUTH_POSTGRES_PASSWORD".into(), "s3cr3t".into())));
+        assert!(env.contains(&("DB_POOL_SIZE".into(), "8".into())));
+        assert!(env.contains(&("DB_REPLICAS".into(), "[1,2]".into())));
+
+        let verbatim = verbatim_entries(&document).expect("maps");
+
+        // The whole point: the spelling someone else chose survives.
+        assert!(verbatim.contains(&("auth.postgres-password".into(), "s3cr3t".into())));
+        assert!(verbatim.contains(&("db.pool_size".into(), "8".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_asked_file_mode_survives_the_rename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let out = directory.path().join("rendered.toml");
+
+        write_atomically(&out, "a = 1\n", Some(0o640)).expect("writes");
+
+        let mode = std::fs::metadata(&out).expect("stats").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o640,
+            "the rendered file wears the asked mode"
+        );
     }
 }

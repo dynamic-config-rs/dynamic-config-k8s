@@ -10,12 +10,26 @@ contract cannot move without a reviewed diff saying it moved.
 | annotation | required | meaning |
 |---|---|---|
 | `dynamic-config.rs/inject` | yes | `"true"` asks; anything else but `"false"` fails the admission |
-| `dynamic-config.rs/source` | yes | `consul`, `vault`, `config-server`, `firestore`, `git`, `redis` (etcd, nats, s3: 0.2.0) |
+| `dynamic-config.rs/source` | yes | `consul`, `vault`, `config-server`, `firestore`, `git`, `redis`, `etcd`, `nats`, `s3` |
 | `dynamic-config.rs/endpoint` | one of the two | the store's address — a url; `<project>[/<database>]` for firestore |
 | `dynamic-config.rs/endpoint-secret` | one of the two | `<secret>/<key>` holding the address, when the address carries a password (a redis url) |
 | `dynamic-config.rs/key` | yes | the document's key; `mount/path` for vault, `application/profile` for config-server, the file's path for git |
 | `dynamic-config.rs/path` | yes | where the rendered file lands; the extension picks the format |
 | `dynamic-config.rs/mode` | no | `init`, `sidecar` (default), `both` |
+
+## The namespace gate, before any pod is read
+
+Every key below is per-pod. One optional guard sits a level
+above: with `webhook.namespaceGating=true` the webhook selects only
+namespaces **labeled** `dynamic-config.rs/injection: enabled` — a
+label, not an annotation, because the gate lives in the webhook
+configuration's `namespaceSelector` and Kubernetes selectors cannot
+see annotations. Inside a gated namespace the per-pod
+`dynamic-config.rs/inject: "true"` is still required; the
+[security page](security.md#namespace-gating) owns the trade
+(blast radius, per-namespace `failurePolicy: Fail`), and
+[`examples/namespace-gating.yaml`](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/namespace-gating.yaml)
+is the ready-to-apply shape.
 
 ## Behaviour
 
@@ -29,8 +43,42 @@ contract cannot move without a reviewed diff saying it moved.
 | `dynamic-config.rs/agent-memory-request` | `32Mi` | its memory request |
 | `dynamic-config.rs/agent-cpu-limit` | none | its CPU limit — none by default, on purpose |
 | `dynamic-config.rs/agent-memory-limit` | `64Mi` | its memory limit |
+| `dynamic-config.rs/file-mode` | umask's answer (0644) | the rendered file's octal permissions, e.g. `"0640"` — set on the scratch file **before** the atomic rename, so a reader never sees the final path in a mode it will not keep |
+| `dynamic-config.rs/agent-run-as-user` | `65532` | the injected container's UID, so the rendered file's **owner** matches what the app runs as; `0` is refused — the agent stays nonroot in every configuration |
+| `dynamic-config.rs/agent-run-as-group` | `65532` | its GID, same rule |
+| `dynamic-config.rs/env-inject` | none | a container name: its command is wrapped in `set -a; . <path>; set +a; exec …`, so the rendered dotenv is the process's REAL environment. Needs `mode: init` or `both` (env freezes at container start — Kubernetes' rule) and an explicit `command` (an ENTRYPOINT is invisible to the webhook); both refusals name the fix |
+| `dynamic-config.rs/env-restart` | `"false"` | with `env-inject` and `mode: both`: when the sidecar re-renders the dotenv, the kubelet restarts JUST the app container (a liveness probe compares the file against the fingerprint the wrapper exported at start) and the wrapper re-sources the new file — the closest thing to a live env update the kernel permits: seconds, no pod recreation, no new IP. Refused if the container already has its own livenessProbe |
 | `dynamic-config.rs/template` | none | an inline minijinja template; [it owns the output bytes](rendering.md#templates) |
 | `dynamic-config.rs/template-configmap` | none | `<name>` or `<name>/<key>` (default key `template`): the template from a ConfigMap, mounted read-only and re-read every render |
+
+## Several documents, one pod
+
+Every store-shaped key accepts a **`.<name>` suffix**, and each name is
+one more injected agent writing one more file into the same directory:
+
+```yaml
+# the default render:
+dynamic-config.rs/source: "vault"
+dynamic-config.rs/key: "secret/myapp"
+dynamic-config.rs/path: "/config/app.yaml"
+dynamic-config.rs/auth: "kubernetes"
+# a second, named `cache`:
+dynamic-config.rs/source.cache: "redis"
+dynamic-config.rs/endpoint-secret.cache: "redis-url/url"
+dynamic-config.rs/key.cache: "myapp/cache.json"
+dynamic-config.rs/path.cache: "/config/cache.toml"
+```
+
+Per-name: everything a store needs — source, endpoint(+secret), key,
+path, section, watch cadence, every auth key, CA/TLS/ssh material
+(mounted under suffixed paths), templates, file-mode. Pod-wide, on
+purpose: `mode`, volume medium, resources, run-as identity,
+`env-inject` (the default render's file is the one that can become the
+environment). Two rules, refused with the fix named: every path lives
+in the **default path's directory** (one shared volume), and each
+name's `source`/`key`/`path` are required exactly like the default's.
+Container names follow the suffix — `dynamic-config-agent-cache` in
+`kubectl get pod`, so a broken render says which one it is.
 
 ## Authentication
 
@@ -79,9 +127,9 @@ store pages carry the full manifests, this table is the lookup:
 | `firestore` | `<project>` or `<project>/<database>`: `acme-prod` | `collection/document`: `config/billing` | *(none = metadata-server)*, `metadata-server`, `access-token`, `emulator` |
 | `git` | any clone url: `https://…`, `git@host:org/repo.git` | file path in the repository: `billing/prod.yaml` | *(none = token if set, else anonymous)*, `anonymous`, `token`, `ssh`, `ssh-key` |
 | `redis` | `redis://` / `rediss://` url — via `endpoint-secret` when it carries a password | key with extension: `myapp/config.json` | *(none — credentials live in the url)* |
-| `etcd` | — | — | refused at admission: 0.2.0 (async client) |
-| `nats` | — | — | refused at admission: 0.2.0 |
-| `s3` | — | — | refused at admission: 0.2.0 |
+| `etcd` | (no `auth` key) | `tls-secret` client certificates, or `auth-username` + `password-secret` — etcd's own two methods, both first-class | `--key` is the etcd key |
+| `nats` | (no `auth` key) | a `.creds` file via `auth-token-path`, or `token-secret`; anonymous otherwise | `--key` is `<bucket>/<key>` |
+| `s3` | (no `auth` key) | the ambient AWS chain — IRSA on EKS, the workload's own identity | `--endpoint` is the bucket; `api-url` overrides for MinIO/Ceph/R2 |
 
 ## The prefix is claimed territory
 
@@ -115,9 +163,15 @@ verbatim from the tests:
 - `volume-medium` outside `memory | disk`; `native-sidecar` outside
   `true | false`
 - a resource annotation that is not a Kubernetes quantity
-- any `dynamic-config.rs/*` key the contract does not list — including
-  `source: etcd|nats|s3`, refused with a message naming the version
-  that takes them
+- `file-mode` outside octal `0400`–`0777` — setuid bits answer no
+  question, and an owner-unreadable file is write-only noise
+- `agent-run-as-user`/`-group` of `0` — the agent stays nonroot in
+  every configuration
+- `env-inject` with `mode: sidecar`, a container the pod does not
+  have, or a container with no explicit `command`
+- `env-restart` without `env-inject`, without `mode: both`, or on a
+  container that already owns a `livenessProbe`
+- any `dynamic-config.rs/*` key the contract does not list
 - `template` and `template-configmap` both set — one template, one
   place
 

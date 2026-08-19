@@ -20,56 +20,38 @@ permissions:
   contents: read
 
 jobs:
-  deny:
-    name: advisories, licences, sources
+  policy:
+    name: the security policy names the current line
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check
-
-  unsafe:
-    name: no unsafe code
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Every binary and the webhook's library declare
-      # `#![forbid(unsafe_code)]`; this proves the declarations are still
-      # there rather than trusting nobody removed one in a hurry.
+      # The stale-table drift this org has already lived through once:
+      # SECURITY.md said 0.0.x while the workspace shipped 0.7. The table's
+      # top row must name the line that is actually published.
       - run: |
-          for root in dynamic-config-agent/src/main.rs \
-                      dynamic-config-webhook/src/lib.rs \
-                      dynamic-config-operator/src/main.rs; do
-            if ! grep -q '#!\[forbid(unsafe_code)\]' "$root"; then
-              echo "::error file=$root::missing #![forbid(unsafe_code)]"
-              exit 1
-            fi
-          done
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          line="${version%.*}.x"
+          if ! grep -qF "| ${line}" SECURITY.md; then
+            echo "::error file=SECURITY.md::the supported-versions table does not name ${line} (workspace is ${version})"
+            exit 1
+          fi
+          echo "SECURITY.md names ${line} — current"
 
-  supply-chain:
-    name: dependency review
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # No allow-ghsas: this tree was OSV-batch-scanned clean when the 0.7
-      # floors landed. The first entry here needs the same three-ledger
-      # answer the sibling repositories give.
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
-        with:
-          fail-on-severity: low
-          comment-summary-in-pr: on-failure
+  # deny, the unsafe sweep and dependency review are the org's shared
+  # definition; `@main` becomes `@v1` when the .github repository is
+  # first tagged. The operator has no lib.rs, so it rides the `bins`
+  # input; the agent and webhook appear in both — their libraries and
+  # their binaries each carry the forbid.
+  shared:
+    uses: dynamic-config-rs/.github/.github/workflows/reusable-security-rust.yml@main
+    with:
+      crates: dynamic-config-agent dynamic-config-webhook
+      bins: dynamic-config-agent dynamic-config-webhook dynamic-config-operator
 
   security-ok:
     name: Security is green
-    needs: [deny, unsafe, supply-chain]
+    needs: [policy, shared]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

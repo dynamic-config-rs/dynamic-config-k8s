@@ -1,8 +1,18 @@
 # Install
 
 ```sh
+# From the OCI registry (ArtifactHub lists the same chart):
+helm install dynamic-config \
+  oci://ghcr.io/dynamic-config-rs/charts/dynamic-config --version 0.1.1
+
+# Or from a checkout:
 helm install dynamic-config deploy/helm
 ```
+
+Every image the chart deploys is on ghcr and mirrored to Docker Hub
+(`docker.io/ctolon17/…`) with identical digests, multi-arch, SBOM
+attested and cosign-signed keyless; the repository README carries the
+`cosign verify` line.
 
 That is the whole install: no dependencies, nothing to pre-create. The
 chart mints a CA and a ten-year serving certificate at install time,
@@ -24,15 +34,56 @@ the `caBundle`, and the webhook picks up the renewed pair from disk
 without a restart (it polls the mounted files for a changed
 modification time). The trade between the two:
 
-| | self-signed (default) | cert-manager |
-|---|---|---|
-| dependencies | none | cert-manager installed |
-| renewal | none — ten-year cert; rotate by deleting the Secret and upgrading | automatic, well before expiry |
-| caBundle | embedded at install | maintained by cainjector |
-| fits | getting started, edge clusters, air-gapped | anywhere cert-manager already runs |
+## The selfRotate mode
 
-Both mount the same Secret shape at the same path; the webhook cannot
-tell them apart, which is what makes switching later a values change.
+```sh
+helm install dynamic-config deploy/helm \
+  --set webhook.selfRotate.enabled=true
+```
+
+The third answer, the Vault-agent-injector shape: the webhook is its
+own certificate authority. It mints a CA and leaf **in memory** at
+rotation time, writes the pair to its own Secret — every replica
+serves it through the same file hot-reload cert-manager uses — and
+patches the webhook configuration's `caBundle` itself. A fresh pair
+every 24 hours, leader-elected over a Lease so replicas do not race,
+jittered so a fleet restarted together does not rotate together.
+
+The price is stated in `values.yaml` beside the toggle: a
+service-account token and three narrow, name-scoped permissions — the
+zero-RBAC purity of the other two modes, knowingly traded for rotation
+without a dependency.
+
+| | self-signed (default) | cert-manager | selfRotate |
+|---|---|---|---|
+| dependencies | none | cert-manager installed | none |
+| renewal | none — ten-year cert; rotate by deleting the Secret and upgrading | automatic, well before expiry | automatic, every 24h, leader-elected |
+| caBundle | embedded at install | maintained by cainjector | patched by the webhook itself |
+| RBAC | none | none | one Secret, one MWC, leases — by name |
+| fits | getting started, edge clusters, air-gapped | anywhere cert-manager already runs | rotation wanted, cert-manager not |
+
+All three mount the same Secret shape at the same path; the webhook's
+serving loop cannot tell them apart, which is what makes switching
+later a values change.
+
+## A private mirror for the agent image
+
+The injected agent is pulled in **application namespaces**, so a fleet
+that mirrors images into a private registry needs two values:
+
+```sh
+helm install dynamic-config deploy/helm \
+  --set agent.image=registry.internal/dynamic-config-agent \
+  --set agent.pullSecret=mirror-cred
+```
+
+`agent.pullSecret` is **appended** to each injected pod's own
+`imagePullSecrets`, never replacing them. Pull secrets are namespaced —
+the Secret must exist in every namespace that injects, which is the
+usual replication job (`kubectl create secret docker-registry … -n
+<each>`, or a replicator you already run). The webhook's and operator's
+own images use the chart-level `imagePullSecrets` list instead, because
+those pods live in the release namespace.
 
 ## failurePolicy
 

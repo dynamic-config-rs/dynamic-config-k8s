@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod selfrotate;
 mod tls;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,6 +114,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    // The serving path names its provider per-config, but the selfRotate
+    // mode's kube client uses the process default — which, with ring and
+    // aws-lc both reachable, must be stated or rustls panics mid-handshake.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "a rustls CryptoProvider was already installed")?;
+
     let app = Router::new()
         .route("/mutate", post(mutate))
         .route("/healthz", axum::routing::get(healthz))
@@ -122,6 +130,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::env::var("DYNAMIC_CONFIG_WEBHOOK_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_owned());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let material = tls::Material::from_environment();
+
+    // The selfRotate mode: the rotation loop runs beside the server and
+    // fills the mounted Secret; serving below waits for the kubelet to
+    // deliver the first pair.
+    if let Some(settings) = selfrotate::Settings::from_environment() {
+        info!("selfRotate: this webhook mints and rotates its own certificate");
+        tokio::spawn(selfrotate::run(settings));
+
+        let patience = std::time::Duration::from_secs(5);
+
+        // `loadable`, not `present`: the placeholder Secret mounts empty
+        // files, and serving must not start (and fail, and take the
+        // rotation task down with the process) until a real pair landed.
+        while !material.loadable() {
+            info!("waiting for the first minted pair to arrive at /tls");
+            tokio::time::sleep(patience).await;
+        }
+    }
 
     if material.present() {
         info!(%address, "webhook listening");

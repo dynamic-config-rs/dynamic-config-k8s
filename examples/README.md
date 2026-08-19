@@ -24,6 +24,26 @@ kubectl exec billing -c app -- cat /config/rendered.toml
 | `redis-acl.yaml` | redis | ACL user in url | `endpoint-secret`: the whole address is the secret |
 | `native-sidecar-job.yaml` | consul | none | a Job that finishes because the sidecar is native |
 | `template-env.yaml` | consul | none | output templating: a document in, an `.env` file out |
+| `etcd-tls.yaml` | etcd | TLS client certificate | the credential IS the certificate; etcd's operator-standard method |
+| `etcd-password.yaml` | etcd | username + password | `auth-username` + `password-secret`; secret-based, first-class on purpose |
+| `nats-creds.yaml` | nats | `.creds` file | the NATS account idiom, named by `auth-token-path` |
+| `s3-irsa.yaml` | s3 | IRSA (ambient chain) | workload identity; the service account carries the role |
+| `file-mode-and-identity.yaml` | consul | none | `file-mode: "0640"` + `agent-run-as-user/group`: the rendered file's mode and owner matched to the app container |
+| `env-inject.yaml` | consul | none | REAL OS env vars : init agent renders a dotenv, `env-inject` wraps the app's command — start-time by Kubernetes' own rule |
+| `render-to-secret.yaml` | consul | none | the operator's Secret target + `shape: envEntries` (the envFrom shape): a Secret kept reconciled, watchers react with no restart |
+| `multi-render.yaml` | vault + redis | kubernetes / url-secret | several documents, one pod: `.<name>`-suffixed annotations, one agent and one file per name |
+| `namespace-gating.yaml` | consul | none | the opt-in namespace label for `webhook.namespaceGating=true` — the outer guard; the per-pod annotation stays required |
+
+Under [`real/`](real/), the same machinery on real software:
+
+| File | Software | Shows |
+|---|---|---|
+| [`real/airflow-scheduler.yaml`](real/airflow-scheduler.yaml) | Apache Airflow 2.10 | `AIRFLOW__SECTION__KEY` env dialect templated from the store, `env-inject` making it the scheduler's real environment |
+| [`real/grafana-datasources.yaml`](real/grafana-datasources.yaml) | Grafana 11 | datasource provisioning YAML rendered where Grafana already looks, kept live by the sidecar |
+| [`real/kafka-client-properties.yaml`](real/kafka-client-properties.yaml) | Kafka (bitnami 3.9) | the operator's Secret target carrying a `.properties` file a JVM client mounts |
+| [`real/cluster-class.yaml`](real/cluster-class.yaml) | any tenant | `ClusterDynamicConfigClass`: platform-owned store + credential, tenant Renders with a `namespaces` allowlist |
+| [`real/existing-secret-postgres.yaml`](real/existing-secret-postgres.yaml) | bitnami/postgresql | the `existingSecret` contract: `shape: entries` produces the exact key names another chart demands |
+| [`real/full-stack-shop.yaml`](real/full-stack-shop.yaml) | four components, two stores | end-to-end: THREE secrets injected three ways (existingSecret, secretKeyRef env, mounted+live), API on `env-inject`+`env-restart`, worker on live files, credentials only in the platform namespace |
 
 The [book's store pages](https://dynamic-config-rs.github.io/k8s/) walk
 through every one of these with the store-side setup commands; the
