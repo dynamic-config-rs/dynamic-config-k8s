@@ -42,7 +42,34 @@ pub async fn run(
     let (deliver, mut delivered) = tokio::sync::mpsc::channel::<Fetched>(1);
     let handle = RemoteWatch::new();
     let mut pace = Pace::new(interval);
-    let mut rendered: Option<String> = None;
+
+    // **The file exists before the watch does.** A watch delivers a
+    // *change*, and the stores keep that literally: the current value is
+    // not delivered at startup, because a caller that wanted it fetches
+    // it. An agent is exactly such a caller — the app beside it opens the
+    // rendered file as soon as the pod is ready, and without this it would
+    // find nothing until the configuration happened to move or the resync
+    // came round.
+    //
+    // A failure here ends the agent rather than being waited out: a
+    // sidecar that has never written the file is a pod whose app is
+    // reading something that is not there, and a restart with Kubernetes'
+    // backoff is a better answer than a container that looks healthy and
+    // serves nothing. Once the first render is down, every later failure
+    // is survivable — there is a good file to keep.
+    let first = source.fetch().await?;
+    let mut rendered = Some(crate::render::render_fetched(&first, spec)?);
+
+    crate::render::write_atomically(
+        &spec.out,
+        rendered.as_deref().unwrap_or_default(),
+        spec.file_mode,
+    )?;
+    crate::metrics::rendered();
+    info!(
+        bytes = rendered.as_deref().unwrap_or_default().len(),
+        "rendered"
+    );
 
     let mut watcher = spawn_watch(source, &handle, interval, deliver.clone());
     let mut resync = tokio::time::interval(interval);

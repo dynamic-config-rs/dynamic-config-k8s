@@ -116,6 +116,41 @@ impl RemoteSource for Flapping {
     }
 }
 
+/// A store that pushes nothing, ever — which is what a healthy store looks
+/// like between changes, and what every pod's first second looks like.
+struct Quiet {
+    document: &'static str,
+}
+
+impl RemoteSource for Quiet {
+    fn fetch(&self) -> Result<Fetched, Error> {
+        Ok(Fetched::new(self.document, Format::Json))
+    }
+
+    fn describe(&self) -> String {
+        "a store with nothing to say".to_owned()
+    }
+
+    fn watch_capability(&self) -> WatchCapability {
+        WatchCapability::Native
+    }
+
+    fn watch(
+        &self,
+        watching: &Watching,
+        _interval: Duration,
+        _on_change: &mut dyn FnMut(Fetched) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        // Connected and silent: the shape a subscription has when the
+        // configuration is simply not changing.
+        while watching.keep_going() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn a_pushed_document_is_rendered() {
     let out = scratch("pushed.json");
@@ -141,6 +176,44 @@ async fn a_pushed_document_is_rendered() {
     assert!(
         rendered.contains('2'),
         "the last pushed document is what the file holds: {rendered}"
+    );
+}
+
+/// **The file exists before anything changes.**
+///
+/// A watch delivers a *change*, and the stores keep that literally: the
+/// current value is not delivered at startup. An agent is a caller that
+/// wants it anyway — the app beside it opens the rendered file as soon as
+/// the pod is ready — so the sidecar fetches and renders once before it
+/// starts watching.
+///
+/// Pinned here because the cost of learning it elsewhere is a kind cluster:
+/// this is the regression the e2e smoke caught when the loop began waiting
+/// for a delivery that a quiet store never makes.
+#[tokio::test]
+async fn the_first_render_happens_before_any_change_arrives() {
+    let out = scratch("first-render.json");
+    let _ = std::fs::remove_file(&out);
+
+    let source = Arc::new(Built::Blocking(Arc::new(Quiet {
+        document: r#"{"port":9000}"#,
+    })));
+
+    dynamic_config_agent::sidecar::run(
+        &spec(&out, 3600),
+        &source,
+        Duration::from_secs(3600),
+        tokio::time::sleep(Duration::from_millis(200)),
+    )
+    .await
+    .expect("the loop ends when it is told to");
+
+    let rendered = std::fs::read_to_string(&out)
+        .expect("the file is written before the first change, not after it");
+
+    assert!(
+        rendered.contains("9000"),
+        "the current document is what the file holds: {rendered}"
     );
 }
 
