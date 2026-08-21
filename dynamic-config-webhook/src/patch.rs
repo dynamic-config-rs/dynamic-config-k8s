@@ -11,7 +11,7 @@ use crate::annotations::{self, Mode};
 /// and this constant is only the fallback a bare binary gets. Read once:
 /// an admission decision must not change between two requests because
 /// somebody edited the environment.
-const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1";
+const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.2.0";
 
 fn agent_image() -> &'static str {
     static IMAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -223,16 +223,37 @@ fn respond(uid: &str, mut response: Value) -> Value {
 /// restart policy, so the two halves of a `both` render can collide with
 /// either.
 fn collides(pod: &Value, request: &annotations::Request) -> Option<String> {
-    let mut wanted = vec![
-        "dynamic-config-agent".to_owned(),
-        "dynamic-config-init".to_owned(),
-    ];
+    // **Only the names this render actually adds.** Reserving both meant a
+    // sidecar request was refused by a pod whose *init* container happened
+    // to be called `dynamic-config-init` — somebody else's container, a
+    // name this injection was never going to take, and an admission
+    // refused for a collision that could not happen.
+    let (agent, init) = match request.mode {
+        annotations::Mode::Init => (false, true),
+        annotations::Mode::Sidecar => (true, false),
+        annotations::Mode::Both => (true, true),
+    };
+
+    let mut wanted = Vec::new();
+
+    if agent {
+        wanted.push("dynamic-config-agent".to_owned());
+    }
+
+    if init {
+        wanted.push("dynamic-config-init".to_owned());
+    }
 
     for (index, _) in request.extra.iter().enumerate() {
         let n = index + 1;
 
-        wanted.push(format!("dynamic-config-agent-{n}"));
-        wanted.push(format!("dynamic-config-init-{n}"));
+        if agent {
+            wanted.push(format!("dynamic-config-agent-{n}"));
+        }
+
+        if init {
+            wanted.push(format!("dynamic-config-init-{n}"));
+        }
     }
 
     for list in ["/spec/containers", "/spec/initContainers"] {

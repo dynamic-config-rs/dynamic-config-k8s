@@ -733,10 +733,15 @@ impl Installation {
     fn from_environment() -> Result<Self, String> {
         let mounted = crate::installation_file::read(&document_path())?;
 
+        // **Set-and-empty is an answer, not an absence.** An empty
+        // `..._AGENT_ENV_ALLOW` means *allow nothing*, which is exactly
+        // what somebody reaches for to revoke what a document granted —
+        // and treating it as unset handed the document back, inverting
+        // the precedence this function exists to state. Only a variable
+        // that is not set at all falls through.
         Self::from_lookup(&|name| {
             std::env::var(name)
                 .ok()
-                .filter(|value| !value.is_empty())
                 .or_else(|| mounted.get(name).cloned())
         })
     }
@@ -1024,6 +1029,31 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
     of_pod_with(pod, installation())
 }
 
+/// Whether the pod already carries what an injection puts there.
+///
+/// The agent's container, under either of the two names it takes: the
+/// sidecar's and the init container's. Checked rather than trusted,
+/// because the mark that says "already injected" travels with a copied
+/// manifest and the containers do not.
+fn already_injected(pod: &Value) -> bool {
+    let named = |list: Option<&Vec<Value>>| {
+        list.is_some_and(|containers| {
+            containers.iter().any(|container| {
+                matches!(
+                    container.pointer("/name").and_then(Value::as_str),
+                    Some("dynamic-config-agent" | "dynamic-config-init")
+                )
+            })
+        })
+    };
+
+    named(pod.pointer("/spec/containers").and_then(Value::as_array))
+        || named(
+            pod.pointer("/spec/initContainers")
+                .and_then(Value::as_array),
+        )
+}
+
 /// [`of_pod`] with the installation made explicit — the server feeds
 /// its own; tests construct theirs through
 /// [`Installation::from_lookup`].
@@ -1048,7 +1078,18 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // repeating that decision is the whole of what this guard is for.
     match get(STATUS) {
         None => {}
-        Some(INJECTED) => return Ok(None),
+        // The mark says a previous pass patched this pod. Believed only
+        // when the patch is *there*: a manifest copied out of a cluster
+        // and applied elsewhere — `kubectl get pod -o yaml | kubectl apply
+        // -f -` — carries the mark without the containers, and this guard
+        // was the only thing between that pod and running with no
+        // configuration at all, silently.
+        Some(INJECTED) if already_injected(pod) => return Ok(None),
+        Some(INJECTED) => {
+            return Err(format!(
+                "{PREFIX}{STATUS} is {INJECTED:?} but this pod carries no                  injected container: the mark is this webhook's to write,                  and a pod copied from another cluster keeps the mark                  without what it stood for"
+            ))
+        }
         Some(other) => {
             return Err(format!(
                 "{PREFIX}{STATUS} is {other:?}, and it is not a pod's to set: \

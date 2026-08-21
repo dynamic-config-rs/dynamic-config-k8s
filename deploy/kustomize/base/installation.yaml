@@ -25,6 +25,10 @@ metadata:
   namespace: dynamic-config
 data:
   installation.yaml: |
+    # An empty map: the settings below are examples, and an installation
+    # that sets none of them still has to be a document. Uncomment what you
+    # need and delete this line.
+    {}
     # Fleet-wide defaults, applied to every injected agent.
     #
     #   mode: sidecar

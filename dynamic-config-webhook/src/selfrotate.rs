@@ -62,6 +62,7 @@ const SKEW: time::Duration = time::Duration::minutes(5);
 pub static ROTATIONS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static EXPIRES_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[derive(Clone)]
 pub struct Settings {
     pub namespace: String,
     pub service: String,
@@ -139,31 +140,68 @@ async fn attend(
     // patches — which is fast until the API server is not. Renewing
     // underneath it means a slow rotation cannot have its lease taken by
     // a replica that then rotates on top of it.
+    // **A lost lease stops the rotation, rather than being logged past.**
+    // The renewal answers three ways and each means something different: it
+    // still leads, somebody else took it, or the API server could not be
+    // asked. Only the first is a reason to keep going. Two replicas
+    // rotating at once write one CA's leaf into the Secret and another's
+    // bundle into the webhook configuration, and every admission TLS
+    // handshake fails until somebody notices — which is the failure the
+    // lease exists to prevent.
+    let (lost, taken) = tokio::sync::oneshot::channel();
+
     let renewing = tokio::spawn({
         let client = client.clone();
-        let settings = Settings {
-            namespace: settings.namespace.clone(),
-            service: settings.service.clone(),
-            secret: settings.secret.clone(),
-            webhook_configuration: settings.webhook_configuration.clone(),
-            identity: settings.identity.clone(),
-        };
+        let settings = settings.clone();
 
         async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(
-                    u64::try_from(LEASE_SECONDS).unwrap_or(30) / 3,
-                ))
-                .await;
+            // A renewal that *fails* is not a lease that was lost: an API
+            // server refusing for a moment is ordinary, and giving up on
+            // the first one would make a rotation fail on a hiccup. It
+            // becomes a loss when nothing has succeeded for a whole term,
+            // which is exactly when another replica may take it.
+            let mut held = tokio::time::Instant::now();
+            let term = Duration::from_secs(u64::try_from(LEASE_SECONDS).unwrap_or(30));
 
-                if let Err(error) = hold_lease(&client, &settings).await {
-                    warn!(%error, "renewing the rotation lease failed");
+            loop {
+                tokio::time::sleep(term / 3).await;
+
+                match hold_lease(&client, &settings).await {
+                    Ok(true) => held = tokio::time::Instant::now(),
+                    Ok(false) => {
+                        warn!("the rotation lease was taken by another replica");
+
+                        let _ = lost.send(());
+
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(%error, "renewing the rotation lease failed");
+
+                        if held.elapsed() >= term {
+                            warn!("no renewal succeeded within the lease's term");
+
+                            let _ = lost.send(());
+
+                            return;
+                        }
+                    }
                 }
             }
         }
     });
 
-    let rotated = rotate(client, settings).await;
+    // Dropping the rotation is what abandons it: the writes are `await`
+    // points, so cancellation lands between them and nothing half-written
+    // reaches the Secret or the webhook configuration.
+    let rotated = tokio::select! {
+        result = rotate(client, settings) => result,
+        _ = taken => {
+            warn!("the rotation lease was lost mid-rotation; abandoning it unwritten");
+
+            Ok(())
+        }
+    };
 
     renewing.abort();
     rotated

@@ -37,6 +37,33 @@ spec:
             readOnlyRootFilesystem: true
             seccompProfile:
               type: RuntimeDefault
+          # Leader election needs to know who this replica *is*. Without
+          # both of these the operator logs that there is no election and
+          # reconciles unelected — harmless at one replica and exactly the
+          # bug 0.2.0 fixed the moment somebody scales to two. The chart
+          # has carried them since; this overlay had not.
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 9090
+              name: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { memory: 128Mi }

@@ -14,7 +14,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "dynamic-config.fullname" . }}-installation
+  name: {{ include "dynamic-config.installation.fullname" . }}
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
   {{- include "dynamic-config.annotations" . | nindent 2 }}
 data:

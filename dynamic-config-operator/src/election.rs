@@ -69,11 +69,13 @@ pub async fn lead(
     let identity = identity.to_owned();
 
     Ok(async move {
+        let mut held = tokio::time::Instant::now();
+
         loop {
             tokio::time::sleep(RENEW).await;
 
             match claim(&leases, &identity).await {
-                Ok(true) => {}
+                Ok(true) => held = tokio::time::Instant::now(),
                 Ok(false) => {
                     tracing::warn!(lease = LEASE, "the lease was taken by another replica");
 
@@ -85,6 +87,22 @@ pub async fn lead(
                     // operator that gave up on one API blip would hand the
                     // cluster a leaderless gap for no reason.
                     tracing::warn!(%error, lease = LEASE, "renewing the lease failed");
+
+                    // Fatal once the *term* has gone by without one
+                    // succeeding, though — which is the moment another
+                    // replica may take the lease, and this one carrying on
+                    // is two operators reconciling the same objects. The
+                    // documentation above says this future resolves when
+                    // the term is lost; without this it only resolved when
+                    // somebody else announced they had taken it.
+                    if held.elapsed() >= TERM {
+                        tracing::warn!(
+                            lease = LEASE,
+                            "no renewal succeeded within the term; standing down"
+                        );
+
+                        return;
+                    }
                 }
             }
         }
@@ -94,23 +112,36 @@ pub async fn lead(
 /// Takes or renews the lease. `true` means this replica holds it.
 async fn claim(leases: &Api<Lease>, identity: &str) -> Result<bool, kube::Error> {
     let now = MicroTime(chrono::Utc::now());
-    let mine = |version: Option<String>| Lease {
-        metadata: ObjectMeta {
-            name: Some(LEASE.to_owned()),
-            resource_version: version,
-            ..Default::default()
-        },
-        spec: Some(LeaseSpec {
-            holder_identity: Some(identity.to_owned()),
-            lease_duration_seconds: Some(i32::try_from(TERM.as_secs()).unwrap_or(i32::MAX)),
-            renew_time: Some(now.clone()),
-            acquire_time: Some(now.clone()),
-            ..Default::default()
-        }),
-    };
+
+    // **`acquireTime` is when leadership was taken; `renewTime` is when it
+    // was last confirmed.** Writing both on every renewal made the first
+    // one unanswerable — `kubectl describe lease` could not say when the
+    // leader last changed, and `leaseTransitions` stayed at whatever it
+    // started as. So a renewal carries the acquire time it found, and a
+    // takeover sets a new one and counts itself.
+    let mine =
+        |version: Option<String>, acquired: Option<MicroTime>, transitions: Option<i32>| Lease {
+            metadata: ObjectMeta {
+                name: Some(LEASE.to_owned()),
+                resource_version: version,
+                ..Default::default()
+            },
+            spec: Some(LeaseSpec {
+                holder_identity: Some(identity.to_owned()),
+                lease_duration_seconds: Some(i32::try_from(TERM.as_secs()).unwrap_or(i32::MAX)),
+                renew_time: Some(now.clone()),
+                acquire_time: Some(acquired.unwrap_or_else(|| now.clone())),
+                lease_transitions: transitions,
+                ..Default::default()
+            }),
+        };
 
     let Some(current) = leases.get_opt(LEASE).await? else {
-        return match leases.create(&PostParams::default(), &mine(None)).await {
+        // The first holder: acquired now, and the first transition.
+        return match leases
+            .create(&PostParams::default(), &mine(None, None, Some(0)))
+            .await
+        {
             Ok(_) => Ok(true),
             // Another replica created it in the same instant; it leads.
             Err(kube::Error::Api(response)) if response.code == 409 => Ok(false),
@@ -137,11 +168,19 @@ async fn claim(leases: &Api<Lease>, identity: &str) -> Result<bool, kube::Error>
     // The resource version is the fence: two replicas that both saw an
     // expired lease cannot both write over it, because the second write
     // is refused for being based on a version that has moved.
+    // Renewing keeps what is there; taking over from an expired holder
+    // stamps a fresh acquisition and counts the transition.
+    let (acquired, transitions) = if held_by_me {
+        (spec.acquire_time.clone(), spec.lease_transitions)
+    } else {
+        (None, Some(spec.lease_transitions.unwrap_or(0) + 1))
+    };
+
     match leases
         .replace(
             LEASE,
             &PostParams::default(),
-            &mine(current.metadata.resource_version),
+            &mine(current.metadata.resource_version, acquired, transitions),
         )
         .await
     {

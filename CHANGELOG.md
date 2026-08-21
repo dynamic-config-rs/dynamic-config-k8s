@@ -11,6 +11,25 @@ version — the contract is the API here.
 
 ## [0.2.0] — 2026-08-21
 
+### Fixed
+
+- **`agent.defaults.perStore` could not be set as a string at all.** The
+  chart's default for it was an empty *map*, and helm refuses to overwrite
+  a table with a non-table — so the grammar spelling the values reference
+  documents was rejected by the values file that documented it. The
+  default is an empty string now, which takes either: a map overwrites a
+  string happily, and the reverse is what was impossible.
+
+- **The webhook injected the previous release's agent** wherever
+  `DYNAMIC_CONFIG_AGENT_IMAGE` was not set — the embedded fallback still
+  named `v0.1.1`, which is the supported way to run the webhook as a bare
+  binary. It moves with the release now, and the golden fixtures say so.
+
+- **A pod with an unrelated `dynamic-config-init` container was refused a
+  sidecar**, and the reverse in init mode: the collision check reserved
+  both container names whatever the mode asked for, so an admission failed
+  over a name this injection was never going to take.
+
 ### Changed
 
 - **The engine and store floors are 0.9**, and `serde` / `serde_json`

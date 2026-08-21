@@ -101,10 +101,17 @@ pub async fn run(
             // is already being asked on this cadence by its own watch, and
             // a second timer would double its load on the store.
             _ = resync.tick(), if capability == WatchCapability::Native => {
-                crate::metrics::resynced();
-
+                // Counted *after* the store answers. Marking the resync
+                // before the fetch moved the staleness clock on every
+                // attempt, so a store that had been unreachable for an
+                // hour reported a document read seconds ago — the gauge an
+                // operator pages on, saying the opposite of what happened.
                 match source.fetch().await {
-                    Ok(document) => Some(document),
+                    Ok(document) => {
+                        crate::metrics::resynced();
+
+                        Some(document)
+                    }
                     Err(error) => {
                         warn!(error = %error, "the resync failed; the rendered file is unchanged");
                         crate::metrics::failed();

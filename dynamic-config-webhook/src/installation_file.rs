@@ -93,6 +93,19 @@ pub fn read(path: &std::path::Path) -> Result<BTreeMap<String, String>, String> 
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
 
+    // **A document that says nothing is not a malformed document.** The
+    // shipped ConfigMap is a page of commented-out examples, which is what
+    // an installation with no defaults looks like — and YAML reads that as
+    // *null*, which `render` rightly refuses as "not a map of settings".
+    // The webhook then refused to start, so the kustomize path could not be
+    // applied at all until somebody uncommented something.
+    if text
+        .lines()
+        .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    {
+        return Ok(BTreeMap::new());
+    }
+
     let format = dynamic_config::Format::from_path(path)
         .map_err(|_| format!("{}: the name has no format this reads", path.display()))?;
     let document = Value::parse(&text, format).map_err(|error| {
@@ -178,9 +191,24 @@ fn per_store(value: &Value) -> Result<String, String> {
     let mut groups = Vec::new();
 
     for (store, knobs) in stores {
+        // A store's settings may be written either way, which is what the
+        // chart's values reference promises: a map, because a values file
+        // has YAML already, or the same grammar as one string, because an
+        // environment variable can carry that and a map cannot. Refusing
+        // the string here split one setting across two mechanisms — the
+        // map half travelled as a document, the string half as a variable,
+        // and a variable replaces a document wholesale, so a file with one
+        // of each silently lost everything the map had said.
+        if let Value::String(written) = knobs {
+            groups.push(format!("{store}: {written}"));
+
+            continue;
+        }
+
         let Value::Table(knobs) = knobs else {
             return Err(format!(
-                "{}.{store}: a map of setting to value; this is {}",
+                "{}.{store}: a map of setting to value, or that grammar as one \
+                 string; this is {}",
                 PER_STORE.0,
                 kind(knobs)
             ));

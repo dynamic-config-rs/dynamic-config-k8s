@@ -105,7 +105,12 @@ agent:
     # A map travels to the pod as a mounted document and is rendered to
     # the grammar there, by the same parser the string goes through — so
     # the two spellings cannot mean different things.
-    perStore: {}
+    # Empty *string*, not an empty map, and the difference is not
+    # cosmetic: helm refuses to overwrite a table with a non-table, so a
+    # `{}` default makes the string form above impossible to set from a
+    # values file — while a `""` default takes either, because a map
+    # overwrites a string happily.
+    perStore: ""
 
 # ── The webhook ──────────────────────────────────────────────────────
 webhook:

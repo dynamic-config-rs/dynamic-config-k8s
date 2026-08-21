@@ -137,10 +137,67 @@ fn an_unknown_setting_is_refused_and_says_what_there_is() {
 /// A shape that cannot render is refused where it is written.
 #[test]
 fn a_setting_of_the_wrong_shape_is_refused() {
-    let path = written("shape.yaml", "storeDefaults:\n  vault: not-a-map\n");
-    let error = installation_file::read(&path).expect_err("a store's settings are a map");
+    let path = written("shape.yaml", "storeDefaults:\n  vault:\n    - a\n    - b\n");
+    let error = installation_file::read(&path).expect_err("a store's settings are not a list");
 
     assert!(error.contains("storeDefaults.vault"), "{error}");
+}
+
+/// **Either spelling, per store.** A map because a values file has YAML
+/// already; that store's grammar as one string because an environment
+/// variable can carry it and a map cannot. Refusing the string here split
+/// one setting across two mechanisms — the map half travelling as a
+/// document, the string half as a variable — and a variable replaces a
+/// document rather than merging with it, so a file with one of each lost
+/// everything the map had said.
+#[test]
+fn a_store_may_be_written_as_a_map_or_as_its_grammar() {
+    let path = written(
+        "both-spellings.yaml",
+        "storeDefaults:\n  s3: agent-memory-limit=128Mi\n  vault:\n    auth: kubernetes\n",
+    );
+
+    let rendered = installation_file::read(&path).expect("both spellings are settings");
+    let defaults = rendered
+        .get("DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS")
+        .expect("the stores rendered");
+
+    assert!(
+        defaults.contains("s3: agent-memory-limit=128Mi"),
+        "the string spelling survives verbatim: {defaults}"
+    );
+    assert!(
+        defaults.contains("vault: auth=kubernetes"),
+        "and the map spelling becomes the same grammar: {defaults}"
+    );
+}
+
+/// A document that says nothing is an installation that sets nothing.
+///
+/// The shipped kustomize ConfigMap is a page of commented-out examples,
+/// which YAML reads as `null` — and a webhook that refused to start on it
+/// made `kubectl apply -k deploy/kustomize/base` impossible to apply at
+/// all until somebody uncommented a line.
+#[test]
+fn a_document_of_comments_alone_sets_nothing() {
+    let commented = written(
+        "comments-only.yaml",
+        "# mode: sidecar\n#\n#   watchSeconds: 30\n",
+    );
+    let blank = written("blank.yaml", "\n\n");
+
+    assert!(installation_file::read(&commented)
+        .expect("comments are not a malformed document")
+        .is_empty());
+    assert!(installation_file::read(&blank)
+        .expect("an empty file sets nothing")
+        .is_empty());
+
+    // A document that says something *else* is still a mistake, and says
+    // so: silence is a page of comments, not a stray scalar.
+    let scalar = written("scalar.yaml", "~\n");
+
+    assert!(installation_file::read(&scalar).is_err());
 }
 
 /// No mount is an installation that sets nothing, not a failure.
