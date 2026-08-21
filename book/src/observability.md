@@ -10,48 +10,136 @@ includes the OTel Collector.
 
 | component | where | how it turns on |
 |---|---|---|
-| webhook | `GET /metrics` on the serving (TLS) port | always on |
+| webhook | its own plain-HTTP port, and `GET /metrics` on the serving (TLS) port too | `webhook.metrics.enabled`, on by default |
 | agent | its own port, plain HTTP | `metrics-port` annotation, or the `agent.defaults.metricsPort` fleet default |
 | operator | `0.0.0.0:9090`, plain HTTP | on by default; `DYNAMIC_CONFIG_OPERATOR_METRICS_ADDR=""` turns it off |
 
 ## The webhook's metrics
 
-One counter, three outcomes — the webhook's whole job is a decision,
-so its whole telemetry is which way decisions went:
+The webhook sits in the path of every pod creation in the cluster, so
+the first question about it is never "did it work" but **"how long did
+it take"** — the API server's own ten-second timeout turns a slow
+admission into a refused one, and only a histogram answers what the
+tail is doing.
 
 ```text
 # TYPE dynamic_config_admissions_total counter
 dynamic_config_admissions_total{outcome="skipped"} 41
 dynamic_config_admissions_total{outcome="patched"} 12
 dynamic_config_admissions_total{outcome="refused"} 3
+# TYPE dynamic_config_admission_refusals_total counter
+dynamic_config_admission_refusals_total{reason="policy"} 2
+dynamic_config_admission_refusals_total{reason="pinned"} 1
+dynamic_config_admission_refusals_total{reason="conflict"} 0
+dynamic_config_admission_refusals_total{reason="malformed"} 0
+dynamic_config_admission_refusals_total{reason="other"} 0
+# TYPE dynamic_config_admission_duration_seconds histogram
+dynamic_config_admission_duration_seconds_bucket{le="0.0001"} 39
+dynamic_config_admission_duration_seconds_bucket{le="0.001"} 55
+dynamic_config_admission_duration_seconds_bucket{le="+Inf"} 56
+dynamic_config_admission_duration_seconds_sum 0.031
+dynamic_config_admission_duration_seconds_count 56
+# TYPE dynamic_config_admission_patch_bytes_total counter
+dynamic_config_admission_patch_bytes_total 24576
 ```
 
 `skipped` is a pod that did not ask; `patched` asked and got the
-agent; `refused` asked wrongly — a contract violation or a
-[gate](installation-defaults.md#the-gates-in-depth) holding. A rising
-`refused` after an installation change usually means a gate is doing
-its job on workloads that have not caught up.
+agent; `refused` asked wrongly. **The refusals are labelled by kind
+because they are three different pages:**
 
-The endpoint shares the webhook's serving port, so the scrape goes
-over the same TLS the API server uses. Prometheus needs the scheme
-and, unless it trusts the webhook's CA, permission to skip
-verification:
+| reason | what happened | who fixes it |
+|---|---|---|
+| `policy` | a store, or an `agent-env` name, that this installation does not allow here | whoever wrote the pod, or whoever set the gate |
+| `pinned` | a value the installation fixed, overridden by a pod | whoever is working around the installation |
+| `malformed` | an annotation that is not the shape it has to be | whoever wrote the pod — a typo |
+| `conflict` | the pod already has a container by a name the injection needs | whoever wrote the pod — rename it |
+
+The kind is a `status.reason` the refusal carries, not something a
+scrape works out by reading the message, so rewording an error does not
+silently re-label a metric.
+
+In `selfRotate` mode two more say whether rotation is still happening:
+
+```text
+# TYPE dynamic_config_certificate_rotations_total counter
+dynamic_config_certificate_rotations_total 7
+# TYPE dynamic_config_certificate_expires_at_seconds gauge
+dynamic_config_certificate_expires_at_seconds 1755698600
+```
+
+A counter that should climb on a schedule, and a wall-clock second that
+should always be in the future. **Alert on the gauge**: a webhook whose
+certificate expires takes every pod creation in the cluster with it.
 
 ```yaml
-# a scrape_config for the webhook Service
+- alert: DynamicConfigWebhookCertificateExpiring
+  expr: dynamic_config_certificate_expires_at_seconds - time() < 3600
+- alert: DynamicConfigAdmissionSlow
+  expr: histogram_quantile(0.99, rate(dynamic_config_admission_duration_seconds_bucket[5m])) > 1
+```
+
+### Where to scrape it
+
+**A port of its own, in plain HTTP** — `webhook.metrics.port`, 9091 by
+default. The admission port is mutual TLS against a CA the webhook
+mints for itself, so scraping *that* meant handing Prometheus a client
+certificate from that CA, and a deployment that did not simply had no
+metrics. The admission port still answers `/metrics`, so a scrape
+already configured against it keeps working.
+
+With the Prometheus Operator, one toggle:
+
+```yaml
+webhook:
+  metrics:
+    serviceMonitor:
+      enabled: true      # needs the ServiceMonitor CRD
+      interval: 30s
+```
+
+Without it, the Service carries a named `metrics` port:
+
+```yaml
 - job_name: dynamic-config-webhook
-  scheme: https
-  tls_config:
-    insecure_skip_verify: true   # or ca_file from the caBundle
   kubernetes_sd_configs:
     - role: endpoints
       namespaces: { names: [dynamic-config] }
+  relabel_configs:
+    - source_labels: [__meta_kubernetes_endpoint_port_name]
+      action: keep
+      regex: metrics
 ```
+
+## Watching
+
+**The sidecar watches; it does not poll.** Each store says how it learns
+that its document changed, and the agent uses it — so a change in etcd,
+Consul, NATS, Redis or a config server arrives as it happens, and a store
+that must be asked is asked the cheapest question it offers (an S3 object
+is a `HEAD`, not a download).
+
+`watch-seconds` keeps its spelling and means two things depending on the
+store:
+
+| the store | what a watch is | what `watch-seconds` means |
+|---|---|---|
+| etcd, Consul, NATS, Redis, config-server | the store's own push | a **resync** — how often to re-read anyway |
+| Vault, S3, git, Firestore | a cheap "has it changed?" | how often to ask |
+
+[`examples/watch-driven.yaml`](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/watch-driven.yaml)
+is a pod on the push path with both numbers set: a five-minute resync
+under etcd's stream, and the metrics port to scrape it from.
+
+The resync is not belt and braces. **The failure mode of a stream is
+silence**: a subscription the broker forgot, a connection that dropped
+without an error, a blocking query answering an index that will never
+move again. All three look exactly like a store where nothing has
+changed, and the only way to tell them apart is to go and ask.
 
 ## The agent's metrics
 
-A watching agent with a `metrics-port` serves three series; the port
-also lands on the container spec as a named port (`metrics`), so
+A watching agent with a `metrics-port` serves eight series; the port also
+lands on the container spec as a named port (`metrics`), so
 selector-based discovery finds it without configuration:
 
 ```text
@@ -61,19 +149,43 @@ dynamic_config_agent_renders_total 128
 dynamic_config_agent_render_failures_total 2
 # TYPE dynamic_config_agent_last_render_timestamp_seconds gauge
 dynamic_config_agent_last_render_timestamp_seconds 1755612200
+# TYPE dynamic_config_agent_deliveries_total counter
+dynamic_config_agent_deliveries_total 12
+# TYPE dynamic_config_agent_resyncs_total counter
+dynamic_config_agent_resyncs_total 480
+# TYPE dynamic_config_agent_watch_connected gauge
+dynamic_config_agent_watch_connected 1
+# TYPE dynamic_config_agent_watch_reconnects_total counter
+dynamic_config_agent_watch_reconnects_total 3
+# TYPE dynamic_config_agent_staleness_seconds gauge
+dynamic_config_agent_staleness_seconds 4
 ```
 
-The gauge is the one to alert on — a counter that stops moving looks
-identical to a quiet store, but a timestamp that stops moving while
-`watch-seconds` says it should not is a stuck render:
+**`staleness_seconds` is the one to alert on.** It is seconds since the
+store was last read successfully, delivered or resynced — the number a
+pager asks for. Everything else says what happened; this says how long
+ago it stopped happening. Zero until the first success, so a pod that has
+never reached its store does not look fresh.
 
 ```yaml
-# The document went stale: no successful render for 10 minutes.
-- alert: DynamicConfigRenderStale
-  expr: time() - dynamic_config_agent_last_render_timestamp_seconds > 600
+# The document went stale: nothing read from the store for 10 minutes.
+- alert: DynamicConfigStoreStale
+  expr: dynamic_config_agent_staleness_seconds > 600
 - alert: DynamicConfigRenderFailing
   expr: increase(dynamic_config_agent_render_failures_total[10m]) > 0
+# A watch that keeps reopening is a store or a network that is not well.
+- alert: DynamicConfigWatchFlapping
+  expr: increase(dynamic_config_agent_watch_reconnects_total[15m]) > 5
 ```
+
+**Deliveries and resyncs are told apart because that pair is a
+diagnosis.** Deliveries flat while resyncs climb *is* the stalled stream
+the resync exists to cover: the store is being read, changes are landing,
+and the push half is doing nothing. Nothing else here would show it.
+
+`watch_connected` is `0` between a watch ending and the next one opening;
+on a store that is polled rather than pushed it stays `1` for as long as
+the loop runs.
 
 A one-shot init agent serves nothing — it renders once and exits, and
 a scrape target that lives for two seconds is noise. Only the watching
@@ -102,12 +214,31 @@ port collision, say) opts out with `metrics-port: "0"`.
 
 ## The operator's metrics
 
-The same three series, `dynamic_config_operator_`-prefixed:
+The agent's render series, `dynamic_config_operator_`-prefixed —
 `_renders_total` counts reconciles that produced or refreshed a target,
-`_render_failures_total` the ones that ended in a `RenderFailed`
-event, and the gauge the last success. On by default at
+`_render_failures_total` the ones that ended in a `RenderFailed` event,
+and the gauge the last success — plus a reconcile histogram:
+
+```text
+# TYPE dynamic_config_operator_reconcile_duration_seconds histogram
+dynamic_config_operator_reconcile_duration_seconds_bucket{le="0.5"} 88
+dynamic_config_operator_reconcile_duration_seconds_bucket{le="+Inf"} 91
+dynamic_config_operator_reconcile_duration_seconds_sum 12.4
+dynamic_config_operator_reconcile_duration_seconds_count 91
+# TYPE dynamic_config_operator_reconcile_failures_total counter
+dynamic_config_operator_reconcile_failures_total 3
+```
+
+A reconcile is a store fetch and an API write, so a tail that moves is
+usually the store rather than the operator. On by default at
 `0.0.0.0:9090`; point `DYNAMIC_CONFIG_OPERATOR_METRICS_ADDR` elsewhere
-or set it empty to turn it off.
+or set it empty to turn it off. The same port answers `/healthz` and
+`/readyz`, which is what the chart's probes use.
+
+**Only one replica reconciles.** The operator elects a leader over a
+Lease, so `operator.replicas: 2` is spare capacity rather than twice the
+work — and the metrics of a follower stay flat by design. A leader that
+dies is replaced within the lease's fifteen-second term.
 
 Beside the metrics, the operator reports per-object: a `Ready`
 condition on every `DynamicConfigRender`'s status and Kubernetes

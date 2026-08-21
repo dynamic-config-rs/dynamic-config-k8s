@@ -124,10 +124,24 @@
             },
             "perStore": {
               "type": "object",
+              "description": "Per-store defaults. Each store's settings are a map, or the equivalent grammar as one string.",
               "additionalProperties": {
-                "type": "string"
-              },
-              "description": "Per-store default knobs: {vault: 'watch-seconds=30, file-mode=0640'} \u2014 keys spelled as the annotations spell them."
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": [
+                        "string",
+                        "integer",
+                        "boolean"
+                      ]
+                    }
+                  }
+                ]
+              }
             },
             "source": {
               "type": "string",
@@ -414,16 +428,82 @@
           }
         },
         "agentEnvAllow": {
-          "type": "string",
-          "description": "Which agent-env names pods may set, per namespace: 'payments: HTTPS_PROXY, AWS_*; *: RUST_LOG'. Empty = refused everywhere."
+          "description": "A map of namespace to a list of names, or the equivalent grammar as one string.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
         },
         "sourceAllow": {
-          "type": "string",
-          "description": "Which stores pods may use, per namespace; empty = every store everywhere."
+          "description": "A map of namespace to a list of names, or the equivalent grammar as one string.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
         },
         "sourceDeny": {
-          "type": "string",
-          "description": "Stores turned off, per namespace; outranks sourceAllow."
+          "description": "A map of namespace to a list of names, or the equivalent grammar as one string.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer"
+            },
+            "serviceMonitor": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "interval": {
+                  "type": "string"
+                },
+                "labels": {
+                  "type": "object"
+                }
+              }
+            }
+          }
         }
       },
       "additionalProperties": false
@@ -442,6 +522,22 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "spec": {
+              "type": "object"
+            }
+          }
         },
         "image": {
           "type": "string",

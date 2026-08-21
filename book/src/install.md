@@ -3,7 +3,7 @@
 ```sh
 # From the OCI registry (ArtifactHub lists the same chart):
 helm install dynamic-config \
-  oci://ghcr.io/dynamic-config-rs/charts/dynamic-config --version 0.1.1
+  oci://ghcr.io/dynamic-config-rs/charts/dynamic-config --version 0.2.0
 
 # Or from a checkout:
 helm install dynamic-config deploy/helm
@@ -178,9 +178,11 @@ both the values and the gate.
 
 Helm's schema refuses a malformed value at render time; the webhook
 re-validates ALL of it at startup and refuses to serve on a typo — so
-kustomize installs, which patch the same `DYNAMIC_CONFIG_AGENT_*` /
-`DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW` variables straight onto the
-Deployment, get the same refusal at the same door:
+an installation written any of the three ways gets the same refusal at
+the same door. The readable form for kustomize is
+`base/installation.yaml`, a ConfigMap of the same settings as YAML
+([Installation Defaults](installation-defaults.md#writing-them-as-yaml));
+the variables below are the other way, and still work:
 
 ```yaml
 # kustomization.yaml, an overlay patch
@@ -210,8 +212,11 @@ that table.
 
 ## Without helm: kustomize
 
-`deploy/kustomize/` carries the same resources as a base plus two TLS
-overlays — cert-manager, and bring-your-own-PEMs via `secretGenerator`.
+`deploy/kustomize/` carries the same resources as a base — including
+`installation.yaml`, the fleet defaults and gates written as YAML rather
+than as environment-variable grammar — plus TLS overlays for
+cert-manager, bring-your-own-PEMs via `secretGenerator`, and the
+self-rotating mode.
 Its [README](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/deploy/kustomize/README.md)
 is the three-step walkthrough, including the one `caBundle` patch
 kustomize cannot express. The CRDs ship inside the base, drift-gated

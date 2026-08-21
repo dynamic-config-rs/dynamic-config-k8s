@@ -6,7 +6,12 @@
 mod annotations;
 mod patch;
 
+pub mod installation_file;
+
 pub use annotations::{
-    of_pod, of_pod_with, verify_installation, Installation, Mode, Request, ScopedNames, PREFIX,
+    of_pod, of_pod_with, verify_installation, Installation, Mode, Request, ScopedNames, INJECTED,
+    PREFIX, STATUS,
 };
-pub use patch::{admission_response, admission_response_with, patches_for};
+pub use patch::{
+    admission_response, admission_response_with, patches_for, CONFLICT, MALFORMED, PINNED, POLICY,
+};

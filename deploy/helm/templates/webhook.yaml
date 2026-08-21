@@ -289,25 +289,49 @@ spec:
             - name: DYNAMIC_CONFIG_AGENT_DEFAULTS_OVERRIDABLE
               value: {{ .Values.agent.defaults.overridable | toString | quote }}
             {{- end }}
-            {{- if .Values.agent.defaults.perStore }}
+            {{/* Each of these takes a string — the grammar — or a map.
+                 A string goes on as the variable it always was; a map
+                 goes into the mounted installation document instead, so
+                 that the readable form is readable all the way to the
+                 pod rather than being flattened here. */}}
+            {{- if kindIs "string" .Values.agent.defaults.perStore }}
+            {{- with .Values.agent.defaults.perStore }}
+            - name: DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- else if .Values.agent.defaults.perStore }}
             {{- $groups := list }}
             {{- range $store, $knobs := .Values.agent.defaults.perStore }}
+            {{- if kindIs "string" $knobs }}
             {{- $groups = append $groups (printf "%s: %s" $store $knobs) }}
             {{- end }}
+            {{- end }}
+            {{- if $groups }}
             - name: DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS
               value: {{ join "; " $groups | quote }}
             {{- end }}
+            {{- end }}
+            {{- if kindIs "string" .Values.webhook.agentEnvAllow }}
             {{- with .Values.webhook.agentEnvAllow }}
             - name: DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW
               value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            {{- if kindIs "string" .Values.webhook.sourceAllow }}
             {{- with .Values.webhook.sourceAllow }}
             - name: DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW
               value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            {{- if kindIs "string" .Values.webhook.sourceDeny }}
             {{- with .Values.webhook.sourceDeny }}
             - name: DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY
               value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if (include "dynamic-config.installationDocument" .) }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_DEFAULTS_FILE
+              value: /etc/dynamic-config/installation.yaml
             {{- end }}
             {{- if $selfRotate }}
             - name: DYNAMIC_CONFIG_WEBHOOK_SELF_ROTATE
@@ -321,21 +345,42 @@ spec:
             - name: DYNAMIC_CONFIG_WEBHOOK_MWC
               value: {{ include "dynamic-config.fullname" . | quote }}
             {{- end }}
+            {{- if .Values.webhook.metrics.enabled }}
+            {{/* A port of its own, in plain HTTP. The admission port is
+                 mutual TLS against a CA this webhook mints for itself, so
+                 scraping it meant handing Prometheus a client certificate
+                 from that CA — which most deployments did not, and so had
+                 no metrics at all. */}}
+            - name: DYNAMIC_CONFIG_WEBHOOK_METRICS_ADDR
+              value: "0.0.0.0:{{ .Values.webhook.metrics.port }}"
+            {{- end }}
             {{- with .Values.webhook.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           ports:
             - containerPort: {{ .Values.webhook.port }}
               name: https
+            {{- if .Values.webhook.metrics.enabled }}
+            - containerPort: {{ .Values.webhook.metrics.port }}
+              name: metrics
+            {{- end }}
           volumeMounts:
             - { name: tls, mountPath: /tls, readOnly: true }
+            {{- if (include "dynamic-config.installationDocument" .) }}
+            - { name: installation, mountPath: /etc/dynamic-config, readOnly: true }
+            {{- end }}
             {{- with .Values.webhook.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
           resources: {{- toYaml .Values.webhook.resources | nindent 12 }}
           readinessProbe:
-            httpGet: { path: /healthz, port: {{ .Values.webhook.port }}, scheme: HTTPS }
+            {{/* Ready means a certificate this process can serve with is
+                 loaded — which in selfRotate mode is false for the first
+                 minute, while the kubelet syncs the minted pair. A replica
+                 that reported Ready without one would have the Service
+                 send it admissions it cannot complete a handshake for. */}}
+            httpGet: { path: /readyz, port: {{ .Values.webhook.port }}, scheme: HTTPS }
             initialDelaySeconds: {{ .Values.webhook.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.webhook.readinessProbe.periodSeconds }}
             failureThreshold: {{ .Values.webhook.readinessProbe.failureThreshold }}
@@ -352,6 +397,11 @@ spec:
             periodSeconds: {{ .Values.webhook.livenessProbe.periodSeconds }}
             failureThreshold: {{ .Values.webhook.livenessProbe.failureThreshold }}
       volumes:
+        {{- if (include "dynamic-config.installationDocument" .) }}
+        - name: installation
+          configMap:
+            name: {{ $fullname }}-installation
+        {{- end }}
         - name: tls
           secret:
             secretName: {{ $fullname }}-tls
@@ -378,6 +428,33 @@ spec:
   ports:
     - port: {{ .Values.webhook.service.port }}
       targetPort: {{ .Values.webhook.port }}
+      name: https
+    {{- if .Values.webhook.metrics.enabled }}
+    - port: {{ .Values.webhook.metrics.port }}
+      targetPort: metrics
+      name: metrics
+    {{- end }}
+{{- if and .Values.webhook.metrics.enabled .Values.webhook.metrics.serviceMonitor.enabled }}
+---
+{{/* Only where the Prometheus operator's CRD exists — hence opt-in
+     rather than a capability check, which would silently do nothing on a
+     cluster that installs the CRD later. */}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullname }}
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+    {{- with .Values.webhook.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+spec:
+  selector:
+    matchLabels: {{- include "dynamic-config.webhook.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.webhook.metrics.serviceMonitor.interval }}
+{{- end }}
 {{- if .Values.webhook.podDisruptionBudget.enabled }}
 ---
 apiVersion: policy/v1

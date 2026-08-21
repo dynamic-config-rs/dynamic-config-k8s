@@ -31,11 +31,28 @@ see annotations. Inside a gated namespace the per-pod
 [`examples/namespace-gating.yaml`](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/namespace-gating.yaml)
 is the ready-to-apply shape.
 
+## What the webhook writes back
+
+| annotation | value | meaning |
+|---|---|---|
+| `dynamic-config.rs/status` | `injected` | this pod has been through admission and carries the agent |
+
+**Written by the webhook, never by a pod.** A mutating webhook is not
+called once — `reinvocationPolicy: IfNeeded` asks the API server to call
+it again whenever a later webhook changes the pod, and some controllers
+resubmit a spec that has already been admitted. A marked pod is passed
+through untouched; without the mark, the second pass would add the agent
+again, and two containers with one name is a pod the API server refuses.
+
+A pod that sets this annotation to anything else is refused, with a
+message saying so. Setting it to `injected` by hand is a way of saying
+"do not inject me", which `inject: "false"` already says more clearly.
+
 ## Behaviour
 
 | annotation | default | meaning |
 |---|---|---|
-| `dynamic-config.rs/watch-seconds` | `15` | sidecar poll interval, whole seconds |
+| `dynamic-config.rs/watch-seconds` | `15` | how often the sidecar asks a store that must be asked, and how often it re-reads one that pushes; whole seconds. See [Watching](observability.md#watching) |
 | `dynamic-config.rs/section` | whole document | the section key the document nests under |
 | `dynamic-config.rs/native-sidecar` | `"false"` | `"true"` injects the watcher as an init container with `restartPolicy: Always` (Kubernetes 1.29+); [Jobs finish](security.md#native-sidecars) |
 | `dynamic-config.rs/volume-medium` | `memory` | where the rendered file lives: `memory` (tmpfs, off the node's disk) or `disk` |

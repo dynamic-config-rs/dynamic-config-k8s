@@ -7,5 +7,6 @@
 
 pub mod metrics;
 pub mod render;
+pub mod sidecar;
 pub mod sources;
 pub mod spec;

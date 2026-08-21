@@ -9,6 +9,182 @@ version — the contract is the API here.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-21
+
+### Changed
+
+- **The engine and store floors are 0.9**, and `serde` / `serde_json`
+  move to `1.0.228` / `1.0.149` behind them — the floors the engine's
+  own fold requires. Neither moves the MSRV, and nothing in the
+  annotation contract changes.
+
+- **The sidecar watches instead of polling.** The engine's 0.9 carries
+  a watch contract and every store answers it, so the agent uses the
+  mechanism each store actually has: a change in etcd, Consul, NATS,
+  Redis or a config server arrives as it happens rather than up to one
+  interval later, and a store that must be asked is asked the cheapest
+  question it offers — an S3 object is a `HEAD` rather than a
+  download every interval.
+
+  `--watch <seconds>` keeps its spelling and gains a second meaning:
+  the poll period for a store that must be asked, and the **resync**
+  period for one that pushes. The resync is not belt and braces. The
+  failure mode of a stream is silence — a subscription the broker
+  forgot, a connection that dropped without an error — and it looks
+  exactly like a store where nothing has changed.
+
+  A watch that ends is reopened, waited out with a spread, backing-off
+  pace rather than a tight loop against a store that is down.
+
+  `examples/watch-driven.yaml` is a pod on that path, with the resync
+  and the metrics port set and the gauge to alert on named.
+
+- **The operator elects a leader.** Replicas contend for a Lease and
+  only the holder reconciles; a leader that dies is replaced within the
+  lease's fifteen-second term. The ClusterRole has granted `leases`
+  since 0.1.0 and nothing used them, so two replicas both reconciled —
+  which on a bad day is two different documents landing in whichever
+  order the API server saw them. `operator.replicas` is a chart value,
+  with a PodDisruptionBudget that is applied only above one replica.
+
+- **A failed reconcile backs off.** Five seconds doubling to five
+  minutes, per object, spread — where it was a flat thirty seconds for
+  as long as a store stayed down, times every Render pointing at it.
+  A successful requeue is spread too: a hundred Renders created by one
+  `kubectl apply` used to come back to the store together, forever.
+
+### Fixed
+
+- **Admitting a pod twice injected the agent twice.** A mutating
+  webhook is not called once: `reinvocationPolicy: IfNeeded` asks the
+  API server to call it again whenever a later webhook changes the pod,
+  and some controllers resubmit a spec that has already been admitted.
+  The second pass added the agent again — two containers with one name,
+  which the API server refuses, so the pod never started and the error a
+  user saw was about a spec they did not write. The patch now marks the
+  pod (`dynamic-config.rs/status: injected`) and a marked pod is passed
+  through untouched. Found by reading the vault-agent-injector, which
+  has carried the same guard since it shipped.
+
+- **A pod that already used one of the injected container names was
+  patched into an invalid pod.** Same failure, from the other
+  direction. It is refused now, with the name to rename, and the
+  refusal carries its own `conflict` reason so it aggregates apart from
+  the other three.
+
+- **A minted certificate says how long it is good for** (security). The
+  `selfRotate` mode wrote the rotation schedule into an annotation it
+  read back, and left the certificate's own validity to the library
+  default — years. A pair replaced every day but valid for four years
+  is not a short-lived credential; it is a long-lived one that happens
+  to be replaced often, and a copy taken from a node stayed good long
+  after the rotation meant to retire it. Both the CA and the leaf now
+  carry explicit `notBefore`/`notAfter`, five minutes back for clock
+  skew.
+
+  **The CA outlives its leaf, by one full interval.** The caBundle
+  carries the new CA and the previous one so that leaves already
+  serving keep verifying while the kubelet catches up — and a CA that
+  expired with its leaf would have left that window trusting an
+  authority that was no longer valid, breaking the transition at
+  exactly the moment it exists to cover.
+
+- **The rotation lease is renewed while a rotation runs.** The term is
+  thirty seconds and a rotation is a mint plus two API patches — fast
+  until the API server is not, at which point a second replica could
+  take the lease and rotate on top of the first.
+
+- **The webhook stops building a Kubernetes client every fifteen
+  seconds.** One client for the life of the process; the old one
+  re-read the service account token, rebuilt its TLS configuration and
+  opened a new connection four times a minute, for a loop whose usual
+  answer is "not yet".
+
+- **The operator no longer parks its reactor on a network call.** A
+  Class edit re-renders everything referencing it, and working out what
+  that is meant listing the API from inside a synchronous mapper —
+  `block_on`, once per class event, with every other reconcile waiting
+  behind it. The controller's own reflector already holds those
+  objects; reading it is a lock and a filter.
+
+### Added
+
+- **The installation can be written as YAML instead of as a grammar.**
+  Everything an installation sets reaches the webhook as a string,
+  because that is what an environment variable is — and several of
+  those strings were little grammars
+  (`"vault: overridable=false, endpoint=…; s3: file-mode=0640?"`). Fine
+  to parse, unpleasant to write.
+
+  `agent.defaults.perStore` and the three gates now take a **map** as
+  well as a string. A map travels to the pod as a mounted ConfigMap and
+  is rendered to the grammar *there*, by the same parser the string
+  goes through — so there is one set of rules, one set of messages, and
+  two spellings that cannot mean different things. An unknown setting
+  is refused at startup rather than ignored, and a variable set on the
+  container still wins over the document.
+
+  **Kustomize gets the same thing**, which is why the document exists
+  rather than a chart-side rendering: a base has no template engine, so
+  a hand-written ConfigMap is the only structured form it can hand
+  over. `deploy/kustomize/base/installation.yaml` ships empty and
+  commented.
+
+  The webhook reads it through its own engine — the YAML reader it
+  gives applications is the one it reads its own configuration with.
+
+- **Metrics the agent's failure modes are visible in**: deliveries and
+  resyncs told apart (deliveries flat while resyncs climb *is* the
+  stalled stream), `watch_connected`, reconnects, and a
+  **staleness gauge** — seconds since the store was last read
+  successfully, which is the number an alert fires on. Operator-side, a
+  reconcile duration histogram and a failure counter.
+
+- **Probes.** `/healthz` and `/readyz` on the port that was already
+  serving metrics, so a deployment does not have to write an `exec`
+  probe that shells out — and the operator's chart wires both.
+
+- **The webhook's readiness means what it says.** `/readyz` is split
+  from `/healthz` and answers 503 until a certificate this process can
+  serve with is loaded. In `selfRotate` mode that is false for the
+  first minute, and a replica reporting Ready without one is a replica
+  the Service sends admissions to that cannot finish a handshake —
+  which the API server reports as every pod creation failing.
+
+- **Admission latency, as a histogram.** The webhook sits in the path
+  of every pod creation in the cluster, and the API server's own
+  ten-second timeout turns a slow admission into a refused one — so
+  the question is what the tail does, which only a histogram answers.
+  Beside it: patch bytes written, and refusals **labelled by kind** —
+  a store the installation does not allow, a pinned value being
+  overridden, and a malformed annotation are three different pages.
+  The kind is a `status.reason` the refusal carries, not something a
+  scrape works out by reading the English.
+
+- **Metrics on a port of their own** (`webhook.metrics`, on by
+  default), with an opt-in ServiceMonitor. They were served over the
+  admission port, which is mutual TLS against a CA the webhook mints
+  for itself — so scraping them meant handing Prometheus a client
+  certificate from that CA, and a deployment that did not simply had
+  no metrics. The admission port still answers `/metrics`, so an
+  existing scrape keeps working.
+
+- **Rotation is visible**: a rotation counter and an expiry gauge. The
+  pair a scrape wants — a counter that should climb on a schedule, and
+  a wall-clock second that should always be in the future.
+
+### CI
+
+- **One Dockerfile, one dependency build, three images.** The three
+  were byte-identical files that each did `COPY . .` into a fresh
+  `cargo build`, so every image compiled the whole workspace's
+  dependencies from nothing. `cargo-chef` cooks the dependency graph on
+  a layer of its own and the three binaries share it, a `.dockerignore`
+  keeps `target/` out of the build context, and the nightly e2e ladder
+  builds the images **once per run** and hands the legs a tarball
+  instead of rebuilding all three per leg. Release builds gain a buildx
+  cache, where the arm64-under-QEMU half gains most.
+
 ### Added
 
 - **The whole contract is installable, and any value can be pinned**:

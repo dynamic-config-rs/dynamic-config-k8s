@@ -112,3 +112,39 @@ key: {{ $cert.Key | b64enc }}
 ca: {{ $ca.Cert | b64enc }}
 {{- end -}}
 {{- end }}
+
+{{/*
+The installation document, or nothing.
+
+Every setting an installation makes reaches the webhook as a string,
+because that is what an environment variable is — and several of those
+strings are little grammars. A values file has YAML already, so these
+may be written as maps instead, and the map travels to the pod as a
+document rather than being flattened into a grammar here.
+
+Emits nothing when every one of them is a string (or unset), which is
+what the callers test for: no map, no ConfigMap, no mount, no variable.
+*/}}
+{{- define "dynamic-config.installationDocument" -}}
+{{- $document := dict -}}
+{{- if and .Values.agent.defaults.perStore (not (kindIs "string" .Values.agent.defaults.perStore)) -}}
+{{- $stores := dict -}}
+{{- range $store, $knobs := .Values.agent.defaults.perStore -}}
+{{- if not (kindIs "string" $knobs) -}}
+{{- $_ := set $stores $store $knobs -}}
+{{- end -}}
+{{- end -}}
+{{- if $stores -}}
+{{- $_ := set $document "storeDefaults" $stores -}}
+{{- end -}}
+{{- end -}}
+{{- range $key := list "agentEnvAllow" "sourceAllow" "sourceDeny" -}}
+{{- $value := index $.Values.webhook $key -}}
+{{- if and $value (not (kindIs "string" $value)) -}}
+{{- $_ := set $document $key $value -}}
+{{- end -}}
+{{- end -}}
+{{- if $document -}}
+{{- toYaml $document -}}
+{{- end -}}
+{{- end -}}

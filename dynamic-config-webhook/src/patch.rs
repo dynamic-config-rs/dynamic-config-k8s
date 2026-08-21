@@ -37,6 +37,16 @@ fn agent_pull_secret() -> Option<&'static str> {
 }
 
 /// The whole webhook: a review's response, allowed or patched or refused.
+/// The `status.reason` slugs a refusal carries.
+///
+/// Stable: a scrape aggregates on them, so they are part of what this
+/// webhook promises rather than wording that can be improved.
+pub const POLICY: &str = "DynamicConfigPolicy";
+pub const PINNED: &str = "DynamicConfigPinned";
+pub const MALFORMED: &str = "DynamicConfigMalformed";
+/// The pod's own spec collides with what the injection has to add.
+pub const CONFLICT: &str = "DynamicConfigConflict";
+
 pub fn admission_response(review: &Value) -> Value {
     admission_response_with(review, annotations::installation())
 }
@@ -65,12 +75,17 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
                 .and_then(Value::as_str)
                 .unwrap_or_default();
 
-            let refuse = |message: String| {
+            // The refusal carries a machine-readable `reason` beside the
+            // sentence a person reads. `metav1.Status` has the field, and
+            // the alternative — a scrape working out which kind of refusal
+            // this was by reading the English — is a metric that goes
+            // quietly wrong the first time a message is reworded.
+            let refuse = |reason: &str, message: String| {
                 respond(
                     uid,
                     json!({
                         "allowed": false,
-                        "status": { "message": message, "code": 400 },
+                        "status": { "message": message, "code": 400, "reason": reason },
                     }),
                 )
             };
@@ -82,13 +97,16 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
 
             for source in sources {
                 if install.source_denied(namespace, source) {
-                    return refuse(format!(
-                        "source {source} is turned off in namespace \
+                    return refuse(
+                        POLICY,
+                        format!(
+                            "source {source} is turned off in namespace \
                          {namespace:?} by this installation \
                          (webhook.sourceDeny in the chart; the \
                          DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY variable, for \
                          kustomize)"
-                    ));
+                        ),
+                    );
                 }
 
                 if !install.source_allowed(namespace, source) {
@@ -99,13 +117,16 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
                         format!("allowed here: {permitted}")
                     };
 
-                    return refuse(format!(
-                        "source {source} is not on this installation's \
+                    return refuse(
+                        POLICY,
+                        format!(
+                            "source {source} is not on this installation's \
                          allowlist for namespace {namespace:?} — {here} \
                          (webhook.sourceAllow in the chart; the \
                          DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW variable, for \
                          kustomize)"
-                    ));
+                        ),
+                    );
                 }
             }
 
@@ -118,16 +139,36 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
                         format!("allowed here: {permitted}")
                     };
 
-                    return refuse(format!(
-                        "{}agent-env sets {name}, and this installation \
+                    return refuse(
+                        POLICY,
+                        format!(
+                            "{}agent-env sets {name}, and this installation \
                          does not allow it in namespace {namespace:?} — \
                          {here}. The gate belongs to whoever installed \
                          the webhook: webhook.agentEnvAllow in the chart \
                          (the DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW \
                          variable, for kustomize)",
-                        annotations::PREFIX
-                    ));
+                            annotations::PREFIX
+                        ),
+                    );
                 }
+            }
+
+            // A name this injection has to add, that the pod already
+            // uses, produces two containers with one name — which the API
+            // server refuses, so the pod never starts and the failure
+            // looks nothing like its cause. Refused here instead, where
+            // the message can name the container to rename.
+            if let Some(taken) = collides(pod, &request) {
+                return refuse(
+                    CONFLICT,
+                    format!(
+                        "this pod already has a container called {taken:?}, and the \
+                         injection needs that name — rename yours, or set \
+                         {}inject to \"false\" on this pod",
+                        annotations::PREFIX
+                    ),
+                );
             }
 
             let patches = patches_for(pod, &request);
@@ -142,13 +183,26 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
                 }),
             )
         }
-        Err(reason) => respond(
-            uid,
-            json!({
-                "allowed": false,
-                "status": { "message": reason, "code": 400 },
-            }),
-        ),
+        // Everything the annotation parser refuses: a value that is not
+        // the shape it has to be, or one the installation pinned. Both are
+        // the pod author's to fix, and they are told apart because they
+        // are different conversations — one is a typo, the other is
+        // somebody working around the installation.
+        Err(reason) => {
+            let kind = if reason.contains(annotations::PINS) {
+                PINNED
+            } else {
+                MALFORMED
+            };
+
+            respond(
+                uid,
+                json!({
+                    "allowed": false,
+                    "status": { "message": reason, "code": 400, "reason": kind },
+                }),
+            )
+        }
     }
 }
 
@@ -162,11 +216,75 @@ fn respond(uid: &str, mut response: Value) -> Value {
     })
 }
 
+/// The first container name the injection needs that the pod already has.
+///
+/// Both lists, because a name is unique across `containers` *and*
+/// `initContainers` — a native sidecar is an init container with a
+/// restart policy, so the two halves of a `both` render can collide with
+/// either.
+fn collides(pod: &Value, request: &annotations::Request) -> Option<String> {
+    let mut wanted = vec![
+        "dynamic-config-agent".to_owned(),
+        "dynamic-config-init".to_owned(),
+    ];
+
+    for (index, _) in request.extra.iter().enumerate() {
+        let n = index + 1;
+
+        wanted.push(format!("dynamic-config-agent-{n}"));
+        wanted.push(format!("dynamic-config-init-{n}"));
+    }
+
+    for list in ["/spec/containers", "/spec/initContainers"] {
+        let Some(containers) = pod.pointer(list).and_then(Value::as_array) else {
+            continue;
+        };
+
+        for container in containers {
+            let Some(name) = container.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+
+            if wanted.iter().any(|taken| taken == name) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+
+    None
+}
+
 /// The JSONPatch that injects the agent: a shared `emptyDir`, a mount on
 /// every existing container, and the agent as init container, sidecar,
 /// or both.
 pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
     let mut patches = Vec::new();
+
+    // 0. The mark that says this pod has been through here.
+    //
+    // A mutating webhook is not called once: `reinvocationPolicy:
+    // IfNeeded` asks the API server to call it again whenever a later
+    // webhook changes the pod, and some controllers resubmit a spec that
+    // has already been admitted. Without this, the second pass adds the
+    // agent a second time — two containers with one name, which the API
+    // server refuses, so the pod never starts.
+    //
+    // First in the list because the ordering of a JSON patch is the
+    // ordering of its effects, and the annotation map has to exist before
+    // a key can be added to it.
+    if pod.pointer("/metadata/annotations").is_none() {
+        patches.push(json!({ "op": "add", "path": "/metadata/annotations", "value": {} }));
+    }
+
+    patches.push(json!({
+        "op": "add",
+        // `~1` is a literal `/` in a JSON pointer: the key is
+        // `dynamic-config.rs/status`, not a path with two steps.
+        "path": format!("/metadata/annotations/{}{}",
+                        annotations::PREFIX.replace('/', "~1"),
+                        annotations::STATUS),
+        "value": annotations::INJECTED,
+    }));
 
     // 1. The volume the rendered file lives on.
     let has_volumes = pod.pointer("/spec/volumes").is_some();

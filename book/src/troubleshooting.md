@@ -41,6 +41,46 @@ request: dynamic-config.rs/inject is true, so dynamic-config.rs/path is required
 Silently starting without configuration is the failure mode this
 refusal exists to prevent; add the named annotation.
 
+## "container name is duplicated" from the API server
+
+```text
+Error creating: Pod "app" is invalid: spec.containers[2].name:
+Duplicate value: "dynamic-config-agent"
+```
+
+Your pod already has a container by a name the injection needs. The
+webhook refuses that now, with the name to rename:
+
+```text
+admission webhook "inject.dynamic-config.rs" denied the request: this pod
+already has a container called "dynamic-config-agent", and the injection
+needs that name — rename yours, or set dynamic-config.rs/inject to "false"
+```
+
+Seeing the API server's version of it instead means a webhook older than
+0.2.0 patched the pod. Upgrade, or rename the container.
+
+The injected names are `dynamic-config-agent` and
+`dynamic-config-init`, plus `-1`, `-2`… for each
+[named render](rendering.md).
+
+## The same pod was injected twice
+
+Two `dynamic-config-agent` containers in a pod nobody wrote twice is
+admission running twice. It happens with
+`webhook.reinvocationPolicy: IfNeeded`, which asks the API server to
+call this webhook again whenever a *later* webhook changes the pod, and
+with controllers that resubmit an already-admitted spec.
+
+Since 0.2.0 the patch marks the pod — `dynamic-config.rs/status:
+injected` — and a marked pod is passed through untouched. If you are
+seeing this, check the webhook image is 0.2.0 or later:
+
+```sh
+kubectl -n dynamic-config get deploy dynamic-config-webhook \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
+
 ## 401/403 from the store
 
 The token travels in `DYNAMIC_CONFIG_AGENT_TOKEN`, not in annotations.
@@ -121,6 +161,23 @@ In order of likelihood:
    ```sh
    kubectl logs -n <chart-namespace> deploy/dynamic-config-webhook | tail
    ```
+
+## The webhook pod refuses to start: an installation setting
+
+```text
+dynamic-config-webhook: /etc/dynamic-config/installation.yaml:
+"watchSecnods" is not an installation setting; the ones there are:
+cpuRequest, memoryRequest, …, sourceDeny
+```
+
+A typo in the mounted installation document, refused at startup rather
+than ignored — a default that silently never applied is a fleet running
+without the posture somebody thought they had set. Fix the key in
+`agent.defaults` / `webhook.*` (chart) or in
+`base/installation.yaml` (kustomize).
+
+The same check covers shapes: a store's settings are a map, a gate's
+namespaces map to lists, and a setting is a word, a number or a boolean.
 
 ## The webhook pod refuses to start: "no TLS material"
 

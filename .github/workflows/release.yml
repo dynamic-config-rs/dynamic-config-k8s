@@ -128,11 +128,18 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          file: docker/Dockerfile.${{ matrix.component }}
+          file: docker/Dockerfile
+          target: ${{ matrix.component }}
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
           sbom: true
+          # The arm64 half of this runs under QEMU, where a dependency
+          # build is minutes rather than seconds. The cache is scoped per
+          # component so three concurrent matrix legs do not overwrite
+          # each other's entry.
+          cache-from: type=gha,scope=image-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.component }}
           tags: |
             ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:v${{ needs.decide.outputs.version }}
             ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:latest
@@ -184,6 +191,16 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # cosign reads the DOCKER config, and `helm registry login` writes
+      # helm's own — which is why the push succeeded and the signature
+      # that followed it was refused as unauthenticated. Both logins, or
+      # a chart nobody can verify.
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: package and push the chart
         id: push

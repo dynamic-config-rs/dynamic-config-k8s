@@ -41,8 +41,8 @@ repository's guarantees; see its SECURITY.md and the book's
 
 | Version | Supported |
 |---|---|
-| 0.1.x images/chart | ✅ the latest |
-| — | nothing older exists |
+| 0.2.x images/chart | ✅ the latest |
+| ≤ 0.1 | — end of life |
 
 Security fixes land on the **latest release** and nothing is
 backported before 1.0: when a release ships, every prior release is

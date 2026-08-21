@@ -1,0 +1,61 @@
+# The installation, as YAML rather than as a grammar.
+#
+# Every setting an installation makes reaches the webhook as a string,
+# because that is what an environment variable is — and several of those
+# strings are little grammars:
+#
+#   DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS="vault: overridable=false, endpoint=https://vault:8200"
+#   DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW="payments: vault, s3; *: consul"
+#
+# Fine to parse and unpleasant to write. This ConfigMap is the same
+# settings written the way you already write Kubernetes — and the webhook
+# renders it to that grammar itself, so both spellings go through one
+# parser with one set of rules and one set of messages.
+#
+# A variable set on the container still wins: a document is the
+# installation written down, a variable is somebody standing in front of
+# it for this deployment.
+#
+# Empty by default. Uncomment what you need; an unknown setting is
+# refused at startup rather than ignored.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamic-config-webhook-installation
+  namespace: dynamic-config
+data:
+  installation.yaml: |
+    # Fleet-wide defaults, applied to every injected agent.
+    #
+    #   mode: sidecar
+    #   watchSeconds: 30
+    #   fileMode: "0640"
+    #   nativeSidecar: true
+    #   volumeMedium: memory
+    #   metricsPort: 9102
+    #
+    # Per store, which outranks the fleet tier. `overridable: false`
+    # pins everything that store sets; a trailing "!" pins one value and
+    # a trailing "?" opens one.
+    #
+    #   storeDefaults:
+    #     vault:
+    #       overridable: false
+    #       endpoint: https://vault.vault.svc:8200
+    #       auth: kubernetes
+    #       watch-seconds: 30
+    #     s3:
+    #       agent-memory-limit: 128Mi
+    #
+    # The gates. A map of namespace to the names allowed there; "*" is
+    # every namespace. Empty means the annotation is refused everywhere,
+    # which for `agentEnvAllow` is the default.
+    #
+    #   agentEnvAllow:
+    #     payments: [HTTPS_PROXY, "AWS_*"]
+    #     "*": [RUST_LOG]
+    #   sourceAllow:
+    #     payments: [vault, s3]
+    #     "*": [consul]
+    #   sourceDeny:
+    #     sandbox: [git]

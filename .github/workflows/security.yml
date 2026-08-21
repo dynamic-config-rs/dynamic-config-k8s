@@ -37,10 +37,11 @@ jobs:
           echo "SECURITY.md names ${line} — current"
 
   # deny, the unsafe sweep and dependency review are the org's shared
-  # definition; `@main` becomes `@v1` when the .github repository is
-  # first tagged. The operator has no lib.rs, so it rides the `bins`
-  # input; the agent and webhook appear in both — their libraries and
-  # their binaries each carry the forbid.
+  # definition, pinned to the `v1` tag rather than to `main`: a shared
+  # workflow on a branch is every repository in the org running whatever
+  # was pushed there last. The operator has no lib.rs, so it rides the
+  # `bins` input; the agent and webhook appear in both — their libraries
+  # and their binaries each carry the forbid.
   shared:
     # The caller's grant must COVER every permission a called job asks
     # for — the callee's dependency review comments on pull requests,
@@ -50,7 +51,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: dynamic-config-rs/.github/.github/workflows/reusable-security-rust.yml@main
+    uses: dynamic-config-rs/.github/.github/workflows/reusable-security-rust.yml@v1
     with:
       crates: dynamic-config-agent dynamic-config-webhook
       bins: dynamic-config-agent dynamic-config-webhook dynamic-config-operator

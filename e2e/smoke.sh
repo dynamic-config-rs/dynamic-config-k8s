@@ -18,7 +18,12 @@ kind create cluster --name "$cluster" --wait 120s
 
 trap 'kind delete cluster --name "$cluster"; rm -f "$KUBECONFIG"' EXIT
 
-just images
+# CI builds the three images once for the whole run and hands them over
+# as a tarball; a local run builds them here. Either way what follows
+# loads `:dev` tags into kind.
+if [[ "${IMAGES_PRELOADED:-0}" != "1" ]]; then
+  just images
+fi
 kind load docker-image --name "$cluster" \
   dynamic-config-agent:dev dynamic-config-webhook:dev
 

@@ -10,3 +10,9 @@ spec:
   ports:
     - port: 443
       targetPort: 8443
+      name: https
+    # Named, so a ServiceMonitor or a relabel rule can keep it by name
+    # rather than by number.
+    - port: 9091
+      targetPort: metrics
+      name: metrics

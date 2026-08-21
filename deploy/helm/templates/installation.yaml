@@ -1,0 +1,23 @@
+{{- $document := include "dynamic-config.installationDocument" . -}}
+{{- if $document }}
+{{/*
+  The installation, as the document somebody wrote rather than as the
+  grammar it would otherwise be flattened into. The webhook reads it
+  through its own engine — the same YAML reader it gives applications —
+  and renders it to that grammar itself, so both spellings go through
+  one parser with one set of rules and one set of messages.
+
+  A kustomize base has no template engine and writes this ConfigMap by
+  hand; that is the whole reason the document exists rather than a
+  chart-side rendering.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-installation
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+data:
+  installation.yaml: |
+{{ $document | indent 4 }}
+{{- end }}

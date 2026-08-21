@@ -23,6 +23,34 @@
 
 use serde_json::Value;
 
+/// The phrase every pin refusal carries, and the one thing that tells a
+/// pin apart from a malformed value.
+///
+/// **It lives here because the messages do.** A refusal is a sentence a
+/// pod's author reads, and the alternative to one shared phrase was
+/// threading a second, machine-readable enum through sixty-six refusal
+/// sites — or working the answer out somewhere else by reading the
+/// English, which goes quietly wrong the first time a message is
+/// reworded. A test walks every pin path and asserts the phrase survives.
+pub(crate) const PINS: &str = "the installation pins";
+
+/// The mark an injection leaves on the pod it patched.
+///
+/// **An injection has to be idempotent, and a mutating webhook is not
+/// called once.** `reinvocationPolicy: IfNeeded` asks the API server to
+/// call this webhook again whenever a *later* webhook changes the pod, and
+/// some controllers resubmit a spec that has already been through
+/// admission. Without a mark, the second pass adds the agent a second
+/// time — two containers with one name, which the API server refuses, so
+/// the pod never starts at all.
+///
+/// This is the vault-agent-injector's `agent-inject-status: injected`
+/// under another name, and for the same reason.
+pub const STATUS: &str = "status";
+
+/// What [`STATUS`] is set to once a pod has been patched.
+pub const INJECTED: &str = "injected";
+
 pub const PREFIX: &str = "dynamic-config.rs/";
 
 /// Where the CA configmap and the ssh-key secret land in the agent
@@ -694,8 +722,23 @@ impl Installation {
         })
     }
 
+    /// The installation as this process was given it: the environment,
+    /// over the mounted document if there is one.
+    ///
+    /// **The environment wins.** A document is the installation written
+    /// down once, in a values file or a ConfigMap; a variable is somebody
+    /// standing in front of it for this deployment, which is the more
+    /// specific statement of the two — the same rule the layers below
+    /// follow.
     fn from_environment() -> Result<Self, String> {
-        Self::from_lookup(&|name| std::env::var(name).ok())
+        let mounted = crate::installation_file::read(&document_path())?;
+
+        Self::from_lookup(&|name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .or_else(|| mounted.get(name).cloned())
+        })
     }
 
     fn store(&self, source: Option<&str>) -> Option<&KnobDefaults> {
@@ -830,6 +873,17 @@ impl Installation {
 /// here — the chart cannot validate an env var a kustomize patch set,
 /// so the process door is the one gate every install path walks
 /// through.
+/// Where a mounted installation document lives.
+///
+/// A path rather than a fixed mount so that a chart, a kustomize base and
+/// a test can each put it where they want; absent means there is none,
+/// which is an ordinary installation.
+fn document_path() -> std::path::PathBuf {
+    std::env::var("DYNAMIC_CONFIG_WEBHOOK_DEFAULTS_FILE")
+        .unwrap_or_else(|_| "/etc/dynamic-config/installation.yaml".to_owned())
+        .into()
+}
+
 pub fn verify_installation() -> Result<(), String> {
     Installation::from_environment().map(|_| ())
 }
@@ -988,6 +1042,22 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
             .and_then(Value::as_str)
     };
 
+    // Before anything else, including the shape checks: a pod this
+    // webhook has already patched is not a pod to patch again, and it is
+    // not a pod to refuse either — the first pass already decided, and
+    // repeating that decision is the whole of what this guard is for.
+    match get(STATUS) {
+        None => {}
+        Some(INJECTED) => return Ok(None),
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}{STATUS} is {other:?}, and it is not a pod's to set: \
+                 this webhook writes it as {INJECTED:?} on a pod it has \
+                 patched, so that a second admission does not patch it again"
+            ))
+        }
+    }
+
     match get("inject") {
         Some("true") => {}
         Some("false") | None => return Ok(None),
@@ -1004,6 +1074,9 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // territory, and an unknown key in it fails the admission.
     const KNOWN: &[&str] = &[
         "inject",
+        // Written by this webhook, never by a pod's author — a value
+        // other than `injected` is refused below rather than ignored.
+        STATUS,
         "source",
         "endpoint",
         "endpoint-secret",
