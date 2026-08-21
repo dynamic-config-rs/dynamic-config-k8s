@@ -21,7 +21,7 @@
 # Trivy scan exists to notice.
 #
 # Build one:  docker build -f docker/Dockerfile --target agent -t agent:dev .
-FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS chef
+FROM rust:1.97-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS chef
 WORKDIR /src
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler \
