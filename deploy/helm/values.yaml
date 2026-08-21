@@ -84,25 +84,74 @@ agent:
     # "!" pins one value, "?" opens one value, and "overridable=false"
     # inside a group pins everything THAT store sets — the ladder is
     # per-value marker > per-store overridable > the flag above.
+    # Each store's settings are a **map** — which is what you are already
+    # writing — or the equivalent grammar as one string, which is what an
+    # environment variable can carry and what this used to take.
+    #
     #   perStore:
-    #     vault: "overridable=false, endpoint=https://vault.vault.svc:8200, auth=kubernetes, watch-seconds=30?"
+    #     vault:
+    #       overridable: false
+    #       endpoint: https://vault.vault.svc:8200
+    #       auth: kubernetes
+    #       watch-seconds: 30
+    #     s3:
+    #       agent-memory-limit: 128Mi
+    #
+    # The string form still works, per store:
+    #
+    #   perStore:
     #     s3: "agent-memory-limit=128Mi"
-    perStore: {}
+    #
+    # A map travels to the pod as a mounted document and is rendered to
+    # the grammar there, by the same parser the string goes through — so
+    # the two spellings cannot mean different things.
+    # Empty *string*, not an empty map, and the difference is not
+    # cosmetic: helm refuses to overwrite a table with a non-table, so a
+    # `{}` default makes the string form above impossible to set from a
+    # values file — while a `""` default takes either, because a map
+    # overwrites a string happily.
+    perStore: ""
 
 # ── The webhook ──────────────────────────────────────────────────────
 webhook:
+  metrics:
+    # A plain-HTTP port for scraping, beside the mutual-TLS admission
+    # port. The admission port still answers /metrics, so a scrape
+    # already configured against it keeps working.
+    enabled: true
+    port: 9091
+    serviceMonitor:
+      # Only rendered where the Prometheus operator's CRD exists.
+      enabled: false
+      interval: 30s
+      labels: {}
   # Which `agent-env` variable names pods may set on their injected
   # agents, and where. Empty = the annotation is refused everywhere.
   # Grammar: semicolons between groups, an optional `namespace:` head
   # on each (absent or `*` = every namespace), commas between names,
   # a trailing `*` on a name is a prefix glob. The webhook validates
   # this at startup and refuses to serve on a typo.
+  # A **map** of namespace to the names allowed there, or the grammar as
+  # one string. `"*"` is every namespace.
+  #
+  #   agentEnvAllow:
+  #     payments: [HTTPS_PROXY, "AWS_*"]
+  #     "*": [RUST_LOG]
+  #
   #   agentEnvAllow: "payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"
   agentEnvAllow: ""
   # Which STORES pods may use, and where — same grammar, names from
   # the source list. Empty = every store, everywhere; non-empty = ONLY
   # the listed. `sourceDeny` is the subtractive twin and outranks the
   # allowlist. Both validated at webhook startup.
+  #   sourceAllow:
+  #     payments: [vault, s3]
+  #     "*": [consul]
+  #   sourceDeny:
+  #     sandbox: [git]
+  #
+  # Or, as one string each:
+  #
   #   sourceAllow: "payments: vault, s3; *: consul"
   #   sourceDeny: "sandbox: git"
   sourceAllow: ""
@@ -235,6 +284,18 @@ networkPolicy:
 # ── The operator (optional; the CRDs install either way) ─────────────
 operator:
   enabled: false
+  # Spare capacity, not throughput: the replicas contend for a Lease and
+  # only the holder reconciles. Two means a leader that dies is replaced
+  # within the lease's fifteen-second term rather than when the kubelet
+  # gets round to restarting the pod.
+  replicas: 1
+  podDisruptionBudget:
+    # Only applied above one replica. A budget over a single replica
+    # blocks every node drain in the cluster, which is a worse outage
+    # than the one it prevents.
+    enabled: true
+    spec:
+      minAvailable: 1
   image: ghcr.io/dynamic-config-rs/dynamic-config-operator
   tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""

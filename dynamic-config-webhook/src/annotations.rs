@@ -23,6 +23,34 @@
 
 use serde_json::Value;
 
+/// The phrase every pin refusal carries, and the one thing that tells a
+/// pin apart from a malformed value.
+///
+/// **It lives here because the messages do.** A refusal is a sentence a
+/// pod's author reads, and the alternative to one shared phrase was
+/// threading a second, machine-readable enum through sixty-six refusal
+/// sites — or working the answer out somewhere else by reading the
+/// English, which goes quietly wrong the first time a message is
+/// reworded. A test walks every pin path and asserts the phrase survives.
+pub(crate) const PINS: &str = "the installation pins";
+
+/// The mark an injection leaves on the pod it patched.
+///
+/// **An injection has to be idempotent, and a mutating webhook is not
+/// called once.** `reinvocationPolicy: IfNeeded` asks the API server to
+/// call this webhook again whenever a *later* webhook changes the pod, and
+/// some controllers resubmit a spec that has already been through
+/// admission. Without a mark, the second pass adds the agent a second
+/// time — two containers with one name, which the API server refuses, so
+/// the pod never starts at all.
+///
+/// This is the vault-agent-injector's `agent-inject-status: injected`
+/// under another name, and for the same reason.
+pub const STATUS: &str = "status";
+
+/// What [`STATUS`] is set to once a pod has been patched.
+pub const INJECTED: &str = "injected";
+
 pub const PREFIX: &str = "dynamic-config.rs/";
 
 /// Where the CA configmap and the ssh-key secret land in the agent
@@ -694,8 +722,28 @@ impl Installation {
         })
     }
 
+    /// The installation as this process was given it: the environment,
+    /// over the mounted document if there is one.
+    ///
+    /// **The environment wins.** A document is the installation written
+    /// down once, in a values file or a ConfigMap; a variable is somebody
+    /// standing in front of it for this deployment, which is the more
+    /// specific statement of the two — the same rule the layers below
+    /// follow.
     fn from_environment() -> Result<Self, String> {
-        Self::from_lookup(&|name| std::env::var(name).ok())
+        let mounted = crate::installation_file::read(&document_path())?;
+
+        // **Set-and-empty is an answer, not an absence.** An empty
+        // `..._AGENT_ENV_ALLOW` means *allow nothing*, which is exactly
+        // what somebody reaches for to revoke what a document granted —
+        // and treating it as unset handed the document back, inverting
+        // the precedence this function exists to state. Only a variable
+        // that is not set at all falls through.
+        Self::from_lookup(&|name| {
+            std::env::var(name)
+                .ok()
+                .or_else(|| mounted.get(name).cloned())
+        })
     }
 
     fn store(&self, source: Option<&str>) -> Option<&KnobDefaults> {
@@ -830,6 +878,17 @@ impl Installation {
 /// here — the chart cannot validate an env var a kustomize patch set,
 /// so the process door is the one gate every install path walks
 /// through.
+/// Where a mounted installation document lives.
+///
+/// A path rather than a fixed mount so that a chart, a kustomize base and
+/// a test can each put it where they want; absent means there is none,
+/// which is an ordinary installation.
+fn document_path() -> std::path::PathBuf {
+    std::env::var("DYNAMIC_CONFIG_WEBHOOK_DEFAULTS_FILE")
+        .unwrap_or_else(|_| "/etc/dynamic-config/installation.yaml".to_owned())
+        .into()
+}
+
 pub fn verify_installation() -> Result<(), String> {
     Installation::from_environment().map(|_| ())
 }
@@ -970,6 +1029,31 @@ pub fn of_pod(pod: &Value) -> Result<Option<Request>, String> {
     of_pod_with(pod, installation())
 }
 
+/// Whether the pod already carries what an injection puts there.
+///
+/// The agent's container, under either of the two names it takes: the
+/// sidecar's and the init container's. Checked rather than trusted,
+/// because the mark that says "already injected" travels with a copied
+/// manifest and the containers do not.
+fn already_injected(pod: &Value) -> bool {
+    let named = |list: Option<&Vec<Value>>| {
+        list.is_some_and(|containers| {
+            containers.iter().any(|container| {
+                matches!(
+                    container.pointer("/name").and_then(Value::as_str),
+                    Some("dynamic-config-agent" | "dynamic-config-init")
+                )
+            })
+        })
+    };
+
+    named(pod.pointer("/spec/containers").and_then(Value::as_array))
+        || named(
+            pod.pointer("/spec/initContainers")
+                .and_then(Value::as_array),
+        )
+}
+
 /// [`of_pod`] with the installation made explicit — the server feeds
 /// its own; tests construct theirs through
 /// [`Installation::from_lookup`].
@@ -988,6 +1072,33 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
             .and_then(Value::as_str)
     };
 
+    // Before anything else, including the shape checks: a pod this
+    // webhook has already patched is not a pod to patch again, and it is
+    // not a pod to refuse either — the first pass already decided, and
+    // repeating that decision is the whole of what this guard is for.
+    match get(STATUS) {
+        None => {}
+        // The mark says a previous pass patched this pod. Believed only
+        // when the patch is *there*: a manifest copied out of a cluster
+        // and applied elsewhere — `kubectl get pod -o yaml | kubectl apply
+        // -f -` — carries the mark without the containers, and this guard
+        // was the only thing between that pod and running with no
+        // configuration at all, silently.
+        Some(INJECTED) if already_injected(pod) => return Ok(None),
+        Some(INJECTED) => {
+            return Err(format!(
+                "{PREFIX}{STATUS} is {INJECTED:?} but this pod carries no                  injected container: the mark is this webhook's to write,                  and a pod copied from another cluster keeps the mark                  without what it stood for"
+            ))
+        }
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}{STATUS} is {other:?}, and it is not a pod's to set: \
+                 this webhook writes it as {INJECTED:?} on a pod it has \
+                 patched, so that a second admission does not patch it again"
+            ))
+        }
+    }
+
     match get("inject") {
         Some("true") => {}
         Some("false") | None => return Ok(None),
@@ -1004,6 +1115,9 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // territory, and an unknown key in it fails the admission.
     const KNOWN: &[&str] = &[
         "inject",
+        // Written by this webhook, never by a pod's author — a value
+        // other than `injected` is refused below rather than ignored.
+        STATUS,
         "source",
         "endpoint",
         "endpoint-secret",

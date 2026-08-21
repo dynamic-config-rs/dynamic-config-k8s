@@ -1608,3 +1608,190 @@ fn a_store_can_pin_its_own_group() {
         .unwrap();
     assert_eq!(request.watch_seconds, 30);
 }
+
+// ---------------------------------------------------------------------------
+// What a refusal says about itself
+// ---------------------------------------------------------------------------
+
+/// A refusal carries a machine-readable `reason` beside its sentence.
+///
+/// A scrape aggregates on it, so it is part of what this webhook promises.
+/// The three paths are three different conversations: a store the
+/// installation does not allow is a deployment being wrong, a pinned value
+/// being overridden is somebody working around the installation, and a
+/// malformed annotation is a typo.
+#[test]
+fn a_refusal_says_which_kind_it_is() {
+    let review = |pod: serde_json::Value| {
+        serde_json::json!({
+            "request": { "uid": "u", "namespace": "team-a", "object": pod },
+        })
+    };
+    let reason = |response: &serde_json::Value| {
+        response
+            .pointer("/response/status/reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    // Policy: a store this installation does not allow here.
+    let denied = install(&[("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", "vault")]);
+    let response =
+        dynamic_config_webhook::admission_response_with(&review(vault_kubernetes_pod()), &denied);
+
+    assert_eq!(reason(&response), dynamic_config_webhook::POLICY);
+
+    // Pinned: a value the installation fixed, overridden by a pod.
+    let pinned = install(&[("DYNAMIC_CONFIG_AGENT_SOURCE", "consul!")]);
+    let response =
+        dynamic_config_webhook::admission_response_with(&review(vault_kubernetes_pod()), &pinned);
+
+    assert_eq!(
+        reason(&response),
+        dynamic_config_webhook::PINNED,
+        "{}",
+        response
+            .pointer("/response/status/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    );
+
+    // Malformed: a value that is not the shape it has to be.
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/file-mode"] = json!("888");
+    let response = dynamic_config_webhook::admission_response_with(&review(pod), &install(&[]));
+
+    assert_eq!(reason(&response), dynamic_config_webhook::MALFORMED);
+}
+
+// ---------------------------------------------------------------------------
+// Injecting twice
+// ---------------------------------------------------------------------------
+
+/// **A second admission of a patched pod must not patch it again.**
+///
+/// A mutating webhook is not called once. `reinvocationPolicy: IfNeeded`
+/// asks the API server to call it again whenever a later webhook changes
+/// the pod, and some controllers resubmit a spec that has already been
+/// admitted. Injecting twice produces two containers with one name, which
+/// the API server refuses — so the pod does not start at all, and the
+/// failure looks nothing like its cause.
+#[test]
+fn a_second_admission_does_not_inject_twice() {
+    use base64::Engine as _;
+
+    let review = |pod: &serde_json::Value| json!({ "request": { "uid": "u", "namespace": "team", "object": pod } });
+    let apply = |pod: &serde_json::Value, response: &serde_json::Value| {
+        let encoded = response
+            .pointer("/response/patch")
+            .and_then(serde_json::Value::as_str)
+            .expect("the pod asked, so it was patched");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("the patch is base64");
+        let operations: json_patch::Patch =
+            serde_json::from_slice(&decoded).expect("the patch is a JSON patch");
+
+        let mut patched = pod.clone();
+        json_patch::patch(&mut patched, &operations).expect("the patch applies");
+
+        patched
+    };
+    let container_names = |pod: &serde_json::Value| -> Vec<String> {
+        pod.pointer("/spec/containers")
+            .and_then(serde_json::Value::as_array)
+            .map(|containers| {
+                containers
+                    .iter()
+                    .filter_map(|container| Some(container.get("name")?.as_str()?.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let pod = annotated("sidecar");
+    let once = apply(
+        &pod,
+        &dynamic_config_webhook::admission_response(&review(&pod)),
+    );
+
+    assert_eq!(
+        container_names(&once),
+        ["app", "dynamic-config-agent"],
+        "the first admission injects"
+    );
+    assert_eq!(
+        once.pointer(&format!(
+            "/metadata/annotations/dynamic-config.rs~1{}",
+            dynamic_config_webhook::STATUS
+        ))
+        .and_then(serde_json::Value::as_str),
+        Some(dynamic_config_webhook::INJECTED),
+        "and marks the pod: {once}"
+    );
+
+    let second = dynamic_config_webhook::admission_response(&review(&once));
+
+    assert!(
+        second.pointer("/response/patch").is_none(),
+        "the second admission patched a pod that was already injected: {second}"
+    );
+    assert_eq!(
+        second.pointer("/response/allowed"),
+        Some(&json!(true)),
+        "and it is allowed, not refused — the first pass already decided"
+    );
+}
+
+/// The mark is this webhook's to write, and a pod saying something else
+/// with it is refused rather than quietly skipped.
+#[test]
+fn a_pod_may_not_invent_its_own_injection_status() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]
+        [format!("dynamic-config.rs/{}", dynamic_config_webhook::STATUS)] = json!("nearly");
+
+    let error = dynamic_config_webhook::of_pod_with(&pod, &install(&[])).unwrap_err();
+
+    assert!(error.contains("not a pod's to set"), "{error}");
+}
+
+/// A pod that already uses a name the injection needs is refused, not
+/// patched into a pod the API server will reject.
+///
+/// Two containers with one name is invalid, so the pod never starts —
+/// and the error a user sees then is the API server's, about a spec they
+/// did not write. Refusing here puts the sentence where the mistake is.
+#[test]
+fn a_container_name_the_injection_needs_is_refused_rather_than_duplicated() {
+    for list in ["containers", "initContainers"] {
+        let mut pod = annotated("sidecar");
+        pod["spec"][list] = json!([
+            { "name": "app", "image": "app:1" },
+            { "name": "dynamic-config-agent", "image": "somebody-elses:1" }
+        ]);
+
+        let response = dynamic_config_webhook::admission_response(&review(pod));
+
+        assert_eq!(
+            response.pointer("/response/allowed"),
+            Some(&json!(false)),
+            "{list}: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/response/status/reason")
+                .and_then(serde_json::Value::as_str),
+            Some(dynamic_config_webhook::CONFLICT)
+        );
+
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        assert!(message.contains("dynamic-config-agent"), "{message}");
+        assert!(message.contains("rename"), "{message}");
+    }
+}

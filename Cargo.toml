@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/dynamic-config-rs/dynamic-config-k8s"
@@ -17,23 +17,27 @@ authors = ["Cevat Batuhan Tolon"]
 [workspace.dependencies]
 # The engine, for resolving; the stores, for fetching. Carets: the agent
 # is an application, and an engine patch should reach it on rebuild.
-dynamic-config = { version = "0.7", default-features = false }
-dynamic-config-consul = "0.7"
-dynamic-config-vault = "0.7"
-dynamic-config-server = { version = "0.7", default-features = false, features = ["client", "tls"] }
-dynamic-config-firestore = "0.7"
-dynamic-config-store-core = "0.7"
+#
+# **These move to 0.9 at release time.** The watch contract the agent
+# drives is the engine's 0.9 and the stores' 0.9; the patch table at the
+# bottom of this file points at the working trees that carry it, which are
+# still numbered 0.8. Bump both together, and delete the patch table.
+dynamic-config = { version = "0.9", default-features = false }
+dynamic-config-consul = "0.9"
+dynamic-config-vault = "0.9"
+dynamic-config-server = { version = "0.9", default-features = false, features = ["client", "tls"] }
+dynamic-config-firestore = "0.9"
+dynamic-config-store-core = "0.9"
 minijinja = "2"
-dynamic-config-git = "0.7"
-dynamic-config-redis = { version = "0.7", features = ["tls"] }
-serde = { version = "1.0.221", features = ["derive"] }
-serde_json = "1.0.127"
+dynamic-config-git = "0.9"
+dynamic-config-redis = { version = "0.9", features = ["tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # The 0.2.0 stores — async clients, driven by the agent's tokio runtime.
-dynamic-config-etcd = { version = "0.7", features = ["tls"] }
-dynamic-config-nats = "0.7"
-dynamic-config-s3 = "0.7"
+dynamic-config-etcd = { version = "0.9", features = ["tls"] }
+dynamic-config-nats = "0.9"
+dynamic-config-s3 = "0.9"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 aws-config = "1"
-

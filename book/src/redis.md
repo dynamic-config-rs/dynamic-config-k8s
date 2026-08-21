@@ -1,6 +1,7 @@
 # Redis
 
-A key read as a document, watched by polling. The key carries its
+A key read as a document, watched over **keyspace notifications** — a
+change arrives as it happens rather than up to an interval later. The key carries its
 format in its extension (`myapp/config.json`); a key without one needs
 the document format to be guessable, so give it one.
 

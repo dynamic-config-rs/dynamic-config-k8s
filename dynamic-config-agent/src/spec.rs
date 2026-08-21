@@ -39,7 +39,9 @@ usage: dynamic-config-agent
                 the output format (.json .toml .yaml .ini .properties) —
                 unless a template is given, which then owns the bytes
                 and frees the extension
-  --watch       poll interval in seconds; absent = one shot (init mode)
+  --watch       watch the store; absent = one shot (init mode). The
+                number is the poll interval for a store that must be
+                asked, and the resync interval for one that pushes
   --section     the section key the document nests under (default: the
                 whole document)
   --file-mode   the rendered file's permissions, octal (e.g. 0640);

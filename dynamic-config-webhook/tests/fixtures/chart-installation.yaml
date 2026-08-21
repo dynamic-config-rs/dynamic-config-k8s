@@ -1,0 +1,18 @@
+agentEnvAllow:
+  payments:
+  - HTTPS_PROXY
+  - AWS_*
+sourceAllow:
+  '*':
+  - consul
+  payments:
+  - vault
+  - s3
+storeDefaults:
+  s3:
+    agent-memory-limit: 128Mi
+  vault:
+    auth: kubernetes
+    endpoint: https://vault.vault.svc:8200
+    overridable: false
+    watch-seconds: 30

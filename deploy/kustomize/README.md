@@ -21,8 +21,8 @@ Composing (a Flux Kustomization or an Argo Application points here):
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/selfrotate?ref=v0.1.1
-  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/with-operator?ref=v0.1.1
+  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/selfrotate?ref=v0.2.0
+  - github.com/dynamic-config-rs/dynamic-config-k8s//deploy/kustomize/overlays/with-operator?ref=v0.2.0
 ```
 
 ## cert-manager
@@ -58,6 +58,43 @@ kubectl apply -k deploy/kustomize/overlays/cert-manager
      -p "[{\"op\":\"add\",\"path\":\"/webhooks/0/clientConfig/caBundle\",\"value\":\"$(base64 -w0 ca.crt)\"}]"
    ```
 
+## The installation, as YAML
+
+`base/installation.yaml` is a ConfigMap of the fleet defaults and the
+gates, written the way you already write Kubernetes rather than as the
+grammar an environment variable has to carry:
+
+```yaml
+data:
+  installation.yaml: |
+    storeDefaults:
+      vault:
+        overridable: false
+        endpoint: https://vault.vault.svc:8200
+    sourceAllow:
+      payments: [vault, s3]
+      "*": [consul]
+```
+
+The webhook renders it to that grammar itself, through the same parser
+the variables go through — so the two spellings cannot mean different
+things, and an unknown setting is refused at startup rather than
+ignored. A variable set on the container still wins.
+
+## Metrics
+
+The webhook serves them on a plain-HTTP port of its own (9091, named
+`metrics` on both the pod and the Service) as well as on the admission
+port. The admission port is mutual TLS against a CA the webhook may mint
+for itself, so scraping *that* means handing Prometheus a client
+certificate from it — which is why the plain port exists. Set
+`DYNAMIC_CONFIG_WEBHOOK_METRICS_ADDR` to `""` to turn it off.
+
+Readiness probes `/readyz`, which answers 503 until a certificate this
+process can serve with is loaded — in `selfRotate` mode that is false for
+the first minute, and a replica reporting Ready without one is a replica
+the Service sends admissions it cannot finish a handshake for.
+
 ## What the chart gives that this cannot
 
 Chart-minted TLS with Secret reuse, fleet-wide agent defaults as
@@ -87,6 +124,10 @@ kubectl apply -k deploy/kustomize/overlays/with-operator   # plus a TLS overlay
 
 Adds the `DynamicConfigRender` reconciler and its least-privilege RBAC —
 including Secret writes, because a Render's `secret:` target is a Secret
-the operator owns. GitOps note: under ArgoCD prefer the selfrotate or
+the operator owns, and Leases, because replicas elect a leader and only
+the holder reconciles. Running more than one replica here needs
+`POD_NAME` and `POD_NAMESPACE` from the downward API; without them the
+operator says so and runs unelected, which is correct for one replica and
+wrong for two. GitOps note: under ArgoCD prefer the selfrotate or
 cert-manager overlay over own-cert, for the same render-stability
 reasons the book's [GitOps page](https://dynamic-config-rs.github.io/k8s/gitops.html) walks.

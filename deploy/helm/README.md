@@ -68,6 +68,11 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | `webhook.certManager.enabled` | `false` | `false`: chart-minted cert, Secret reused across upgrades; `true`: cert-manager issues and renews |
 | `webhook.certManager.issuerRef.name/kind` | — | required when enabled |
 | `webhook.certManager.duration/renewBefore` | cert-manager defaults | certificate lifetime knobs |
+| `webhook.agentEnvAllow` / `.sourceAllow` / `.sourceDeny` | `""` | a **map** of namespace to allowed names, or the equivalent grammar as one string |
+| `webhook.metrics.enabled` | `true` | a plain-HTTP port for scraping, beside the mutual-TLS admission port |
+| `webhook.metrics.port` | `9091` | that port; also a named `metrics` port on the Service |
+| `webhook.metrics.serviceMonitor.enabled` | `false` | needs the Prometheus operator's CRD |
+| `webhook.metrics.serviceMonitor.interval` / `.labels` | `30s` / `{}` | — |
 | `webhook.selfRotate.enabled` | `false` | the third TLS mode: the webhook mints CA+leaf in memory, writes its own Secret, patches its own caBundle (two-CA transition window), rotates every 24h behind a Lease. Costs three name-scoped RBAC grants — stated beside the toggle in values.yaml. Mutually exclusive with certManager |
 | `webhook.selfSignedDays` | `3650` | validity of the chart-minted pair |
 | `webhook.failurePolicy` | `Ignore` | `Fail` couples pod CREATEs to webhook availability — the book's security page owns the trade |
@@ -92,10 +97,60 @@ Per-pod `dynamic-config.rs/agent-*` annotations override these.
 | value | default | meaning |
 |---|---|---|
 | `operator.enabled` | `false` | the deployment; CRDs come from `deploy/crds.json` regardless |
+| `operator.replicas` | `1` | **spare capacity, not throughput**: replicas contend for a Lease and only the holder reconciles |
+| `operator.podDisruptionBudget.enabled` | `true` | applied **only above one replica** — a budget over a single replica blocks every node drain in the cluster |
+| `operator.podDisruptionBudget.spec` | `{minAvailable: 1}` | passed through verbatim |
 | `operator.image` / `.tag` / `.digest` / `.imagePullPolicy` | ghcr | — |
 | `operator.serviceAccount.create/name/annotations` | `true` | — |
 | `operator.rbac.create` | `true` | least-privilege ClusterRole: the two CRDs, ConfigMaps, events, leases |
 | `operator.resources` / `.priorityClassName` / `.nodeSelector` / `.tolerations` / `.affinity` / `.podLabels` / `.podAnnotations` / `.extraEnv` | — | as the webhook's |
+
+The operator's pods carry `POD_NAME` and `POD_NAMESPACE` from the downward
+API, which is what the Lease holds as its identity — a pod name is unique
+in a namespace, so two replicas cannot claim to be the same holder and a
+restarted pod does not inherit its predecessor's term. Liveness and
+readiness probe `/healthz` and `/readyz` on the metrics port.
+
+## Writing the installation as YAML
+
+Everything an installation sets reaches the webhook as a *string*,
+because that is what an environment variable is — and several of those
+strings are little grammars. They may be written as maps instead:
+
+```yaml
+agent:
+  defaults:
+    perStore:
+      vault:
+        overridable: false
+        endpoint: https://vault.vault.svc:8200
+        auth: kubernetes
+        watch-seconds: 30
+webhook:
+  sourceAllow:
+    payments: [vault, s3]
+    "*": [consul]
+```
+
+A map travels to the pod as a mounted ConfigMap and is rendered to the
+grammar *there*, by the same parser the string form goes through — one
+set of rules, one set of messages, and two spellings that cannot mean
+different things. The string form still works, per store and per gate,
+so nothing that already runs has to move.
+
+The webhook reads that document through its own engine: the YAML reader
+it gives applications is the one it reads its own configuration with.
+
+An environment variable set on the container still wins over the
+document — a document is the installation written down, a variable is
+somebody standing in front of it for this deployment. The same rule the
+configuration layers themselves follow.
+
+**Kustomize gets the same thing**, and is the reason the document exists
+rather than a chart-side rendering: a base has no template engine, so a
+hand-written ConfigMap of YAML is the only structured form it can hand
+over. `deploy/kustomize/base/installation.yaml` is that ConfigMap, empty
+and commented.
 
 ## ArtifactHub
 

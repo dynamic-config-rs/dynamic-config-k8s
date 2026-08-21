@@ -66,7 +66,11 @@ metadata:
   labels: {{- include "dynamic-config.labels" . | nindent 4 }}
   {{- include "dynamic-config.annotations" . | nindent 2 }}
 spec:
-  replicas: 1
+  # More than one is spare capacity, not more throughput: the replicas
+  # contend for a Lease and only the holder reconciles. Two means a leader
+  # that dies is replaced within the lease's term instead of when the
+  # kubelet gets round to restarting it.
+  replicas: {{ .Values.operator.replicas }}
   selector:
     matchLabels: {{- include "dynamic-config.operator.selectorLabels" . | nindent 6 }}
   template:
@@ -104,12 +108,53 @@ spec:
         - name: operator
           image: {{ include "dynamic-config.image" (dict "component" .Values.operator "root" $) | quote }}
           imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
-          {{- with .Values.operator.extraEnv }}
-          env: {{- toYaml . | nindent 12 }}
-          {{- end }}
+          env:
+            # The Lease's holder identity, and where to write it. A pod
+            # name is unique in a namespace, so two replicas cannot claim
+            # to be the same holder and a restarted pod does not inherit
+            # its predecessor's term.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.operator.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - containerPort: 9090
               name: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
           securityContext: {{- include "dynamic-config.containerSecurity" . | nindent 12 }}
           resources: {{- toYaml .Values.operator.resources | nindent 12 }}
+{{- if and .Values.operator.podDisruptionBudget.enabled (gt (int .Values.operator.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+  {{- include "dynamic-config.annotations" . | nindent 2 }}
+spec:
+  # Only meaningful above one replica, which is why the guard above exists:
+  # a budget of `minAvailable: 1` over a single replica blocks every node
+  # drain in the cluster, which is a worse outage than the one it prevents.
+  {{- toYaml .Values.operator.podDisruptionBudget.spec | nindent 2 }}
+  selector:
+    matchLabels: {{- include "dynamic-config.operator.selectorLabels" . | nindent 6 }}
+{{- end }}
 {{- end }}

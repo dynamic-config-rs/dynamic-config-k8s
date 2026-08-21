@@ -12,6 +12,15 @@
 //! files and never half ones. `--one-shot` is the init-container mode;
 //! `--watch <interval>` is the sidecar.
 //!
+//! **The sidecar watches rather than polls.** Each store says how it
+//! learns that its document changed, and the agent uses it: a change in
+//! etcd, Consul, NATS, Redis or a config server arrives as it happens,
+//! and a store that has to be asked is asked the cheapest question it
+//! offers — an S3 object is a `HEAD` rather than a download. The interval
+//! is what remains: how often to ask a store that must be asked, and how
+//! often to re-read one that pushes, because a subscription the broker
+//! forgot looks exactly like a store where nothing has changed.
+//!
 //! Output format follows `--out`'s extension, and `.properties`/`.ini`
 //! are legal *here* although the engine's `save` refuses them: the
 //! engine's contract is a round trip, and a rendered file for a consumer
@@ -56,9 +65,15 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
-    let source = sources::build(spec).await?;
+    let source = std::sync::Arc::new(sources::build(spec).await?);
+    let capability = source.capability();
 
-    info!(source = %source.describe(), out = %spec.out.display(), "agent starting");
+    info!(
+        source = %source.describe(),
+        out = %spec.out.display(),
+        watch = %capability,
+        "agent starting"
+    );
 
     if let Some(address) = &spec.metrics_addr {
         tokio::spawn(dynamic_config_agent::metrics::serve(
@@ -67,41 +82,20 @@ async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let mut last_rendered: Option<String> = None;
+    let Some(interval) = spec.watch else {
+        // Init mode: one fetch, one render, and a failure is a failure —
+        // there is no last good content to keep.
+        let fetched = source.fetch().await?;
+        let rendered = render::render_fetched(&fetched, spec)?;
 
-    loop {
-        let attempt = match source.fetch().await {
-            Ok(fetched) => render::render_fetched(&fetched, spec),
-            Err(error) => Err(error.into()),
-        };
+        render::write_atomically(&spec.out, &rendered, spec.file_mode)?;
+        dynamic_config_agent::metrics::rendered();
+        info!(bytes = rendered.len(), "rendered");
 
-        match attempt {
-            Ok(rendered) => {
-                if last_rendered.as_deref() != Some(rendered.as_str()) {
-                    render::write_atomically(&spec.out, &rendered, spec.file_mode)?;
-                    dynamic_config_agent::metrics::rendered();
-                    info!(bytes = rendered.len(), "rendered");
-                    last_rendered = Some(rendered);
-                } else {
-                    info!("unchanged");
-                }
-            }
-            Err(error) => {
-                // The file keeps its last good content — the same
-                // keep-serving rule the engine applies in-process. An
-                // init run has no last good content to keep, so it fails.
-                if spec.watch.is_none() || last_rendered.is_none() {
-                    return Err(error);
-                }
+        return Ok(());
+    };
 
-                dynamic_config_agent::metrics::failed();
-                warn!(error = %error, "fetch failed; the rendered file is unchanged");
-            }
-        }
-
-        match spec.watch {
-            Some(interval) => tokio::time::sleep(interval).await,
-            None => return Ok(()),
-        }
-    }
+    // A sidecar runs until the pod does not: the stop future never
+    // completes, and the loop ends when the process does.
+    dynamic_config_agent::sidecar::run(spec, &source, interval, std::future::pending()).await
 }

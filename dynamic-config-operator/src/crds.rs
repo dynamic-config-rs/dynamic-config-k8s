@@ -227,91 +227,71 @@ pub async fn run(client: kube::Client) -> Result<(), Box<dyn std::error::Error>>
 
     // A Class edit re-renders everything referencing it — the wiring
     // that makes a rotated endpoint land without touching the Renders.
+    //
+    // Read from the controller's own reflector rather than by listing the
+    // API. A mapper is synchronous, so an API call inside one has to be
+    // blocked on — which parks the reactor thread on a network round trip,
+    // once per class event, while every other reconcile waits. The
+    // reflector already holds every Render the controller is watching, and
+    // reading it is a lock and a filter.
+    let controller = Controller::new(renders, watcher::Config::default());
+    let known = controller.store();
+
     let mapper = {
-        let context = std::sync::Arc::clone(&context);
+        let known = known.clone();
 
         move |class: DynamicConfigClass| {
-            let context = std::sync::Arc::clone(&context);
+            let (Some(namespace), Some(name)) = (class.metadata.namespace, class.metadata.name)
+            else {
+                return Vec::new();
+            };
 
-            async move {
-                let Some(namespace) = class.metadata.namespace else {
-                    return Vec::new();
-                };
-                let Some(name) = class.metadata.name else {
-                    return Vec::new();
-                };
-                let renders: Api<DynamicConfigRender> =
-                    Api::namespaced((*context).clone(), &namespace);
-
-                match renders.list(&Default::default()).await {
-                    Ok(list) => list
-                        .items
-                        .into_iter()
-                        .filter(|render| render.spec.class == name)
-                        .filter_map(|render| {
-                            Some(
-                                kube::runtime::reflector::ObjectRef::new(
-                                    render.metadata.name.as_deref()?,
-                                )
-                                .within(&namespace),
-                            )
-                        })
-                        .collect(),
-                    Err(error) => {
-                        tracing::warn!(%error, "listing renders for a class change failed");
-                        Vec::new()
-                    }
-                }
-            }
+            known
+                .state()
+                .into_iter()
+                .filter(|render| {
+                    render.spec.class == name
+                        && render.metadata.namespace.as_deref() == Some(namespace.as_str())
+                })
+                .filter_map(|render| {
+                    Some(
+                        kube::runtime::reflector::ObjectRef::new(render.metadata.name.as_deref()?)
+                            .within(&namespace),
+                    )
+                })
+                .collect()
         }
     };
 
     let cluster_classes: Api<ClusterDynamicConfigClass> = Api::all((*context).clone());
     let cluster_mapper = {
-        let context = std::sync::Arc::clone(&context);
+        let known = known.clone();
 
         move |class: ClusterDynamicConfigClass| {
-            let context = std::sync::Arc::clone(&context);
+            let Some(name) = class.metadata.name else {
+                return Vec::new();
+            };
 
-            async move {
-                let Some(name) = class.metadata.name else {
-                    return Vec::new();
-                };
-                let renders: Api<DynamicConfigRender> = Api::all((*context).clone());
-
-                match renders.list(&Default::default()).await {
-                    Ok(list) => list
-                        .items
-                        .into_iter()
-                        .filter(|render| {
-                            render.spec.class == name
-                                && render.spec.class_kind == ClassKind::ClusterDynamicConfigClass
-                        })
-                        .filter_map(|render| {
-                            Some(
-                                kube::runtime::reflector::ObjectRef::new(
-                                    render.metadata.name.as_deref()?,
-                                )
-                                .within(render.metadata.namespace.as_deref()?),
-                            )
-                        })
-                        .collect(),
-                    Err(error) => {
-                        tracing::warn!(%error, "listing renders for a cluster-class change failed");
-                        Vec::new()
-                    }
-                }
-            }
+            known
+                .state()
+                .into_iter()
+                .filter(|render| {
+                    render.spec.class == name
+                        && render.spec.class_kind == ClassKind::ClusterDynamicConfigClass
+                })
+                .filter_map(|render| {
+                    Some(
+                        kube::runtime::reflector::ObjectRef::new(render.metadata.name.as_deref()?)
+                            .within(render.metadata.namespace.as_deref()?),
+                    )
+                })
+                .collect()
         }
     };
 
-    Controller::new(renders, watcher::Config::default())
-        .watches(classes, watcher::Config::default(), move |class| {
-            futures::executor::block_on(mapper(class))
-        })
-        .watches(cluster_classes, watcher::Config::default(), move |class| {
-            futures::executor::block_on(cluster_mapper(class))
-        })
+    controller
+        .watches(classes, watcher::Config::default(), mapper)
+        .watches(cluster_classes, watcher::Config::default(), cluster_mapper)
         .run(reconcile, on_error, context)
         .for_each(|outcome| async move {
             match outcome {
@@ -332,12 +312,56 @@ pub enum ReconcileError {
     Kube(#[from] kube::Error),
 }
 
+/// How long to wait before trying a Render that failed again.
+///
+/// Doubling from five seconds to five minutes, per object, spread by up to
+/// a quarter. A flat thirty seconds is two failures a minute for as long as
+/// a store is down — times every Render pointing at it — and a fleet that
+/// all started together makes those arrive in step.
+///
+/// Keyed by object, so one Render failing does not slow another down, and
+/// forgotten on success: the next failure starts from five seconds again.
+static BACKOFF: std::sync::Mutex<Option<std::collections::HashMap<String, u32>>> =
+    std::sync::Mutex::new(None);
+
+fn failures(key: &str, failed: bool) -> u32 {
+    let mut guard = BACKOFF.lock().unwrap_or_else(|error| error.into_inner());
+    let counts = guard.get_or_insert_with(std::collections::HashMap::new);
+
+    if !failed {
+        counts.remove(key);
+
+        return 0;
+    }
+
+    let count = counts.entry(key.to_owned()).or_insert(0);
+
+    *count = count.saturating_add(1);
+
+    *count
+}
+
 fn on_error(
-    _object: std::sync::Arc<DynamicConfigRender>,
+    object: std::sync::Arc<DynamicConfigRender>,
     _error: &ReconcileError,
     _context: std::sync::Arc<kube::Client>,
 ) -> kube::runtime::controller::Action {
-    kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(30))
+    const BASE: std::time::Duration = std::time::Duration::from_secs(5);
+    const CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let key = format!(
+        "{}/{}",
+        object.metadata.namespace.as_deref().unwrap_or_default(),
+        object.metadata.name.as_deref().unwrap_or_default()
+    );
+
+    let attempt = failures(&key, true);
+    let factor = 1u32.checked_shl(attempt.min(16)).unwrap_or(u32::MAX);
+    let wait = BASE.checked_mul(factor).unwrap_or(CEILING).min(CEILING);
+
+    dynamic_config_agent::metrics::reconcile_failed();
+
+    kube::runtime::controller::Action::requeue(dynamic_config_agent::metrics::spread(wait))
 }
 
 async fn reconcile(
@@ -346,6 +370,8 @@ async fn reconcile(
 ) -> Result<kube::runtime::controller::Action, ReconcileError> {
     use kube::api::{Patch, PatchParams};
     use kube::Api;
+
+    let started = std::time::Instant::now();
 
     let namespace = render
         .metadata
@@ -417,7 +443,22 @@ async fn reconcile(
                     .await;
             }
 
-            Ok(kube::runtime::controller::Action::requeue(interval))
+            failures(
+                &format!(
+                    "{}/{}",
+                    render.metadata.namespace.as_deref().unwrap_or_default(),
+                    render.metadata.name.as_deref().unwrap_or_default()
+                ),
+                false,
+            );
+            dynamic_config_agent::metrics::reconciled(started.elapsed());
+
+            // Spread, for the same reason every other interval here is: a
+            // hundred Renders created by one `kubectl apply` would otherwise
+            // come back to the store together, forever.
+            Ok(kube::runtime::controller::Action::requeue(
+                dynamic_config_agent::metrics::spread(interval),
+            ))
         }
         Err(error) => {
             // Kind and shape only — never a value, the same redaction

@@ -34,13 +34,22 @@ spec:
               app.kubernetes.io/component: webhook
       containers:
         - name: webhook
-          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.1.1
+          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.2.0
           imagePullPolicy: IfNotPresent
           env:
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
-              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.1.1
+              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.2.0
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
               value: "0.0.0.0:8443"
+            # Where the plain-HTTP metrics port binds. Empty turns it off,
+            # and the admission port still serves /metrics either way.
+            - name: DYNAMIC_CONFIG_WEBHOOK_METRICS_ADDR
+              value: "0.0.0.0:9091"
+            # The installation, as the ConfigMap beside this rather than
+            # as a grammar in the variables below. A variable still wins
+            # where both say something.
+            - name: DYNAMIC_CONFIG_WEBHOOK_DEFAULTS_FILE
+              value: /etc/dynamic-config/installation.yaml
             - name: DYNAMIC_CONFIG_AGENT_CPU_REQUEST
               value: "10m"
             - name: DYNAMIC_CONFIG_AGENT_MEMORY_REQUEST
@@ -70,9 +79,19 @@ spec:
           ports:
             - containerPort: 8443
               name: https
+            # Metrics on a port of their own, in plain HTTP. The admission
+            # port is mutual TLS against a CA the webhook may mint for
+            # itself, so scraping *that* means handing Prometheus a client
+            # certificate from it. The admission port still answers
+            # /metrics, so an existing scrape keeps working.
+            - containerPort: 9091
+              name: metrics
           volumeMounts:
             - name: tls
               mountPath: /tls
+              readOnly: true
+            - name: installation
+              mountPath: /etc/dynamic-config
               readOnly: true
           securityContext:
             runAsNonRoot: true
@@ -88,12 +107,20 @@ spec:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { memory: 64Mi }
           readinessProbe:
-            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            # /readyz, not /healthz: ready means a certificate this process
+            # can serve with is loaded. In selfRotate mode that is false for
+            # the first minute, and a replica reporting Ready without one is
+            # a replica the Service sends admissions it cannot complete a
+            # handshake for.
+            httpGet: { path: /readyz, port: 8443, scheme: HTTPS }
             initialDelaySeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
             periodSeconds: 20
       volumes:
+        - name: installation
+          configMap:
+            name: dynamic-config-webhook-installation
         - name: tls
           secret:
             secretName: dynamic-config-webhook-tls

@@ -44,6 +44,25 @@ fn validity() -> Duration {
 /// The lease's own term; renewed at half this.
 const LEASE_SECONDS: i32 = 30;
 
+/// How far back a minted certificate's validity starts.
+///
+/// A node whose clock is a minute behind the minting pod would otherwise
+/// refuse a certificate for not being valid yet — which looks exactly like
+/// a broken rotation and is a wrong clock.
+const SKEW: time::Duration = time::Duration::minutes(5);
+
+/// Rotations that completed, and when the current pair expires.
+///
+/// The pair a scrape wants: a counter that should climb on a schedule,
+/// and a wall-clock second that should always be in the future. An expiry
+/// that stops moving while the counter stops climbing is a rotation that
+/// has quietly stopped, which is the failure this mode has to make
+/// visible — a webhook whose certificate expires takes every pod creation
+/// in the cluster with it.
+pub static ROTATIONS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EXPIRES_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone)]
 pub struct Settings {
     pub namespace: String,
     pub service: String,
@@ -73,8 +92,22 @@ impl Settings {
 
 /// The rotation loop, spawned beside the server. Never returns.
 pub async fn run(settings: Settings) {
+    // One client for the life of the process. A fresh one every fifteen
+    // seconds re-read the service account token, rebuilt the TLS config
+    // and opened a new connection to the API server — four times a minute,
+    // for a loop whose usual answer is "not yet".
+    let client = loop {
+        match Client::try_default().await {
+            Ok(client) => break client,
+            Err(error) => {
+                warn!(%error, "no kube client for self-rotation; retrying");
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        }
+    };
+
     loop {
-        if let Err(error) = attend(&settings).await {
+        if let Err(error) = attend(&client, &settings).await {
             warn!(%error, "self-rotation attempt failed; retrying");
         }
 
@@ -82,10 +115,11 @@ pub async fn run(settings: Settings) {
     }
 }
 
-async fn attend(settings: &Settings) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::try_default().await?;
-
-    if !hold_lease(&client, settings).await? {
+async fn attend(
+    client: &Client,
+    settings: &Settings,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !hold_lease(client, settings).await? {
         return Ok(()); // another replica rotates; this one only serves
     }
 
@@ -102,7 +136,75 @@ async fn attend(settings: &Settings) -> Result<(), Box<dyn std::error::Error + S
         }
     }
 
-    rotate(&client, settings).await
+    // The lease is thirty seconds and a rotation is a mint plus two API
+    // patches — which is fast until the API server is not. Renewing
+    // underneath it means a slow rotation cannot have its lease taken by
+    // a replica that then rotates on top of it.
+    // **A lost lease stops the rotation, rather than being logged past.**
+    // The renewal answers three ways and each means something different: it
+    // still leads, somebody else took it, or the API server could not be
+    // asked. Only the first is a reason to keep going. Two replicas
+    // rotating at once write one CA's leaf into the Secret and another's
+    // bundle into the webhook configuration, and every admission TLS
+    // handshake fails until somebody notices — which is the failure the
+    // lease exists to prevent.
+    let (lost, taken) = tokio::sync::oneshot::channel();
+
+    let renewing = tokio::spawn({
+        let client = client.clone();
+        let settings = settings.clone();
+
+        async move {
+            // A renewal that *fails* is not a lease that was lost: an API
+            // server refusing for a moment is ordinary, and giving up on
+            // the first one would make a rotation fail on a hiccup. It
+            // becomes a loss when nothing has succeeded for a whole term,
+            // which is exactly when another replica may take it.
+            let mut held = tokio::time::Instant::now();
+            let term = Duration::from_secs(u64::try_from(LEASE_SECONDS).unwrap_or(30));
+
+            loop {
+                tokio::time::sleep(term / 3).await;
+
+                match hold_lease(&client, &settings).await {
+                    Ok(true) => held = tokio::time::Instant::now(),
+                    Ok(false) => {
+                        warn!("the rotation lease was taken by another replica");
+
+                        let _ = lost.send(());
+
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(%error, "renewing the rotation lease failed");
+
+                        if held.elapsed() >= term {
+                            warn!("no renewal succeeded within the lease's term");
+
+                            let _ = lost.send(());
+
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Dropping the rotation is what abandons it: the writes are `await`
+    // points, so cancellation lands between them and nothing half-written
+    // reaches the Secret or the webhook configuration.
+    let rotated = tokio::select! {
+        result = rotate(client, settings) => result,
+        _ = taken => {
+            warn!("the rotation lease was lost mid-rotation; abandoning it unwritten");
+
+            Ok(())
+        }
+    };
+
+    renewing.abort();
+    rotated
 }
 
 /// Acquire or renew the rotation lease. `true` means this replica leads.
@@ -278,6 +380,16 @@ async fn rotate(
         )
         .await?;
 
+    ROTATIONS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    EXPIRES_AT.store(
+        u64::try_from(
+            (chrono::Utc::now() + chrono::Duration::from_std(validity()).expect("fits"))
+                .timestamp(),
+        )
+        .unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     info!(
         secret = %settings.secret,
         configuration = %settings.webhook_configuration,
@@ -307,23 +419,46 @@ struct Minted {
 }
 
 /// A CA and a leaf for the service's DNS names, minted in memory.
+///
+/// **Both carry an explicit lifetime.** Without one the certificate's own
+/// validity is whatever the library defaults to — years — while the
+/// rotation schedule comes from an annotation this process writes to
+/// itself. A pair replaced every day but valid for four years is not a
+/// short-lived credential; it is a long-lived one that happens to be
+/// replaced often, and a copy taken from a node stays good long after the
+/// rotation that was supposed to retire it.
+///
+/// **The CA outlives its leaf, on purpose.** The caBundle carries the new
+/// CA and the previous one for a whole interval, so that leaves already
+/// serving on other replicas keep verifying while the kubelet catches up.
+/// A CA that expired with its leaf would leave that window trusting a
+/// certificate authority that is no longer valid — the transition would
+/// break at exactly the moment it exists to cover.
 fn mint(settings: &Settings) -> Result<Minted, Box<dyn std::error::Error + Send + Sync>> {
+    let leaf_life = time::Duration::try_from(validity())?;
+    let starts = time::OffsetDateTime::now_utc() - SKEW;
+
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "dynamic-config-webhook-ca");
+    ca_params.not_before = starts;
+    ca_params.not_after = starts + leaf_life * 2;
 
     let ca_key = rcgen::KeyPair::generate()?;
     let ca = ca_params.self_signed(&ca_key)?;
 
     let service = &settings.service;
     let namespace = &settings.namespace;
-    let leaf_params = rcgen::CertificateParams::new(vec![
+    let mut leaf_params = rcgen::CertificateParams::new(vec![
         format!("{service}.{namespace}.svc"),
         format!("{service}.{namespace}.svc.cluster.local"),
         service.clone(),
     ])?;
+
+    leaf_params.not_before = starts;
+    leaf_params.not_after = starts + leaf_life;
 
     let leaf_key = rcgen::KeyPair::generate()?;
     let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key)?;

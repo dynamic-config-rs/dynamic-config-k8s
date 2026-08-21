@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod crds;
+mod election;
 
 use tracing::info;
 
@@ -55,5 +56,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let client = kube::Client::try_default().await?;
-    crds::run(client).await
+
+    // One replica reconciles; the rest wait for its term to end. Two
+    // writing the same ConfigMap is harmless on a good day and two
+    // different documents landing in an arbitrary order on a bad one.
+    //
+    // The namespace and the identity come from the downward API, which the
+    // chart wires. Without them there is nothing to contend over, so a
+    // single replica runs unelected — which is what a `kubectl run` of this
+    // image is, and refusing that would make the image untestable.
+    let (namespace, identity) = (
+        std::env::var("POD_NAMESPACE").ok(),
+        std::env::var("POD_NAME").ok(),
+    );
+
+    let Some((namespace, identity)) = namespace.zip(identity) else {
+        tracing::warn!(
+            "POD_NAMESPACE and POD_NAME are not set, so there is no leader election; \
+             run one replica"
+        );
+
+        return crds::run(client).await;
+    };
+
+    let lost = election::lead(&client, &namespace, &identity).await?;
+
+    tokio::select! {
+        result = crds::run(client) => result,
+        () = lost => {
+            // Ending the process rather than pausing: a controller that
+            // has been running holds caches and in-flight work, and the
+            // simplest correct answer to "somebody else leads now" is to
+            // let the pod restart and contend again from nothing.
+            Err("the leader lease was lost".into())
+        }
+    }
 }

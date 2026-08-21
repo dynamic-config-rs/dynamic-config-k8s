@@ -1,0 +1,14 @@
+# The build context is the workspace, and `target/` in it is the whole
+# difference between a context of a few megabytes and one of several
+# gigabytes — uploaded to the daemon on every build, for a directory the
+# build never reads.
+target/
+**/target/
+
+.git/
+.github/
+book/
+e2e/
+deploy/
+docs/
+*.md

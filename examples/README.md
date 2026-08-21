@@ -26,6 +26,7 @@ kubectl exec billing -c app -- cat /config/rendered.toml
 | `template-env.yaml` | consul | none | output templating: a document in, an `.env` file out |
 | `etcd-tls.yaml` | etcd | TLS client certificate | the credential IS the certificate; etcd's operator-standard method |
 | `etcd-password.yaml` | etcd | username + password | `auth-username` + `password-secret`; secret-based, first-class on purpose |
+| `watch-driven.yaml` | etcd | username + password | the push path: a store whose watch streams, `watch-seconds` as the **resync** floor rather than a poll, and the staleness gauge to alert on |
 | `nats-creds.yaml` | nats | `.creds` file | the NATS account idiom, named by `auth-token-path` |
 | `s3-irsa.yaml` | s3 | IRSA (ambient chain) | workload identity; the service account carries the role |
 | `file-mode-and-identity.yaml` | consul | none | `file-mode: "0640"` + `agent-run-as-user/group`: the rendered file's mode and owner matched to the app container |

@@ -1,8 +1,9 @@
 # Git
 
-Configuration that lives where its reviews live. The agent polls the
-ref's *advertisement* — one handshake per tick, a transfer only when
-the ref actually moved — so a 15-second watch does not hammer the host.
+Configuration that lives where its reviews live. Git has nothing to push,
+so the agent asks — but it asks the *cheap* question: the ref's
+advertisement is one handshake per tick, and a transfer happens only when
+the ref actually moved, so a 15-second watch does not hammer the host.
 
 The endpoint is anything git understands (`https://…`, `ssh://…`,
 `git@host:org/repo.git`); the key is the file's path inside the

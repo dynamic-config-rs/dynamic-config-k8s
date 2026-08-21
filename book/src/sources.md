@@ -28,7 +28,7 @@ Common to all six:
   `dynamic-config.rs/ca-configmap`.
 
 Every pairing on these pages also exists as a ready-to-apply manifest
-in the repository's `examples/` directory — twenty-two manifests plus six real-software walkthroughs, each
+in the repository's `examples/` directory — twenty-three manifests plus six real-software walkthroughs, each
 self-contained with its Secret placeholders.
 
 ## etcd, NATS, S3 — the async three

@@ -12,6 +12,22 @@
 {{- printf "%s-webhook" (include "dynamic-config.fullname" .) -}}
 {{- end }}
 
+{{/*
+The installation ConfigMap's name, in one place.
+
+It is mounted by the webhook and created beside it, and those were two
+expressions that agreed by coincidence until one of them did not: the
+ConfigMap was named after the *release* and the mount after the *webhook*,
+so the moment anything put a map in `perStore` the volume named a
+ConfigMap nobody had created. A pod stuck in CreateContainerConfigError
+takes the webhook down, and with `failurePolicy: Ignore` the API server
+then admits every pod uninjected — which is the failure a gate is supposed
+to prevent, arrived at by way of the gate itself.
+*/}}
+{{- define "dynamic-config.installation.fullname" -}}
+{{- printf "%s-installation" (include "dynamic-config.webhook.fullname" .) -}}
+{{- end }}
+
 {{- define "dynamic-config.operator.fullname" -}}
 {{- printf "%s-operator" (include "dynamic-config.fullname" .) -}}
 {{- end }}
@@ -112,3 +128,40 @@ key: {{ $cert.Key | b64enc }}
 ca: {{ $ca.Cert | b64enc }}
 {{- end -}}
 {{- end }}
+
+{{/*
+The installation document, or nothing.
+
+Every setting an installation makes reaches the webhook as a string,
+because that is what an environment variable is — and several of those
+strings are little grammars. A values file has YAML already, so these
+may be written as maps instead, and the map travels to the pod as a
+document rather than being flattened into a grammar here.
+
+Emits nothing when every one of them is a string (or unset), which is
+what the callers test for: no map, no ConfigMap, no mount, no variable.
+*/}}
+{{- define "dynamic-config.installationDocument" -}}
+{{- $document := dict -}}
+{{- if and .Values.agent.defaults.perStore (not (kindIs "string" .Values.agent.defaults.perStore)) -}}
+{{- $stores := dict -}}
+{{- range $store, $knobs := .Values.agent.defaults.perStore -}}
+{{/* Every entry, whichever way it was written: a store left out here
+     would travel as a variable instead, and a variable replaces this
+     whole document rather than merging with it. */}}
+{{- $_ := set $stores $store $knobs -}}
+{{- end -}}
+{{- if $stores -}}
+{{- $_ := set $document "storeDefaults" $stores -}}
+{{- end -}}
+{{- end -}}
+{{- range $key := list "agentEnvAllow" "sourceAllow" "sourceDeny" -}}
+{{- $value := index $.Values.webhook $key -}}
+{{- if and $value (not (kindIs "string" $value)) -}}
+{{- $_ := set $document $key $value -}}
+{{- end -}}
+{{- end -}}
+{{- if $document -}}
+{{- toYaml $document -}}
+{{- end -}}
+{{- end -}}

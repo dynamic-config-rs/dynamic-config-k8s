@@ -1,13 +1,19 @@
-# ArtifactHub repository metadata. Publish path (the release round that
-# ships the chart): push the packaged chart to ghcr as OCI, then push
-# this file beside it —
-#   helm package deploy/helm
-#   helm push dynamic-config-0.1.0.tgz oci://ghcr.io/dynamic-config-rs/charts
+# ArtifactHub repository metadata: how artifacthub.io knows this chart's
+# publisher is this repository rather than somebody who copied it.
+#
+# The repository was claimed on 2026-08-21 and the id below is the one
+# artifacthub.io assigned. It proves ownership by *matching*: the same id
+# has to be reachable beside the chart, which `release.yml`'s chart job
+# does on every release —
+#
 #   oras push ghcr.io/dynamic-config-rs/charts/dynamic-config:artifacthub.io \
 #     artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
-# then claim the repo on artifacthub.io and paste the repositoryID it
-# assigns below.
-repositoryID: ""   # filled in when the repository is claimed on artifacthub.io
+#
+# so there is nothing to run by hand. A scan that finds the layer and the
+# id agreeing marks the publisher verified; one that finds neither leaves
+# the chart listed and unverified, which is what 0.1.1 was after its
+# chart job died at `cosign sign`.
+repositoryID: "3748f66e-7c6d-4606-bbb1-f9ab3c6b59c8"
 owners:
   - name: Cevat Batuhan Tolon
     email: tallon1997r@gmail.com

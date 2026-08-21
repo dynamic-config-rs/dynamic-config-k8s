@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use dynamic_config::{AsyncRemoteSource, RemoteSource};
+use std::time::Duration;
+
+use dynamic_config::{AsyncRemoteSource, Fetched, RemoteSource, WatchCapability, Watching};
 
 use crate::spec::Spec;
 
@@ -29,6 +31,74 @@ impl Built {
         match self {
             Self::Blocking(source) => source.describe(),
             Self::Async(source) => source.describe(),
+        }
+    }
+
+    /// How this store learns that its document changed.
+    ///
+    /// What the agent plans its loop around: a store that pushes is
+    /// watched and resynced, and a store that does not is polled — by the
+    /// store's own cheap question where it has one, which for S3 is a
+    /// `HEAD` rather than the object.
+    pub fn capability(&self) -> WatchCapability {
+        match self {
+            Self::Blocking(source) => source.watch_capability(),
+            Self::Async(source) => source.watch_capability(),
+        }
+    }
+
+    /// Watches, sending every document the store delivers.
+    ///
+    /// The blocking six go to the blocking pool and hand documents back
+    /// over the channel; the async three are driven on the reactor. One
+    /// place renders, whichever kind ran.
+    pub async fn watch(
+        &self,
+        watching: Watching,
+        interval: Duration,
+        deliver: tokio::sync::mpsc::Sender<Fetched>,
+    ) -> Result<(), dynamic_config::Error> {
+        match self {
+            Self::Blocking(source) => {
+                let source = Arc::clone(source);
+
+                tokio::task::spawn_blocking(move || {
+                    source.watch(&watching, interval, &mut |document| {
+                        // A full channel means the renderer is behind, which
+                        // for a document that arrives seconds apart means it
+                        // is wedged. Blocking here is the backpressure: the
+                        // store's own loop waits rather than the agent
+                        // growing a queue of documents nobody read.
+                        deliver
+                            .blocking_send(document)
+                            .map_err(|_| dynamic_config::Error::remote("the renderer stopped"))
+                    })
+                })
+                .await
+                .map_err(|error| dynamic_config::Error::remote(format!("watch task: {error}")))?
+            }
+            Self::Async(source) => {
+                // The async trait hands documents to a *synchronous*
+                // callback, so there is no `send().await` to wait on here
+                // the way the blocking arm does. A full channel therefore
+                // ends this watch rather than stalling it: the loop above
+                // reopens it after a spread wait, and the document that
+                // could not be delivered arrives again on the next event
+                // or on the resync. What is lost is a reconnect, not a
+                // change.
+                source
+                    .watch(&watching, interval, &mut move |document| {
+                        deliver.try_send(document).map_err(|error| match error {
+                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                dynamic_config::Error::remote("the renderer is behind")
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                dynamic_config::Error::remote("the renderer stopped")
+                            }
+                        })
+                    })
+                    .await
+            }
         }
     }
 

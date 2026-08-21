@@ -1,0 +1,52 @@
+version: 2
+
+updates:
+  # Cargo, grouped: three binaries sharing an engine and nine store crates
+  # is a queue of patch bumps nobody reads separately.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+    # Majors arrive on their own, because they are the ones with a decision
+    # in them: `kube` and `k8s-openapi` move together with a cluster's own
+    # supported API versions, and rcgen writes the certificates this
+    # webhook serves with.
+    ignore:
+      - dependency-name: kube
+        update-types: [version-update:semver-major]
+      - dependency-name: k8s-openapi
+        update-types: [version-update:semver-major]
+      - dependency-name: rcgen
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # One grouped bump instead of a queue: an action pin is reviewed the
+    # same way whether one moved or five did.
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The base images, by digest.
+  #
+  # A digest is only safe to pin because this runs: a pinned base image
+  # with nobody bumping it is an image that stops receiving the security
+  # updates the nightly Trivy scan exists to notice. With Dependabot on it,
+  # the pin says *which* bytes and the weekly pull request says when they
+  # move — which is the pair Scorecard's pinning check is actually asking
+  # for.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      images:
+        patterns: ["*"]

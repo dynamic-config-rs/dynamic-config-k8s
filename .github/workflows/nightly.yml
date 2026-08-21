@@ -32,8 +32,48 @@ jobs:
         env:
           SOAK_HOURS: "5"
 
+  # The three images, built once for the whole run.
+  #
+  # Each e2e leg used to build all three itself: three legs, nine builds,
+  # every one of them compiling the same dependency graph from nothing.
+  # Now one job builds them, and the legs load a tarball.
+  images:
+    name: the images, once
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+
+      # One dependency build behind all three, cached across runs: the
+      # cook layer is invalidated by a dependency change and by nothing
+      # else, so an ordinary night pays for this project's own code.
+      - name: build, into the local daemon
+        run: |
+          for component in agent webhook operator; do
+            docker buildx build \
+              --file docker/Dockerfile \
+              --target "$component" \
+              --tag "dynamic-config-$component:dev" \
+              --cache-from "type=gha,scope=e2e-$component" \
+              --cache-to "type=gha,mode=max,scope=e2e-$component" \
+              --load .
+          done
+
+      - run: just images-save images.tar
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-images
+          path: images.tar
+          retention-days: 1
+
   e2e-ladder:
     name: the full e2e ladder
+    needs: images
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -52,7 +92,17 @@ jobs:
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: just
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
+
+      # The scripts build the images themselves when they are run by hand;
+      # here they are already loaded, and `just images` would rebuild them.
       - run: e2e/${{ matrix.leg }}.sh
+        env:
+          IMAGES_PRELOADED: "1"
 
   # The published images age between releases: base-image CVEs accrue
   # while the tags stand still. This scans what users actually pull —

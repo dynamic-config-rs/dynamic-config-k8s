@@ -1,0 +1,49 @@
+# A store that pushes: etcd's watch stream, not a poll.
+#
+# The agent asks the source how it learns that a document changed. etcd,
+# NATS, Redis, Consul and the config server answer "I push" — the agent
+# holds their stream open and re-renders when it fires, so a change lands
+# in the file in about the time the network takes.
+#
+# `watch-seconds` still matters, and means something different for those
+# five: it is the **resync** interval, the periodic re-fetch that runs
+# alongside the stream. A stream can stall without disconnecting — a
+# dropped connection nobody sent a FIN for — and a resync is what turns
+# that from a file frozen forever into a file at most `watch-seconds`
+# behind. For a store that cannot push (vault, s3, git, firestore) it is
+# the poll interval it always was.
+#
+# The number to alert on is `dynamic_config_agent_staleness_seconds`,
+# scraped from the port below: how long since this agent last confirmed
+# the document, whichever way it confirmed it. `watch_connected 0` beside
+# `resyncs_total` climbing is the stalled stream, caught by the resync.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: etcd-password
+stringData:
+  password: REPLACE-WITH-THE-PASSWORD
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: billing
+  annotations:
+    dynamic-config.rs/inject: "true"
+    dynamic-config.rs/source: "etcd"
+    dynamic-config.rs/endpoint: "https://etcd.infra.svc:2379"
+    dynamic-config.rs/key: "myapp/config.json"
+    dynamic-config.rs/path: "/config/rendered.toml"
+    dynamic-config.rs/mode: "sidecar"
+    dynamic-config.rs/auth-username: "myapp"
+    dynamic-config.rs/password-secret: "etcd-password/password"
+    dynamic-config.rs/ca-configmap: "etcd-ca"
+    # The resync floor, not the poll period: etcd pushes.
+    dynamic-config.rs/watch-seconds: "300"
+    # Where the agent serves its own numbers.
+    dynamic-config.rs/metrics-port: "9109"
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "while true; do echo ── $(date); cat /config/rendered.toml; sleep 30; done"]

@@ -3,10 +3,12 @@
 Two kinds of installation-time decisions live in the webhook's
 configuration, and they must not be confused: **defaults**, which a pod
 may always override, and **gates**, which a pod may never override.
-Both arrive as chart values (or, for kustomize, as environment
-variables on the webhook Deployment), and every one of them is
-validated when the webhook starts — a mistyped value stops the install,
-never the first admission.
+Both arrive as chart values, or as a
+[ConfigMap of YAML](#writing-them-as-yaml) that kustomize can hand over
+too, or as environment variables on the webhook Deployment — three
+spellings of one thing, and every one of them is validated when the
+webhook starts. A mistyped value stops the install, never the first
+admission.
 
 ```text
 defaults:  annotation  >  per-store default  >  fleet default  >  built-in
@@ -14,6 +16,86 @@ pins:      a value marked "!" (or under overridable: "false") refuses a
            DIFFERING annotation — the tiers still fill what pods omit
 gates:     the installer's word is final
 ```
+
+## Writing them as YAML
+
+An installation reaches the webhook as **strings**, because that is what
+an environment variable is — and several of those strings are little
+grammars:
+
+```text
+DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS="vault: overridable=false, endpoint=https://vault:8200; s3: file-mode=0640?"
+DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW="payments: vault, s3; *: consul"
+```
+
+Fine to parse and unpleasant to write. So the same settings may be
+written as maps:
+
+```yaml
+# values.yaml
+agent:
+  defaults:
+    perStore:
+      vault:
+        overridable: false
+        endpoint: https://vault.vault.svc:8200
+        auth: kubernetes
+        watch-seconds: 30
+      s3:
+        agent-memory-limit: 128Mi
+webhook:
+  sourceAllow:
+    payments: [vault, s3]
+    "*": [consul]
+  agentEnvAllow:
+    payments: [HTTPS_PROXY, "AWS_*"]
+```
+
+**A map is defined as what it renders to.** It travels to the pod as a
+mounted ConfigMap and is turned into the grammar *there*, by the same
+parser the string form goes through — so there is one set of rules, one
+set of messages, and two spellings that cannot mean different things.
+Pins, markers and tiers work the same either way: `overridable: false`
+in a map is the `overridable=false` in a string.
+
+The webhook reads that document through its own engine: the YAML reader
+it gives applications is the one it reads its own configuration with.
+
+### Kustomize gets the same thing
+
+This is why the document exists at all rather than a chart-side
+rendering. A kustomize base has no template engine, so a hand-written
+ConfigMap is the only structured form it can hand over —
+`deploy/kustomize/base/installation.yaml`, which ships empty and
+commented:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamic-config-webhook-installation
+data:
+  installation.yaml: |
+    storeDefaults:
+      vault:
+        overridable: false
+        endpoint: https://vault.vault.svc:8200
+    sourceAllow:
+      payments: [vault, s3]
+      "*": [consul]
+```
+
+### Which wins
+
+An **environment variable set on the container beats the document**: a
+document is the installation written down once, a variable is somebody
+standing in front of it for this deployment — the more specific of the
+two, which is the same rule the configuration layers themselves follow.
+
+A setting the document does not know is **refused at startup**, with the
+list of the ones there are. A default silently ignored is a default that
+never applied, and the first sign of it would be a pod running without
+the posture somebody thought they had set.
 
 ## The knob vocabulary
 
@@ -132,8 +214,12 @@ the enforcement twin of the `sourceAllow` gate below.
 fleet. One realistic installation, every store present — each line
 pairs with the pod that uses it below:
 
+The string form below is one of the two spellings; the same installation
+[as maps](#writing-them-as-yaml) reads the same.
+
 ```yaml
-# values.yaml — or, for kustomize, joined with "; " into
+# values.yaml — or, for kustomize, the same settings in
+# base/installation.yaml, or joined with "; " into
 # DYNAMIC_CONFIG_AGENT_STORE_DEFAULTS
 agent:
   defaults:
@@ -403,8 +489,10 @@ Deciding between them:
 
 ### Kustomize, same doors
 
-Every value above is one environment variable on the webhook
-Deployment — the chart is convenience, not capability:
+Every value above is either a key in
+[`base/installation.yaml`](#kustomize-gets-the-same-thing) — the
+readable form, and usually what you want — or one environment variable
+on the webhook Deployment. The chart is convenience, not capability:
 
 ```yaml
 # kustomization.yaml, an overlay patch

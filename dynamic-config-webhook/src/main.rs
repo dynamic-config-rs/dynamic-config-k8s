@@ -27,8 +27,63 @@ static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static PATCHED: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 
+/// How long admissions took, and how big the patches were.
+///
+/// **The number this webhook is judged by.** It sits in the path of every
+/// pod creation in the cluster, so a slow admission is a slow deployment
+/// for everything, and the API server's own timeout — ten seconds by
+/// default — turns a slow one into a *refused* one. A histogram is the
+/// only shape that answers "is the tail moving", which is the question a
+/// latency problem announces itself in.
+static ADMISSION_MICROS_SUM: AtomicU64 = AtomicU64::new(0);
+static ADMISSION_COUNT: AtomicU64 = AtomicU64::new(0);
+static PATCH_BYTES_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// Bucket ceilings in microseconds. An admission is JSON in, a pure
+/// function, JSON out — tens of microseconds when it is well, and the
+/// interesting question is what the far tail does under load.
+const ADMISSION_BUCKETS: [u64; 7] = [100, 500, 1_000, 5_000, 25_000, 100_000, 1_000_000];
+
+static ADMISSION_HISTOGRAM: [AtomicU64; 7] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Why an admission was refused, by the *kind* of mistake.
+///
+/// Labelled, because the three answer different pages: a pod asking for a
+/// store the installation does not allow is somebody's deployment being
+/// wrong, a pinned value being overridden is somebody working around the
+/// installation, and a malformed annotation is a typo. Never the value —
+/// an annotation value carries store addresses and role names.
+static REFUSED_MALFORMED: AtomicU64 = AtomicU64::new(0);
+static REFUSED_POLICY: AtomicU64 = AtomicU64::new(0);
+static REFUSED_PINNED: AtomicU64 = AtomicU64::new(0);
+static REFUSED_CONFLICT: AtomicU64 = AtomicU64::new(0);
+static REFUSED_OTHER: AtomicU64 = AtomicU64::new(0);
+
+/// Which of the four a refusal is, read off the `status.reason` the pure
+/// function set — not guessed from the English in `status.message`.
+fn refusal_reason(reason: &str) -> &'static AtomicU64 {
+    match reason {
+        dynamic_config_webhook::POLICY => &REFUSED_POLICY,
+        dynamic_config_webhook::PINNED => &REFUSED_PINNED,
+        dynamic_config_webhook::MALFORMED => &REFUSED_MALFORMED,
+        dynamic_config_webhook::CONFLICT => &REFUSED_CONFLICT,
+        _ => &REFUSED_OTHER,
+    }
+}
+
 async fn mutate(Json(review): Json<Value>) -> Json<Value> {
+    let started = std::time::Instant::now();
     let response = dynamic_config_webhook::admission_response(&review);
+
+    record(started.elapsed(), &response);
 
     // The audit line: who, what, and which way it went — and no values,
     // because annotation values include store addresses and role names
@@ -51,6 +106,14 @@ async fn mutate(Json(review): Json<Value>) -> Json<Value> {
         "patched"
     } else if response.pointer("/response/allowed") == Some(&Value::Bool(false)) {
         REFUSED.fetch_add(1, Ordering::Relaxed);
+        refusal_reason(
+            response
+                .pointer("/response/status/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
+        .fetch_add(1, Ordering::Relaxed);
+
         "refused"
     } else {
         SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -64,21 +127,106 @@ async fn mutate(Json(review): Json<Value>) -> Json<Value> {
     Json(response)
 }
 
+/// What one admission cost, and how much it wrote.
+fn record(elapsed: std::time::Duration, response: &Value) {
+    let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+
+    ADMISSION_COUNT.fetch_add(1, Ordering::Relaxed);
+    ADMISSION_MICROS_SUM.fetch_add(micros, Ordering::Relaxed);
+
+    for (bucket, ceiling) in ADMISSION_HISTOGRAM.iter().zip(ADMISSION_BUCKETS) {
+        if micros <= ceiling {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // A patch is base64 in the response, and its size is what the API
+    // server carries per pod. A patch that grew by an order of magnitude
+    // is an injection template that got away from somebody.
+    if let Some(patch) = response.pointer("/response/patch").and_then(Value::as_str) {
+        PATCH_BYTES_SUM.fetch_add(patch.len() as u64, Ordering::Relaxed);
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// Ready means **a certificate this process can serve with is loaded**.
+///
+/// Split from liveness because the two differ exactly once, and it is the
+/// moment that matters: in `selfRotate` mode the process starts before any
+/// pair exists, and a webhook that is Ready without one is a webhook the
+/// Service sends admissions to that cannot complete a handshake — which
+/// the API server reports as every pod creation failing.
+async fn readyz() -> (axum::http::StatusCode, &'static str) {
+    if tls::Material::from_environment().loadable()
+        || std::env::var("DYNAMIC_CONFIG_WEBHOOK_PLAINTEXT").as_deref() == Ok("1")
+    {
+        (axum::http::StatusCode::OK, "ok")
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "no certificate loaded",
+        )
+    }
 }
 
 /// Prometheus text format, hand-rolled: three counters do not earn a
 /// metrics crate. Scrape over the same TLS the API server uses.
 async fn metrics() -> String {
+    let count = ADMISSION_COUNT.load(Ordering::Relaxed);
+    let mut buckets = String::new();
+    let mut cumulative = 0;
+
+    for (bucket, ceiling) in ADMISSION_HISTOGRAM.iter().zip(ADMISSION_BUCKETS) {
+        // Each bucket already counts everything at or under its ceiling;
+        // the `max` is against a scrape landing between two increments of
+        // one observation, which Prometheus would refuse as a bucket going
+        // backwards.
+        cumulative = cumulative.max(bucket.load(Ordering::Relaxed));
+
+        let seconds = ceiling as f64 / 1_000_000.0;
+
+        buckets.push_str(&format!(
+            "dynamic_config_admission_duration_seconds_bucket{{le=\"{seconds}\"}} {cumulative}\n"
+        ));
+    }
+
     format!(
         "# TYPE dynamic_config_admissions_total counter\n\
          dynamic_config_admissions_total{{outcome=\"skipped\"}} {}\n\
          dynamic_config_admissions_total{{outcome=\"patched\"}} {}\n\
-         dynamic_config_admissions_total{{outcome=\"refused\"}} {}\n",
+         dynamic_config_admissions_total{{outcome=\"refused\"}} {}\n\
+         # TYPE dynamic_config_admission_refusals_total counter\n\
+         dynamic_config_admission_refusals_total{{reason=\"malformed\"}} {}\n\
+         dynamic_config_admission_refusals_total{{reason=\"policy\"}} {}\n\
+         dynamic_config_admission_refusals_total{{reason=\"pinned\"}} {}\n\
+         dynamic_config_admission_refusals_total{{reason=\"conflict\"}} {}\n\
+         dynamic_config_admission_refusals_total{{reason=\"other\"}} {}\n\
+         # TYPE dynamic_config_admission_duration_seconds histogram\n\
+         {buckets}\
+         dynamic_config_admission_duration_seconds_bucket{{le=\"+Inf\"}} {count}\n\
+         dynamic_config_admission_duration_seconds_sum {}\n\
+         dynamic_config_admission_duration_seconds_count {count}\n\
+         # TYPE dynamic_config_admission_patch_bytes_total counter\n\
+         dynamic_config_admission_patch_bytes_total {}\n\
+         # TYPE dynamic_config_certificate_rotations_total counter\n\
+         dynamic_config_certificate_rotations_total {}\n\
+         # TYPE dynamic_config_certificate_expires_at_seconds gauge\n\
+         dynamic_config_certificate_expires_at_seconds {}\n",
         SKIPPED.load(Ordering::Relaxed),
         PATCHED.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
+        REFUSED_MALFORMED.load(Ordering::Relaxed),
+        REFUSED_POLICY.load(Ordering::Relaxed),
+        REFUSED_PINNED.load(Ordering::Relaxed),
+        REFUSED_CONFLICT.load(Ordering::Relaxed),
+        REFUSED_OTHER.load(Ordering::Relaxed),
+        ADMISSION_MICROS_SUM.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        PATCH_BYTES_SUM.load(Ordering::Relaxed),
+        selfrotate::ROTATIONS_TOTAL.load(Ordering::Relaxed),
+        selfrotate::EXPIRES_AT.load(Ordering::Relaxed),
     )
 }
 
@@ -129,7 +277,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/mutate", post(mutate))
         .route("/healthz", axum::routing::get(healthz))
+        .route("/readyz", axum::routing::get(readyz))
         .route("/metrics", axum::routing::get(metrics));
+
+    // Metrics on a port of their own, in plain HTTP.
+    //
+    // They used to be served over the admission port, which is mutual TLS
+    // against a CA the webhook mints for itself — so scraping them meant
+    // giving Prometheus a client certificate from that CA, and every
+    // deployment that did not simply had no metrics. The admission port
+    // keeps serving `/metrics` as well, so a scrape configured against it
+    // does not break.
+    let scrape =
+        std::env::var("DYNAMIC_CONFIG_WEBHOOK_METRICS_ADDR").unwrap_or_else(|_| String::new());
+
+    if !scrape.is_empty() {
+        let plain = Router::new()
+            .route("/metrics", axum::routing::get(metrics))
+            .route("/healthz", axum::routing::get(healthz))
+            .route("/readyz", axum::routing::get(readyz));
+
+        match tokio::net::TcpListener::bind(&scrape).await {
+            Ok(listener) => {
+                info!(address = %scrape, "metrics endpoint listening");
+                tokio::spawn(async move {
+                    let _ = axum::serve(listener, plain).await;
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, address = %scrape, "metrics endpoint could not bind")
+            }
+        }
+    }
 
     let address =
         std::env::var("DYNAMIC_CONFIG_WEBHOOK_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_owned());
