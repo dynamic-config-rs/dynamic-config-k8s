@@ -52,7 +52,7 @@ rcgen = "0.13"
 # Already in the graph through rcgen, so depending on it directly costs no
 # compilation — only the constructors rcgen does not re-export.
 time = { version = "0.3.36", default-features = false, features = ["std"] }
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = "0.9"
 
