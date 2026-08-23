@@ -1,0 +1,60 @@
+{{- /*
+The RBAC an injected agent needs to write Kubernetes Events about its own
+pod — and nothing else.
+
+Off by default, and worth the sentence: the sidecar carries no API
+credential in any other configuration, and the webhook touches the API
+server nowhere on its admission path. Turning this on puts a service account
+beside every application that asks for it, to improve a diagnostic. That is
+a real trade rather than an obvious win.
+
+The grant is `create` on `events`, namespaced, and nothing more. An agent
+that could *read* events could read every failure in the namespace and has
+no reason to; one that could update them could rewrite somebody else's.
+
+**The pod supplies the identity.** These objects only make the permission
+possible; a pod still has to say `dynamic-config.rs/events: "true"` and to
+run under a ServiceAccount bound below.
+*/ -}}
+{{- if .Values.agent.events.enabled }}
+{{- range $namespace := .Values.agent.events.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dynamic-config.fullname" $ }}-agent-events
+  namespace: {{ $namespace }}
+  labels: {{- include "dynamic-config.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dynamic-config.fullname" $ }}-agent-events
+  namespace: {{ $namespace }}
+  labels: {{- include "dynamic-config.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dynamic-config.fullname" $ }}-agent-events
+subjects:
+  {{- if $.Values.agent.events.serviceAccounts }}
+  {{- range $account := $.Values.agent.events.serviceAccounts }}
+  - kind: ServiceAccount
+    name: {{ $account }}
+    namespace: {{ $namespace }}
+  {{- end }}
+  {{- else }}
+  # Every service account in the namespace. Named accounts are the better
+  # shape and this is the one that works without knowing them; a chart that
+  # forced the list would be a chart nobody could install first and refine
+  # after.
+  - kind: Group
+    apiGroup: rbac.authorization.k8s.io
+    name: system:serviceaccounts:{{ $namespace }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -3,11 +3,507 @@
 All notable changes to the `dynamic-config-k8s` components are documented
 here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-The three components version together and ship as images, not crates.
+The four components version together and ship as images, not crates.
 Pre-1.0, a breaking change to the **annotation contract** bumps the minor
 version — the contract is the API here.
 
 ## [Unreleased]
+
+## [0.3.0] — 2026-08-23
+
+### Added
+
+- **The injected agent is probed, and `/readyz` finally means something.**
+  The endpoint answered `ok` before the first render, so nothing could tell a
+  pod that had configuration from one that did not. It is 503 until a
+  document has been rendered now, and the webhook attaches a `readinessProbe`
+  to the injected container — pod readiness is already AND-ed across
+  containers, so a Service sends no traffic to a pod whose configuration does
+  not exist yet.
+
+  The trade, said out loud: with the store unreachable at start and nothing
+  cached, the pod never becomes ready. That is correct — the application has
+  no configuration — but it turns a store outage into a visibly stalled
+  rollout rather than pods that come up and misbehave.
+  `dynamic-config.rs/readiness: "false"` is the escape hatch, and
+  `agent.defaults.metricsPort` now defaults to `9110` because the probe
+  answers on that port.
+- **`dynamic-config.rs/startup-policy`** — `allow-cached` (the default),
+  `require-fresh` or `best-effort`. The rendered volume is an `emptyDir`,
+  which survives a *container* restart and dies with the pod, so an agent
+  coming back after a crash usually finds its own last render on disk.
+  Refusing to start on it turned a store outage into "every restarting pod
+  stays down", when the file it needed was already there.
+
+- **Dynamic secrets, end to end.** `dynamic-config.rs/dynamic: "true"` reads
+  a Vault engine that mints credentials; the agent then renews the lease at
+  about two thirds of its life — on the *lease's* clock, spread through the
+  same pace the polls use — and hands it back on SIGTERM.
+  `revoke-on-shutdown: "false"` is the opt-out for a lease something else is
+  still using.
+
+  Two rules the loop keeps: **a renewal is not a render**, because extending
+  a lease keeps the same credential and rewriting the file would wake every
+  application watching it for nothing; and a renewal that is refused
+  *re-fetches*, because the credential is expiring and a new one is the only
+  recovery — which is a new document, so that one does render.
+
+  Four metrics come with it: `lease_renewals_total`,
+  `lease_renewal_failures_total`, `lease_revocations_total` and
+  `lease_ttl_seconds`.
+- **A meta file beside the render**, behind `dynamic-config.rs/meta: "true"`
+  — a digest of the bytes, the store's revision, and a clock. It answers the
+  question an application cannot otherwise ask: *which configuration am I
+  actually running?* Two pods holding the same file is a claim nobody can
+  check from inside either of them; two pods printing the same digest is one
+  anybody can. It describes the render and never contains it.
+- **Three gaps against the reference implementation, closed.**
+  `agent-ephemeral-request` and `agent-ephemeral-limit` set the injected
+  container's ephemeral storage — which mattered for exactly one
+  configuration and was unbounded: on `volume-medium: disk` the rendered
+  volume is node storage rather than the pod's memory, `history` keeps
+  copies beside it, and nothing declared that resource, so a pod could fill
+  a node's disk without exceeding a limit it had declared.
+
+  `timeout` is the deadline for one fetch attempt, per pod. Ten seconds
+  everywhere was right for a store on the same network and wrong for a Git
+  remote across a WAN; a workload in that position had no way to say so.
+
+  `agent-image` names the image for this pod's own agent, which is how an
+  agent upgrade stops being all-or-nothing — one Deployment tries it first,
+  the way `canary-configmap` already lets one cohort try a document. Refused
+  unless the installation lists a prefix it starts with, because an image on
+  the injected container runs chosen code beside the application holding the
+  store's credential.
+- **A node-level agent, delivered as a CSI driver** —
+  `dynamic-config-node-agent`, a fourth image and a DaemonSet. One process
+  per node instead of one container per render: 10,000 pods at 2.5 renders
+  each is 25,000 sidecar containers, and that number is what this exists
+  for.
+
+  **These were two entries on the backlog and are one component**, because
+  a DaemonSet that fetches for a whole node has to get bytes into a pod, and
+  there are two ways: a `hostPath` the pod also mounts, which restricted Pod
+  Security forbids for the reason it forbids it, or a CSI volume, which is
+  the interface Kubernetes added for exactly this. Building them separately
+  would have been building a thing and its only delivery mechanism as though
+  they were unrelated.
+
+  Pods on one node wanting the same document from the same store **under the
+  same credential** share one fetch and one watch — a node whose hundred
+  pods read one Consul key opens one connection. The credential is part of
+  that identity rather than metadata beside it: sharing across it would hand
+  one namespace's document to another. What is not shared is the rendered
+  file, which each pod gets at its own path in its own format.
+
+  One property a sidecar cannot offer comes free: the kubelet does not start
+  a pod's containers until every volume is published, and publishing does
+  the first fetch — so there is no window in which the file is missing, and
+  no init container because there is nothing for one to do.
+
+  **Off by default, and the sidecar stays the shape to reach for.** This
+  holds the store credentials of every pod on its node, runs as root because
+  the kubelet owns the volume directories, and mounts host paths. Not a
+  better shape — a different trade, for a scale that makes the first one
+  untenable, and one to make with a measurement rather than a preference.
+
+  The CSI proto is vendored at v1.11.0 rather than fetched: a build that
+  reaches the network fails in an air-gapped mirror. Registration is
+  upstream's `node-driver-registrar`, because writing it here would
+  reimplement a thing Kubernetes ships.
+- **`dynamic-config.rs/class`** — the webhook resolves a
+  `DynamicConfigClass` or `ClusterDynamicConfigClass`, so a pod names a
+  store the platform team maintains instead of repeating its endpoint and
+  auth. The operator has read these objects since 0.1.1 and the injector did
+  not, which meant the two halves of this product solved the same problem
+  twice.
+
+  **The admission path still calls nothing.** That was the property this
+  waited two rounds for: a webhook that reads the cluster in its hot path
+  fails when the API server is busy, and every pod creation fails with it.
+  The classes are listed on a background timer into a map in memory, and
+  admission reads the map — the cost is a synchronisation delay a mounted
+  ConfigMap already has, and a class created seconds ago is refused by name
+  rather than admitted without a store.
+
+  Off unless `webhook.classes.enabled`, which also creates the cluster-wide
+  `list`/`watch` on the two class kinds — and on nothing else, least of all
+  the Secrets they name. A class supplies defaults rather than pins, and a
+  namespaced class shadows a cluster one of the same name.
+- **`dynamic-config.rs/events`** — the agent writes `Warning` Events on its
+  own pod for `RenderFailed` and `DocumentAbsent`, so `kubectl describe pod`
+  shows them where somebody is already looking rather than one
+  `kubectl logs -c` away.
+
+  **Off, and twice opt-in**, because it is the one thing that puts an API
+  credential in the sidecar: an administrator creates the Role
+  (`agent.events.enabled`, `create` on `events` in named namespaces and
+  nothing else) and sets `webhook.allowEvents`; only then may a pod ask, and
+  asking without it is refused with the chart value named rather than
+  admitted into a 403.
+
+  Hand-written against `ureq`, which is already in this binary's tree for
+  three of its stores — `kube` and `k8s-openapi` would roughly double the
+  image for one POST. The service-account token is re-read per Event, the
+  same rule the Vault store follows for the same file.
+- **`dynamic-config.rs/canary-configmap`** — a change reaches part of the
+  fleet first. The cohort is the pod's own name hashed into a bucket, so it
+  is deterministic and stable across widening; the percentage is a **mounted
+  ConfigMap**, so growing the cohort is an edit rather than a new pod spec —
+  and a new pod spec is a rolling restart that discards the state a canary
+  exists to watch.
+
+  That last part is what kept this deferred: the missing piece was never the
+  cohort arithmetic, it was who advances it without restarting everything.
+  A pod outside the cohort **holds** what it fetched and publishes it when
+  the number passes its bucket, so nothing is re-fetched and the store need
+  not speak again.
+
+  `0` holds everybody, `100` holds nobody, and a file that is missing or
+  unparseable is no canary rather than zero — a typo must not freeze a fleet
+  on its current document. `canary_holding` and `canary_percent` say what is
+  happening, and `applied` beside them answers the question that decides
+  whether to widen.
+- **Consumer acknowledgement.** `renders_total` said a document reached
+  disk and nothing said whether the application read it, so an application
+  still running the previous one looked exactly like a converged fleet. The
+  application now POSTs the fingerprint it is running to `/applied` on the
+  metrics port — the same string `fingerprint()` answers in three languages,
+  and the one the meta file already carries for everyone else — and four
+  series come out of it: `acks_total`, `ack_mismatches_total`, `applied` and
+  `unapplied_seconds`.
+
+  `200` means current, `409` names the document that actually is. Neither a
+  restarted application acknowledging what it read before the restart nor a
+  slow one acknowledging a replaced generation is an error it caused, and
+  neither is convergence.
+
+  **`dynamic-config.rs/require-ack`** turns it into readiness: the pod stays
+  unready until the application says it applied the document, so a Service
+  sends no traffic to a pod running configuration nobody confirmed. Off by
+  default, and refused without a readiness probe or on `mode: init` — it
+  needs the application's cooperation, and one that never acknowledges would
+  never become ready.
+- **`dynamic-config.rs/history`** — the replaced generation is kept beside
+  the render, so *what was the file before?* has an answer. The rename that
+  publishes a new document is the same rename that destroyed the old one,
+  and by the time an incident asks, the store has moved on too.
+
+  At most ten, off unless asked, each copy taking the mode the render had,
+  and refused alongside `volume-medium: disk` where a replaced secret would
+  outlive the pod. **Not a rollback**: putting an old document back needs
+  the application to say the new one is bad, and nothing here can hear that
+  yet.
+- **Rotated TLS material no longer needs a pod restart.** The kubelet
+  rewrites a mounted ConfigMap or Secret in place and nothing tells the
+  process; every store client here reads its trust material once, when it
+  builds. So a rotated CA used to be a restart, and a rotation nobody
+  restarted for was a store that stopped answering at a moment unrelated to
+  the rotation.
+
+  The agent watches the files it was given and rebuilds the client when they
+  move. **A rebuild is not a restart**: the process stays up, the rendered
+  file never leaves the volume, the last-known-good stays, and the counters
+  keep counting. `dynamic_config_agent_tls_reloads_total` counts them, and
+  `dynamic-config.rs/tls-reload: "false"` opts out.
+
+  A change is confirmed by reading twice a quarter-second apart, because a
+  rotation writes more than one file and a client built from a half-written
+  certificate and key fails in a way that reads as a bad certificate. Tokens
+  needed none of this: the projected service-account token and the config
+  server's bearer file are re-read on every use and always were.
+- **The annotation contract is a registry rather than two lists.** Every key
+  is one row carrying whether it takes a `.name` suffix and whether it has
+  been retired; `KNOWN` and `PER_RENDER` are views of it. Two lists of the
+  same names drift — a key added to one and forgotten in the other is either
+  an annotation nothing accepts with a suffix or one accepted with a suffix
+  no code reads.
+
+  Nothing is deprecated yet, which is the state the table exists to be ready
+  for: a pod setting a retired key will be **admitted with a warning** that
+  names the replacement rather than refused, because a contract that breaks
+  a working pod to make a point is one people pin an old version of. The
+  mechanism is tested against a table of its own, since that is the only
+  moment it can be proved without a real deprecation to point at — and the
+  book's annotation page is checked against the registry, so a key cannot be
+  accepted and left undocumented.
+- **`dynamic-config.rs/notify-http`** — a localhost endpoint the agent POSTs
+  to after the rename, for nginx, Prometheus and every other daemon that
+  reloads on a request and on nothing else. One attempt, a two second
+  deadline, never fatal: the file is already correct when it is sent.
+  Localhost only by construction, checked at admission *and* in the agent —
+  an agent that will POST anywhere is an SSRF primitive holding the pod's
+  store credential. No signal form, and none planned: that needs
+  `shareProcessNamespace` on the pod, which is a change to the process
+  boundary between containers that a webhook should not make for a workload.
+- **`dynamic-config.rs/on-drift`** — `warn` (the default), `repair` or
+  `fail`, for a rendered file something else in the pod has written to. The
+  agent owns the file and the volume is shared, so until now a stray write
+  went unnoticed until the next change arrived from the store.
+  `dynamic_config_agent_drift` and its counter move either way.
+- **`dynamic-config.rs/tls-server-name`** and
+  **`dynamic-config.rs/tls-skip-verify`**. The first names the certificate's
+  own name for an endpoint written as an address it does not carry, and
+  keeps the store authenticated. The second does not, and is gated four
+  ways: an administrator must set `webhook.allowTlsSkipVerify`, it is
+  refused alongside `ca-configmap`, it earns an admission warning, and the
+  agent reports `dynamic_config_agent_tls_verification_skipped 1` so one
+  alert finds every pod using it.
+- **`dynamic-config.rs/revoke-grace`**, **`init-first`**,
+  **`agent-run-as-same-user`** and **`extra-secret`** — four ergonomics the
+  reference implementation has and this did not. `revoke-grace` replaces a
+  fixed five seconds and is refused past the pod's
+  `terminationGracePeriodSeconds`, where the kubelet would cut the
+  revocation off anyway; `init-first` puts the injected init container ahead
+  of the pod's own; `agent-run-as-same-user` takes the UID from the
+  application rather than from a number somebody keeps in step, refusing
+  absent and root; `extra-secret` mounts a Secret read-only into the agent
+  alone, at a fixed path.
+- **`dynamic-config.rs/inject-containers`** — which of the pod's own
+  containers receive the rendered volume. Every one of them by default, as
+  before and as the reference implementation defaults; naming a subset is
+  for the pod that runs a log shipper or a mesh proxy beside its
+  application. `file-mode` cannot draw that line — a sidecar in the same pod
+  usually runs as the same UID and reads a `0600` file exactly as well as
+  the application does. A name the pod does not have is refused, as is
+  leaving out the container `env-inject` wraps.
+- **`dynamic-config.rs/on-delete`** — `retain` (the default), `remove` or
+  `fail`. A document that disappears from the store used to be completely
+  silent: the agent went on serving the file it last rendered, with no log
+  line, no metric movement and every health check reporting fine. It is now a
+  reported condition whichever policy is chosen — `dynamic_config_agent_absent`
+  and its counter move, the log says whether the store answered *gone* or did
+  not answer at all, and under `fail` the loop ends so the pod's restart
+  policy takes over. `retain` stays the default because a vanished key is
+  more often a mistake in the store than an instruction to the workload.
+- **`--max-document-bytes`** in the agent, checked before the document is
+  parsed rather than after, and a `sizeLimit` on the rendered `emptyDir` for
+  both media. A 64Mi container facing an unbounded document had nothing
+  between it and the OOM killer, and a `medium: Memory` volume with no limit
+  charges the pod's memory budget for whatever is written into it.
+- **`dynamic-config.rs/max-staleness`**, wired into `/readyz`.
+  Last-known-good answers "is there a document" and leaves "is it too old to
+  trust" open — a credential may be worthless after five minutes and a
+  feature flag fine after a week, so the ceiling is off unless set.
+- **`dynamic_config_agent_generation`**, the store's own revision of what was
+  last rendered.
+- **`dynamic-config-webhook validate <pod.yaml>`** — the admission decision
+  without a cluster. The webhook was already a pure function of a pod and an
+  installation and the golden tests already drove it that way; this is that
+  call with a front door, so a mistyped annotation is caught in CI rather
+  than by a rollout that will not start.
+- **Admission warnings.** The response had no channel for anything that was
+  worth saying and not worth refusing over, so a configuration that was legal
+  and unwise arrived in silence. Four earn one: disk-backed storage for a
+  rendered secret, a world-readable file mode, a poll interval under five
+  seconds, and a lease nobody will hand back.
+- **`deletionPolicy: Delete | Retain`** on a render's target. `Delete` is
+  what already happened. `Retain` simply does not write the owner reference —
+  and deliberately never *removes* one, because rewriting ownership
+  retroactively is how an upgrade deletes somebody's Secret.
+- **`observedGeneration`** on a render's status, and two reasons that were
+  missing: `ClassNotFound` and `ClassNotAllowed`. Every failure used to be
+  `RenderFailed`, including the operator's two most common answers — so
+  telling them apart meant grepping a message.
+- **OpenTelemetry, in the binaries.** All three export OTLP traces when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set and nothing at all when it is not, so
+  no existing deployment changes behaviour and no annotation is needed to
+  turn it on — the variable is OpenTelemetry's own, and a collector already
+  injecting it into pods is enough.
+
+  It is here rather than in the engine on purpose: a pipeline owns a runtime,
+  a batch processor and a shutdown, and a *library* that takes those over is
+  one that has to be fought. Programs may, because programs own `main`. The
+  Prometheus text every binary already serves is untouched — the collector's
+  `prometheus` receiver reads it directly, and neither way out is the price
+  of the other.
+
+  Resource attributes come from the downward API and are absent rather than
+  invented when nobody wires them: a made-up pod name is worse than none.
+- **Several files, one generation.** `dynamic-config.rs/also.<name>` is a
+  further file cut from the **same** fetched document —
+  `also-section.<name>` picks which part — and the set is published
+  **all or none**: if any of them fails to resolve, render or validate,
+  none is written and every last good file stays. An application reading
+  two of them never sees one from before a change and one from after it
+  because the second failed.
+
+  Two things this deliberately is not. It is **not a second source**: two
+  stores have no common instant, so "these files are one generation" is not
+  something either could promise — a *named render* is the shape for a
+  second store, and it stays a separate container with a separate
+  generation because that is the truth about it. And it is **not atomicity
+  across files**: each rename is atomic, the set is not, and a reader can
+  in principle catch the microseconds between two of them. That window is a
+  rename apart rather than a fetch apart, which is the difference worth
+  having — calling it atomic would be a promise the filesystem does not
+  make.
+- **Schema validation at the boundary.**
+  `dynamic-config.rs/schema-configmap` mounts a JSON Schema and the agent
+  checks the resolved document against it *before* the write — so a document
+  that does not satisfy it never reaches the application and the last good
+  file goes on serving. The engine's own validation is a *typed* one and
+  belongs to Rust, Python and Node; this is the same guarantee for the
+  consumers that are none of those.
+
+  The validator is built with `default-features = false`, which drops the
+  HTTP and file `$ref` resolvers and the TLS stack with them. That is
+  deliberate: a schema arrives as a mounted ConfigMap, and a validator that
+  could fetch a `$ref` over the network would be a config agent making
+  requests on a schema's say-so — the same hazard as a template that can
+  reach a store, which this family already refuses. A refusal names the path
+  and the rule and never the value.
+- **A chart upgrade leg**, nightly, from the published chart to the working
+  tree. Every other leg installs fresh, which proves the install and says
+  nothing about the thing an operator does on a Tuesday. It pins the three
+  failure modes only an upgrade has: `deploy/helm/crds/` is where Helm puts
+  CRDs it installs and **never upgrades**, the webhook's `caBundle` can be
+  rendered empty over by the chart, and pods admitted by the previous
+  version have to go on meaning what they meant.
+- **A scale leg**, also nightly. The webhook has had an admission-latency
+  histogram since 0.2.0 and nothing ever drove load through it, so its own
+  "tens of microseconds" was an assertion rather than a measurement. Two
+  hundred admissions, the histogram read back, and the agent's working set
+  multiplied out — read from the kubelet's summary API, because the image is
+  distroless and has no shell to read a cgroup with. Output rather than a
+  gate: it fails only on a refusal, or on an admission that ate a second of
+  the API server's ten.
+- **A change→visible benchmark**, `e2e/latency.sh`, as a fourth kind leg.
+  Every other leg here proves correctness — the document arrives, and it is
+  the right one — and none of them ever produced a number, which is the
+  thing the parity document says not to do. It times the whole path, from
+  `consul kv put` to a shell inside the application's container reading the
+  new value, and prints p50/p95/max into the job summary.
+
+  Deliberately not the agent's own metrics: the number worth publishing is
+  the one a consumer experiences, and an internal timestamp would flatter it
+  by the width of the rename. The pod's poll interval is set to five minutes
+  so a resync cannot deliver the change — otherwise the leg would be timing
+  a poll, which is exactly the regression it exists to catch.
+- **Six template filters** that minijinja does not ship and a configuration
+  template needs: `b64encode`, `b64decode`, `json`, `yaml`, `quote` and
+  `required`. `tojson` was unavailable even so — minijinja's `json` feature
+  is off in this build — which left a template unable to emit the format half
+  its consumers read.
+
+  Every one is a pure function of the document already in hand, and that is
+  the line: a template cannot read a file, reach a store or see an
+  environment variable, so a rendered document stays a function of what was
+  fetched. Consul Template's `secret()` is precisely the feature not copied.
+- **The agent hears SIGTERM.** It passed a future that never completed, so
+  the process was simply killed. Fine for a file; not fine for a credential
+  minted for one pod, which would have outlived it.
+
+### Security
+
+- **Transport credentials are wiped when they go.** The token, the password
+  and the keys used to *reach* a store are `Zeroizing` now, and `Spec` grew
+  a hand-written `Debug` that prints `***` for both — it derived one, and a
+  derived `Debug` on a struct holding credentials is precisely the accident
+  every store crate here already guards against.
+
+  The claim is narrow on purpose: the resolved document is **not** wiped. It
+  has to be plaintext to be written to a file, and saying otherwise would be
+  a promise this cannot keep.
+
+### Fixed
+
+- **A named render reading S3 gets the pod's AWS credential.** `aws-secret`
+  has no per-render form and is refused outright unless the pod's own
+  source is s3 — so a pod declaring it and then adding a named render on
+  the same bucket was the only shape this could take, and the named
+  render's agent was the one container never given the credential. It
+  could not authenticate to the store its own arguments named. Shipped in
+  0.2.0, when named renders and `aws-secret` arrived together.
+- **A refusal that echoes an endpoint no longer echoes the credential in
+  it.** A pinned-value refusal quotes what the pod asked for, on purpose —
+  a value the author wrote and did not get is a debugging session. But an
+  endpoint is a URL, a URL can carry `user:password@`, and a refusal is
+  the `status.message` of a rejected API call: it reaches the server's
+  audit log and the events of whatever controller was creating the pod.
+  The userinfo is replaced; the rest of the value is untouched.
+- **A `THREAT_MODEL.md`**, a Grafana dashboard with recording and alert
+  rules under `deploy/observability/`, four `ValidatingAdmissionPolicy`
+  samples under `policies/`, and `scripts/airgap-bundle.sh` — which carries
+  the signatures and attestations across with the images, because the
+  supply-chain work is worth nothing offline if they are left behind with
+  the registry.
+- **A lease that cannot be renewed is no longer asked to.** `renewable` came
+  back on every `Fetched` and nothing read it: the agent sent
+  `sys/leases/renew` on a fixed fraction of every lease's life, including
+  the ones Vault had already said were not renewable — every `pki/issue`,
+  and any database credential past its role's maximum. That was a round trip
+  per cycle per pod that could only be refused, and a
+  `lease_renewal_failures_total` that climbed steadily on a fleet where
+  nothing was wrong, which is the kind of counter people learn to ignore.
+
+  Such a lease is re-issued instead, at **90%** of its life rather than the
+  65% a renewal uses. The two fractions are different on purpose: a renewal
+  that fails still leaves a third of the lease to recover in, while a
+  re-issue *is* the recovery — running it early only shortens the credential
+  in use and wakes every application watching the file for it.
+- **A dropping stream no longer reopens at full rate.** The reopen backoff
+  and the store-readable backoff were one `Pace`, so a store whose watch kept
+  failing while its *reads* kept working had its backoff wiped by every
+  resync — the connection was reopened on the interval, forever. They are two
+  now: a delivery resets the stream's pace, a fetch resets the store's. The
+  reopen also records the failure *before* drawing its wait, which it did the
+  other way round — so the first reopen after a drop always waited the
+  healthy interval however long the stream had been failing.
+- **A burst no longer tears the watch down.** The delivery slot was an
+  `mpsc` of capacity one — a *queue* that holds one, not the latest-wins slot
+  its own comment described. Blocking stores blocked their own watch loop on
+  it; async stores returned an error that ended the connection and counted a
+  reconnect, so the loudest signal for a sick stream fired hardest when the
+  stream was healthy. It is a `watch` channel now: the newest document
+  replaces one nobody has rendered yet.
+- **A hung read no longer stalls everything else.** The resync was awaited
+  inside a `select!` arm body, which holds the whole loop — one unanswered
+  `GET` stopped deliveries, lease renewals and the shutdown branch with it.
+  The resync is a spawned producer into the same slot now, one at a time.
+- **A failed write is no longer fatal.** Every other runtime failure warned
+  and kept the last good file; this one ended the process, so a transient
+  `ENOSPC` on the tmpfs killed a sidecar that was holding a perfectly good
+  document.
+
+### Changed
+
+- **arm64 is built on arm64.** Both architectures used to come out of one
+  job, with the arm64 half emulated under QEMU — 1h39m for the agent on
+  0.2.0, and 1h49m for the webhook. Each half now builds on its own runner
+  (free for public repositories), pushes **by digest** with no tag, and a
+  join job assembles the manifest list per registry.
+
+  Four things that had to move with it. The **index** is what `cosign` signs,
+  because `cosign verify …:v0.3.0` resolves a tag to the list and signing
+  what sits underneath would leave that command failing against images that
+  are perfectly genuine. The SBOM and provenance stay on the
+  per-architecture images, because that is what they describe —
+  `SECURITY.md` now says which digest carries which, with the command to
+  resolve one. The layer cache is scoped per architecture as well as per
+  component, since one scope shared by two legs is two legs overwriting each
+  other. And `chart` and `tag-and-release` wait for the join rather than the
+  build, or the tag would be minted naming images nobody can pull.
+
+  The cross-registry digest assertion survives, rewritten against the index,
+  and a new one checks that the list actually carries both architectures.
+- **Named renders are observable.** `dynamic-config-agent-db` and its
+  siblings had no metrics block at all, so they reported nothing whatever
+  went wrong in them. `metrics-port.<name>` gives each one its own endpoint —
+  per render because a port is a pod-wide resource that N containers cannot
+  share, and named rather than allocated because `port + n` reads as tidy
+  right up to the afternoon it lands on whatever the application is
+  listening on. The port is left unnamed and the probe uses the number: a
+  Kubernetes port name is at most fifteen characters and a render suffix may
+  be thirty-two.
+- **CI builds the three images once.** The kind legs each ran `just images` —
+  nine uncached builds of the workspace per pull request. One job builds them
+  with a layer cache and hands them over as an artifact, which is the shape
+  the nightly already used. `images` is named in the aggregate check as well
+  as by the legs that consume it: without that, a failed image build merely
+  *skips* the legs, and a skipped job is a pass.
+- Store pins move to **0.10**, and `AGENT_IMAGE` — a source constant, not a
+  chart value — moves with the release to `v0.3.0`.
 
 ## [0.2.0] — 2026-08-21
 

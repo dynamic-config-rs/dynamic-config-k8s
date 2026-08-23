@@ -1,10 +1,9 @@
 # Observability
 
-Three components, three Prometheus endpoints, one honest sentence
-about OpenTelemetry. Everything here is hand-rolled Prometheus text —
-a handful of counters do not earn a metrics crate — and everything is
-scrapeable by anything that speaks the exposition format, which
-includes the OTel Collector.
+Three components, three Prometheus endpoints, and OTLP traces beside them
+when a collector is configured. The metrics are hand-rolled exposition text
+— a handful of counters do not earn a metrics crate — and are scrapeable by
+anything that speaks the format, the OTel Collector included.
 
 ## What each component exposes
 
@@ -138,9 +137,11 @@ changed, and the only way to tell them apart is to go and ask.
 
 ## The agent's metrics
 
-A watching agent with a `metrics-port` serves eight series; the port also
-lands on the container spec as a named port (`metrics`), so
-selector-based discovery finds it without configuration:
+A watching agent with a `metrics-port` serves twenty-seven series; the port
+also lands on the container spec as a named port (`metrics`), so
+selector-based discovery finds it without configuration. Since 0.3.0 the
+chart gives every installation a default port (9110), so this is on unless
+somebody turns it off with `metrics-port: "0"`:
 
 ```text
 # TYPE dynamic_config_agent_renders_total counter
@@ -159,7 +160,139 @@ dynamic_config_agent_watch_connected 1
 dynamic_config_agent_watch_reconnects_total 3
 # TYPE dynamic_config_agent_staleness_seconds gauge
 dynamic_config_agent_staleness_seconds 4
+# TYPE dynamic_config_agent_generation gauge
+dynamic_config_agent_generation 41
+# TYPE dynamic_config_agent_lease_renewals_total counter
+dynamic_config_agent_lease_renewals_total 6
+# TYPE dynamic_config_agent_lease_renewal_failures_total counter
+dynamic_config_agent_lease_renewal_failures_total 0
+# TYPE dynamic_config_agent_lease_revocations_total counter
+dynamic_config_agent_lease_revocations_total 0
+# TYPE dynamic_config_agent_lease_ttl_seconds gauge
+dynamic_config_agent_lease_ttl_seconds 3600
+# TYPE dynamic_config_agent_absent gauge
+dynamic_config_agent_absent 0
+# TYPE dynamic_config_agent_absent_total counter
+dynamic_config_agent_absent_total 0
+# TYPE dynamic_config_agent_notifications_total counter
+dynamic_config_agent_notifications_total 12
+# TYPE dynamic_config_agent_notification_failures_total counter
+dynamic_config_agent_notification_failures_total 0
+# TYPE dynamic_config_agent_drift gauge
+dynamic_config_agent_drift 0
+# TYPE dynamic_config_agent_drift_total counter
+dynamic_config_agent_drift_total 0
+# TYPE dynamic_config_agent_canary_holding gauge
+dynamic_config_agent_canary_holding 0
+# TYPE dynamic_config_agent_canary_percent gauge
+dynamic_config_agent_canary_percent 100
+# TYPE dynamic_config_agent_acks_total counter
+dynamic_config_agent_acks_total 41
+# TYPE dynamic_config_agent_ack_mismatches_total counter
+dynamic_config_agent_ack_mismatches_total 0
+# TYPE dynamic_config_agent_applied gauge
+dynamic_config_agent_applied 1
+# TYPE dynamic_config_agent_unapplied_seconds gauge
+dynamic_config_agent_unapplied_seconds 0
+# TYPE dynamic_config_agent_tls_reloads_total counter
+dynamic_config_agent_tls_reloads_total 0
+# TYPE dynamic_config_agent_tls_verification_skipped gauge
+dynamic_config_agent_tls_verification_skipped 0
 ```
+
+`generation` is the store's own revision of what was last rendered, where
+the store counts them — a Vault KV version, a Consul index, an etcd
+revision. Zero for a store whose revision is opaque, because an ETag has no
+number to report and inventing one would make a dashboard compare things
+that do not compare.
+
+The four `lease_*` series are zero unless the source is a dynamic-secret
+engine. `lease_ttl_seconds` is what the store last *granted*, not what was
+asked for.
+
+`lease_renewal_failures_total` is worth alerting on precisely because it
+should stay at zero. A lease the store marked `renewable: false` — every
+`pki/issue`, and a database credential past its role's maximum — is never
+sent a renewal in the first place; it is re-issued instead, and
+`lease_renewals_total` stays at zero while the credential keeps arriving.
+So a rising failure count is always a lease that was *expected* to renew
+and did not, which is a real thing to page on rather than the background
+noise it would be if every non-renewable lease were asked anyway.
+
+`tls_verification_skipped` is 1 when the agent runs with
+[`tls-skip-verify`](annotations.md#reaching-the-store-over-tls). A gauge
+rather than a log line repeated per fetch, because the question it answers
+is a fleet question — *which of these five thousand pods are doing this?* —
+and one alert over a gauge answers it where five thousand log streams do
+not. It should stay at zero.
+
+`canary_holding` is 1 while this pod is outside a
+[canary cohort](annotations.md#some-of-the-fleet-before-all-of-it) and is
+holding a document it fetched — without it, a held document looks exactly
+like a store with nothing new to say. `canary_percent` is the number it last
+read, and 100 when no canary is configured.
+
+### The only end-to-end answer
+
+`renders_total` says a document reached disk. `applied` says the
+application is **running** it — the four `ack` series are the difference
+between "we published" and "it converged", and an application still running
+the previous document while every other series reports success is the
+outage they close.
+
+They stay at zero unless the application acknowledges, which is not a
+failure: an application that never acknowledges is not penalised, it simply
+leaves `applied` at zero. `unapplied_seconds` is the one to alert on —
+`ack_mismatches_total` climbing steadily means acknowledgements and renders
+are talking past each other, which is a different problem from being behind.
+
+[The annotations page](annotations.md#knowing-the-application-actually-applied-it)
+has the two-line contract, and `require-ack` turns it into readiness.
+
+`tls_reloads_total` counts the times the store's client was rebuilt for
+rotated trust material — a counter rather than a gauge, because the question
+worth asking is whether a rotation was picked up at all.
+
+`drift` is 1 while a rendered file is something other than what this agent
+wrote. `notification_failures_total` counts post-render calls that were
+refused or unanswered; neither is fatal, because the file is already
+published by the time either can happen.
+
+`absent` is 1 while the store says the document is not there, and
+`absent_total` counts how many times it has gone missing. The distinction
+they encode is the one a stale file cannot make on its own: a store that
+does not answer is an outage, which waiting cures, and a store that answers
+*gone* is a deletion, which waiting does not. Before 0.3.0 a deleted Vault
+secret moved nothing at all and the last render went on being served with
+every health check reporting fine. What the agent *does* about it is
+[`on-delete`](annotations.md#freshness-and-what-happens-when-a-store-is-not-there).
+
+### `/readyz` means there is a document
+
+The agent's readiness is stricter than the operator's, and since 0.3.0 the
+webhook attaches a probe to the injected container: `/readyz` answers 503
+until a document has been rendered, and pod readiness is already AND-ed
+across containers — so a Service sends no traffic to a pod whose
+configuration does not exist yet.
+
+The trade, said plainly: with the store unreachable at start and nothing
+cached, the pod never becomes ready. That is correct — the application has
+no configuration — but it turns a store outage into a visibly stalled
+rollout rather than pods that come up and misbehave. Two ways out, and they
+answer different questions:
+
+- `dynamic-config.rs/startup-policy: allow-cached` (the default) serves the
+  file already on disk when the first fetch fails. The volume survives a
+  *container* restart, so an agent coming back after a crash usually finds
+  its own last render there.
+- `dynamic-config.rs/readiness: "false"` detaches the probe entirely, for a
+  deployment that would rather start than wait.
+
+And `dynamic-config.rs/max-staleness: "6h"` puts a ceiling on the first of
+those: last-known-good answers *is there a document* and leaves *is it too
+old to trust* open. A credential may be worthless after five minutes and a
+feature flag fine after a week, so there is no default — the ceiling is off
+unless somebody sets one.
 
 **`staleness_seconds` is the one to alert on.** It is seconds since the
 store was last read successfully, delivered or resynced — the number a
@@ -235,6 +368,11 @@ usually the store rather than the operator. On by default at
 or set it empty to turn it off. The same port answers `/healthz` and
 `/readyz`, which is what the chart's probes use.
 
+The operator's `/readyz` means *the process is up*, and that is not an
+oversight: an operator with no `DynamicConfigRender` resources has rendered
+nothing and is working perfectly. The **agent** means something stricter by
+the same path — see below.
+
 **Only one replica reconciles.** The operator elects a leader over a
 Lease, so `operator.replicas: 2` is spare capacity rather than twice the
 work — and the metrics of a follower stay flat by design. A leader that
@@ -278,13 +416,63 @@ consumes the rendered file through the engine's own watcher, alert on
 the engine's series (closest to the truth the app sees) and keep the
 agent's gauge as the delivery-side backstop.
 
-## OpenTelemetry, honestly
+## A dashboard and the rules under it
 
-There is no OTel SDK inside any of these binaries, no traces and no
-OTLP exporter — an admission decision and a render loop are single
-hops with nothing worth a span, and a config agent should not carry a
-telemetry stack an order of magnitude heavier than itself. What you
-get instead composes with OTel cleanly:
+`deploy/observability/` carries both, over the series named above:
+
+```sh
+kubectl apply -f deploy/observability/rules.yaml    # recording rules, then alerts
+# Grafana → Dashboards → Import → dashboard.json
+```
+
+The rules come first — four of the dashboard's fleet counters read recording
+rules, and without them those panels stay empty.
+
+Two things worth knowing before tuning the thresholds. **Staleness is the
+gauge to page on**, not a failure counter: an agent that fails one fetch and
+recovers is doing what it was built to do, while one whose store has not
+answered in half an hour is serving a document nobody can vouch for. And
+**`lease_renewal_failures_total` should sit at zero**, which is what makes a
+low threshold on it reasonable — a lease the store marked `renewable: false`
+is never sent a renewal at all, so anything counted there was expected to
+renew and did not.
+
+The recording rules aggregate `pod` away. A thousand agents cost four series
+through them and four thousand without; the alerts that do keep `pod` are
+the ones whose whole purpose is naming which pod.
+
+## OpenTelemetry
+
+Since 0.3.0 the webhook, the agent and the operator export OTLP traces — and only when a
+collector is configured. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` is the whole
+opt-in; leave it unset and nothing is exported, nothing is allocated, and
+the process behaves exactly as it did. The variable is OpenTelemetry's own,
+so a collector that already injects it into pods needs no annotation from
+this chart.
+
+Resource attributes come from the downward API — `service.name`,
+`service.version`, `k8s.pod.name`, `k8s.namespace.name`, `k8s.node.name` —
+and are **absent rather than invented** when nobody wires them: a made-up
+pod name is worse than none.
+
+### Where the pipeline is built
+
+The engine offers an `otel` feature that records into a meter somebody else
+configured, and refuses to build the pipeline. That is the right split: a
+pipeline owns a runtime, a batch processor and a shutdown, and a *library*
+that takes those over is one that has to be fought. These three are
+programs, and programs own `main` — so the exporter, and the flush before
+exit, are theirs.
+
+If a collector cannot be reached, the process logs a warning and carries on
+without traces. A configuration agent that refused to start because its
+*telemetry* was down would be a worse outage than the one it was reporting.
+
+### The Prometheus text is untouched
+
+Nothing above replaces the scrape. Many deployments have one already, and
+the collector reads it directly — neither way out is the price of the
+other:
 
 - **Metrics**: the OTel Collector's `prometheus` receiver scrapes all
   three endpoints and exports OTLP wherever you aggregate:
@@ -305,5 +493,6 @@ get instead composes with OTel cleanly:
 - **Logs**: the JSON lines on stdout are structured input for the
   `filelog` receiver, no parsing regexes required.
 
-If a future release grows OTLP, it will be because a real deployment
-needed it — not because the acronym was missing from this page.
+Traces are spans over the work — an admission, a fetch, a render — and the
+scrape is the state of it. A deployment that wants only one of the two is
+not missing anything by taking only one.

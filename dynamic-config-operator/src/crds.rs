@@ -121,6 +121,29 @@ pub struct RenderTarget {
     /// `existingSecret` contract.
     #[serde(default)]
     pub shape: TargetShape,
+    /// What happens to the target when the Render is deleted.
+    ///
+    /// `Delete` (default) is the behaviour that already existed: the target
+    /// carries an owner reference, so Kubernetes garbage-collects it —
+    /// no finalizer to get wrong.
+    ///
+    /// `Retain` leaves it. For a migration, where the Render is being
+    /// replaced by something else that will manage the same Secret, and
+    /// for a credential whose disappearance would take an application down
+    /// with it. The target is then nobody's, which is the point and the
+    /// hazard: no controller will clean it up afterwards.
+    #[serde(default)]
+    pub deletion_policy: DeletionPolicy,
+}
+
+/// Whether a rendered target outlives the Render that wrote it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum DeletionPolicy {
+    /// Garbage-collected with the Render.
+    #[default]
+    Delete,
+    /// Left behind, owned by nobody.
+    Retain,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -144,6 +167,13 @@ pub enum TargetShape {
 pub struct RenderStatus {
     /// The last generation successfully rendered, and when.
     pub rendered_at: Option<String>,
+    /// The `.metadata.generation` this status was computed from.
+    ///
+    /// What every conditions-reading tool checks before believing a
+    /// condition: without it, a `Ready=True` left over from the previous
+    /// spec is indistinguishable from one that describes the spec in hand,
+    /// and `kubectl wait` believes the stale one.
+    pub observed_generation: Option<i64>,
     /// The last failure, kind and path only — never a value, the same
     /// redaction rule as everywhere else in the organisation.
     pub last_error: Option<String>,
@@ -178,13 +208,68 @@ impl ReadyCondition {
     }
 
     fn not_ready(now: &str, message: &str) -> Self {
+        Self::refused(now, Reason::of(message), message)
+    }
+
+    fn refused(now: &str, reason: Reason, message: &str) -> Self {
         Self {
             r#type: "Ready".to_owned(),
             status: "False".to_owned(),
-            reason: "RenderFailed".to_owned(),
+            reason: reason.as_str().to_owned(),
             // Kind and shape only — never a value.
             message: message.to_owned(),
             last_transition_time: now.to_owned(),
+        }
+    }
+}
+
+/// Why a render is not ready, in the vocabulary a tool can match on.
+///
+/// Every failure used to be `RenderFailed`, including the three that are
+/// not failures of the render at all: a class that does not exist, a class
+/// that exists and does not allow this namespace, and a target the operator
+/// will not overwrite. Those are the operator's most common answers, and
+/// telling them apart in free text meant every alert grepped a message.
+///
+/// **These strings are API**, on the same terms as the annotation contract:
+/// a dashboard aggregates on them, so a rename is a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// The class this render names does not exist.
+    ClassNotFound,
+    /// It exists, and does not admit this namespace.
+    ClassNotAllowed,
+    /// The store could not be read, or the document could not be rendered.
+    RenderFailed,
+}
+
+impl Reason {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassNotFound => "ClassNotFound",
+            Self::ClassNotAllowed => "ClassNotAllowed",
+            Self::RenderFailed => "RenderFailed",
+        }
+    }
+
+    /// Sorts a failure by the message it produced.
+    ///
+    /// Sniffing text is not how this should work and is how it works: the
+    /// failures arrive as `String` from half a dozen call sites. The
+    /// phrases matched here are written in exactly one place each — the
+    /// three `ok_or_else` closures in `resolve` — and a test pins them, so
+    /// the coupling is at least visible rather than accidental.
+    fn of(message: &str) -> Self {
+        // `class` as well as the phrase: a missing *token secret* also
+        // "does not exist", and reporting that as a missing class would
+        // send whoever reads it to the wrong object entirely.
+        if message.contains("class") && message.contains("does not exist") {
+            Self::ClassNotFound
+        } else if message.contains("does not allow namespace") {
+            Self::ClassNotAllowed
+        } else {
+            Self::RenderFailed
         }
     }
 }
@@ -415,6 +500,7 @@ async fn reconcile(
             if changed || had_error || never_rendered {
                 let status = serde_json::json!({ "status": RenderStatus {
                     rendered_at: Some(now.clone()),
+                    observed_generation: render.metadata.generation,
                     last_error: None,
                     conditions: vec![ReadyCondition::ready(&now)],
                 }});
@@ -465,6 +551,7 @@ async fn reconcile(
             // rule as everywhere else in the organisation.
             let status = serde_json::json!({ "status": RenderStatus {
                 rendered_at: render.status.as_ref().and_then(|s| s.rendered_at.clone()),
+                observed_generation: render.metadata.generation,
                 last_error: Some(error.to_string()),
                 conditions: vec![ReadyCondition::not_ready(&now, &error.to_string())],
             }});
@@ -597,7 +684,14 @@ async fn attempt(
                     .data
                     .as_ref()
                     .and_then(|data| data.get(key))
-                    .map(|bytes| String::from_utf8_lossy(&bytes.0).into_owned())
+                    // Into a `Credential` at the moment it is read, so the
+                    // token this reconcile pulled out of a Secret does not
+                    // outlive the fetch it was pulled out for.
+                    .map(|bytes| {
+                        dynamic_config_agent::spec::Credential::new(
+                            String::from_utf8_lossy(&bytes.0).into_owned(),
+                        )
+                    })
                     .ok_or_else(|| {
                         format!("secret {secret_namespace}/{secret_name} has no {key:?} key")
                     })?,
@@ -607,6 +701,69 @@ async fn attempt(
 
     // The agent's own Spec, sources and renderer — one implementation.
     let spec = dynamic_config_agent::spec::Spec {
+        // The operator never runs the sidecar loop — it fetches, renders and
+        // writes to a Secret or ConfigMap — so a startup policy about a file
+        // on disk has nothing to govern here, and neither does a lease: a
+        // credential minted per reconcile, renewed by nobody, is a leak, so
+        // dynamic engines stay a sidecar feature until the operator has
+        // somewhere to keep one.
+        startup_policy: dynamic_config_agent::spec::StartupPolicy::default(),
+        // The operator writes to a Secret or ConfigMap, not to a file, so
+        // there is nowhere to put a sibling meta document and no readiness
+        // of its own for a staleness ceiling to govern.
+        // The operator has no mounted schema to point at; a Render's
+        // validation is the CRD's own, checked by the API server.
+        // A Render writes one target. Several files as one generation is a
+        // sidecar shape: the operator's unit of work is already the whole
+        // object it applies.
+        // A Render's absence policy is the CRD's own: deleting the
+        // Render deletes the target, which is what `deletionPolicy`
+        // governs. There is no long-lived file here to keep or empty.
+        max_document_bytes: None,
+        on_delete: dynamic_config_agent::spec::OnDelete::default(),
+        also: Vec::new(),
+        schema: None,
+        meta: false,
+        max_staleness: None,
+        dynamic: false,
+        revoke_on_shutdown: false,
+        // No lease to hand back, so nothing to spend a grace period on.
+        revoke_grace: dynamic_config_agent::sidecar::REVOKE_DEADLINE,
+        // Both of these are about a *file* the agent keeps: an endpoint to
+        // tell that it moved, and a check that nothing else rewrote it. The
+        // operator's output is a Secret or a ConfigMap, whose consumers are
+        // the kubelet and whose integrity is the API server's.
+        notify_http: None,
+        on_drift: dynamic_config_agent::spec::OnDrift::default(),
+        // A Class names a CA and a client certificate; the two knobs that
+        // move *which* name is checked, or whether one is, are pod
+        // annotations. A Render has no pod to carry them.
+        tls_server_name: None,
+        tls_skip_verify: false,
+        // The operator builds a client per reconcile and drops it, so the
+        // material is read afresh every time by construction — there is no
+        // long-lived client for a rotation to leave behind.
+        tls_reload: false,
+        // A Render's history is the API server's: an object's previous
+        // versions are what an audit log and `kubectl` already answer for,
+        // and keeping copies beside a ConfigMap would be a second answer.
+        history: 0,
+        // Nothing to acknowledge to: the operator has no readiness probe
+        // of its own per Render, and the consumers of a ConfigMap are
+        // pods the operator never sees.
+        require_ack: false,
+        // The operator writes its own Events, through `kube`'s recorder and
+        // against the Render — this flag is the sidecar's way of doing the
+        // same thing without one.
+        events: false,
+        // A Render has no pod name to hash into a cohort, and a ConfigMap
+        // the operator writes reaches every consumer at once by
+        // construction — a canary here would be a canary of one.
+        canary: None,
+        // The store's own default. A Render's reconcile interval already
+        // bounds how long a slow read may hold the operator up, and a
+        // second number beside it would be two ways to say one thing.
+        timeout: None,
         source: source_name,
         endpoint,
         key: render.spec.key.clone(),
@@ -675,6 +832,13 @@ async fn attempt(
 
     // Owned by the Render, so deleting the Render garbage-collects the
     // target — Kubernetes' own cleanup, no finalizer to get wrong.
+    //
+    // Under `Retain` the owner reference is simply not written, which is
+    // the whole mechanism: an object with no owner is not collected. There
+    // is deliberately no code that *removes* one from a target that
+    // already has it — flipping the policy governs from the next apply
+    // onwards, and rewriting ownership retroactively is the kind of thing
+    // that deletes somebody's Secret during an upgrade.
     let owner = serde_json::json!([{
         "apiVersion": "dynamic-config.rs/v1alpha1",
         "kind": "DynamicConfigRender",
@@ -682,6 +846,10 @@ async fn attempt(
         "uid": render.metadata.uid,
         "controller": true,
     }]);
+    let owner = match target.deletion_policy {
+        DeletionPolicy::Delete => Some(owner),
+        DeletionPolicy::Retain => None,
+    };
     let apply = PatchParams::apply("dynamic-config-operator").force();
 
     if let Some(name) = &target.secret {
@@ -706,7 +874,7 @@ async fn attempt(
         let manifest = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
-            "metadata": { "name": name, "ownerReferences": owner },
+            "metadata": metadata(name, owner.as_ref()),
             "type": "Opaque",
             "stringData": data,
         });
@@ -738,7 +906,7 @@ async fn attempt(
     let manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
-        "metadata": { "name": name, "ownerReferences": owner },
+        "metadata": metadata(name, owner.as_ref()),
         "data": data,
     });
 
@@ -747,4 +915,92 @@ async fn attempt(
         .await?;
 
     Ok(true)
+}
+
+/// A target's metadata, with the owner reference only when there is one.
+///
+/// Written out rather than inlined because `"ownerReferences": null` is not
+/// the same as omitting the key: a server-side apply reads the explicit
+/// null as *clear the owners*, which under `Retain` would strip ownership
+/// from a target that already had it — the opposite of leaving it alone.
+fn metadata(name: &str, owner: Option<&serde_json::Value>) -> serde_json::Value {
+    match owner {
+        Some(owner) => serde_json::json!({ "name": name, "ownerReferences": owner }),
+        None => serde_json::json!({ "name": name }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three messages this sorts on are written in exactly one place
+    /// each. Pinning them here makes the coupling visible, so a reworded
+    /// failure fails a test rather than quietly becoming `RenderFailed`.
+    #[test]
+    fn the_reasons_match_the_messages_that_produce_them() {
+        assert_eq!(
+            Reason::of(r#"class "prod-vault" does not exist here"#),
+            Reason::ClassNotFound
+        );
+        assert_eq!(
+            Reason::of(r#"cluster class "prod-vault" does not exist"#),
+            Reason::ClassNotFound
+        );
+        assert_eq!(
+            Reason::of(r#"cluster class "prod" does not allow namespace "team-a": ..."#),
+            Reason::ClassNotAllowed
+        );
+    }
+
+    /// A missing *token secret* also "does not exist", and reporting that
+    /// as a missing class would send whoever reads it to the wrong object.
+    #[test]
+    fn a_missing_secret_is_not_a_missing_class() {
+        assert_eq!(
+            Reason::of("token secret team-a/vault-token does not exist"),
+            Reason::RenderFailed
+        );
+    }
+
+    #[test]
+    fn an_unreachable_store_is_a_render_failure() {
+        assert_eq!(
+            Reason::of("vault https://vault:8200 secret/myapp: connection refused"),
+            Reason::RenderFailed
+        );
+    }
+
+    /// These strings are API: a dashboard aggregates on them, so a rename
+    /// is a breaking change and belongs in the changelog.
+    /// `"ownerReferences": null` is not the same as omitting the key: a
+    /// server-side apply reads the explicit null as *clear the owners*, so
+    /// `Retain` would have stripped ownership from a target that already
+    /// had it — the exact opposite of leaving it alone.
+    #[test]
+    fn retain_omits_the_owner_rather_than_nulling_it() {
+        let retained = metadata("app-config", None);
+
+        assert!(
+            retained.get("ownerReferences").is_none(),
+            "an explicit null would clear the owners: {retained}"
+        );
+
+        let owner = serde_json::json!([{ "kind": "DynamicConfigRender" }]);
+        let owned = metadata("app-config", Some(&owner));
+
+        assert!(owned.get("ownerReferences").is_some());
+    }
+
+    #[test]
+    fn deleting_is_the_default_because_it_is_what_already_happened() {
+        assert_eq!(DeletionPolicy::default(), DeletionPolicy::Delete);
+    }
+
+    #[test]
+    fn the_reason_strings_are_the_ones_that_were_published() {
+        assert_eq!(Reason::ClassNotFound.as_str(), "ClassNotFound");
+        assert_eq!(Reason::ClassNotAllowed.as_str(), "ClassNotAllowed");
+        assert_eq!(Reason::RenderFailed.as_str(), "RenderFailed");
+    }
 }

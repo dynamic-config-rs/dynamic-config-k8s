@@ -1,0 +1,127 @@
+{{- /*
+One agent per node, delivering configuration as a CSI volume.
+
+OFF, and the sidecar stays the default. What this trades away is the
+property the sidecar shape is built on: a sidecar holds one workload's
+credential, and a compromised one reaches one application's configuration.
+This process holds the store credentials of **every pod on its node**.
+
+What it buys is the number it exists for: 10,000 pods at 2.5 renders each
+is 25,000 sidecar containers, and a node whose hundred pods read one Consul
+key opens one connection instead of a hundred.
+
+Not a better shape. A different trade, for a scale that makes the first one
+untenable.
+*/ -}}
+{{- if .Values.nodeAgent.enabled }}
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: config.dynamic-config.rs
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  # Nothing is provisioned or attached: a volume here is a directory the
+  # kubelet already made and a document written into it.
+  attachRequired: false
+  # The pod's name and namespace reach `NodePublishVolume` as volume
+  # context, which is how one node's agent keeps two namespaces' reads
+  # apart.
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Ephemeral
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-node-agent
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-node-agent
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "dynamic-config.nodeAgent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dynamic-config.nodeAgent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "dynamic-config.fullname" . }}-node-agent
+      # The kubelet's plugin directory is on the host, so this is one of
+      # the few workloads in this chart that is not `restricted` — and the
+      # reason it is off by default.
+      hostNetwork: false
+      containers:
+        # Upstream's, and its whole job is telling the kubelet this driver
+        # exists. Writing that ourselves would be reimplementing a thing
+        # Kubernetes ships.
+        - name: node-driver-registrar
+          image: {{ .Values.nodeAgent.registrar.image }}:{{ .Values.nodeAgent.registrar.tag }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.nodeAgent.kubeletPath }}/plugins/config.dynamic-config.rs/csi.sock
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+        - name: node-agent
+          image: {{ .Values.nodeAgent.image }}:{{ .Values.nodeAgent.tag | default (printf "v%s" .Chart.AppVersion) }}
+          env:
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- if .Values.nodeAgent.metricsPort }}
+            - name: DYNAMIC_CONFIG_METRICS_ADDR
+              value: "0.0.0.0:{{ .Values.nodeAgent.metricsPort }}"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            # Root, and this is the honest part: the kubelet creates the
+            # pod volume directories owned by root, and a process that
+            # cannot write into them cannot publish. Every other workload
+            # in this chart runs nonroot; this one cannot, which is one
+            # more reason it is off by default.
+            runAsUser: 0
+          resources: {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
+          volumeMounts:
+            - name: socket
+              mountPath: /csi
+            # `HostToContainer`, not `Bidirectional`. This driver makes
+            # no mounts: `NodePublishVolume` writes a file into the
+            # directory the kubelet made and `NodeUnpublishVolume` leaves
+            # the directory to the kubelet, so there is nothing to
+            # propagate outward. `Bidirectional` would be describing work
+            # that does not happen — and Kubernetes allows it only to a
+            # `privileged` container, which is the one thing this driver
+            # exists to avoid asking for.
+            - name: pods
+              mountPath: {{ .Values.nodeAgent.kubeletPath }}/pods
+              mountPropagation: HostToContainer
+      volumes:
+        - name: socket
+          hostPath:
+            path: {{ .Values.nodeAgent.kubeletPath }}/plugins/config.dynamic-config.rs
+            type: DirectoryOrCreate
+        - name: registration
+          hostPath:
+            path: {{ .Values.nodeAgent.kubeletPath }}/plugins_registry
+            type: Directory
+        - name: pods
+          hostPath:
+            path: {{ .Values.nodeAgent.kubeletPath }}/pods
+            type: Directory
+{{- end }}

@@ -106,6 +106,46 @@ above applies.
 `mode: init` never refreshes by design: rotation there is a pod
 restart, which is the trade the [Vault page](vault.md) states.
 
+## The pod never becomes ready
+
+Since 0.3.0 the webhook attaches a readiness probe to the injected
+container, so a pod stays `0/2` until its first render lands. `kubectl
+logs <pod> -c dynamic-config-agent` says why the fetch is not succeeding.
+
+Three ways out, and they answer different questions:
+
+- the store is genuinely down and a stale document is acceptable →
+  `startup-policy: allow-cached` (the default) already serves the file on
+  the volume if there is one; there is none on a **first** start
+- the document is fine but too old →
+  `dynamic-config.rs/max-staleness` is what flipped readiness; the
+  `staleness_seconds` gauge says by how much
+- the pod should start regardless →
+  `dynamic-config.rs/readiness: "false"`, and the application handles a
+  configuration that is not there yet
+
+## The document was deleted and nothing happened
+
+Check `dynamic_config_agent_absent`. If it is 1, the store is answering
+*gone* and the agent is doing what `on-delete` says — `retain` by default,
+which keeps serving the last render. `remove` truncates the file and
+`fail` ends the agent so the pod restarts.
+
+If it is 0 while the key is definitely gone, the store is not reporting
+the deletion: a `Conditional` store polled on an interval takes up to one
+`watch-seconds` to notice.
+
+## The render is refused and the old file keeps serving
+
+Two checks can refuse a document after it has been fetched, and both keep
+the last good file rather than publishing a bad one:
+
+- **the schema** (`schema-configmap`) — the log line names the failing
+  path and the constraint, never the value
+- **the size ceiling** (`max-document-bytes`, 8 MiB) — the refusal names
+  the limit and the store; a document that grew past it is usually a key
+  that now points at something else
+
 ## `--out` refused at startup
 
 The extension picks the format, and only five are legal: `.json`

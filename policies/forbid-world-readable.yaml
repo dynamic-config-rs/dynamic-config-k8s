@@ -1,0 +1,38 @@
+# Every container in a pod shares the rendered volume, so a world-readable
+# mode hands the document to containers added later as well — including a
+# debug container somebody attaches during an incident.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dynamic-config-forbid-world-readable
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    # The mode is octal text: the last character is the world bits, and
+    # anything but "0" there is readable by every container in the pod.
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !('dynamic-config.rs/file-mode' in object.metadata.annotations) ||
+        object.metadata.annotations['dynamic-config.rs/file-mode'].endsWith('0')
+      message: >-
+        dynamic-config.rs/file-mode must not be world-readable: every
+        container in the pod shares the rendered volume, including ones
+        added after this one was written.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dynamic-config-forbid-world-readable
+spec:
+  policyName: dynamic-config-forbid-world-readable
+  validationActions: [Warn]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        dynamic-config.rs/policy: strict

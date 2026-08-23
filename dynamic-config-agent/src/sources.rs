@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-use dynamic_config::{AsyncRemoteSource, Fetched, RemoteSource, WatchCapability, Watching};
+use dynamic_config::{
+    AsyncRemoteSource, Fetched, Lease, RemoteSource, RenewableSource, WatchCapability, Watching,
+};
 
 use crate::spec::Spec;
 
@@ -22,7 +24,75 @@ use crate::spec::Spec;
 /// clone onto the blocking pool.
 pub enum Built {
     Blocking(Arc<dyn RemoteSource>),
+    /// A blocking store whose *documents* are leased — a dynamic secret
+    /// engine, which mints a credential for this reader alone.
+    ///
+    /// A variant of its own rather than a flag beside `Blocking`, because
+    /// the difference is not how it is read but what has to happen after:
+    /// a lease is renewed on a timer whether or not anybody reads, and
+    /// handed back when the pod stops needing it.
+    Renewable(Arc<dyn RenewableSource>),
     Async(Arc<dyn AsyncRemoteSource>),
+}
+
+/// The one-document slot a watch delivers into.
+///
+/// A `tokio::sync::watch` channel rather than an `mpsc` of capacity one.
+/// The two look alike and behave oppositely under load: an `mpsc` of
+/// capacity one is a *queue* that holds one — a second document waits, or
+/// is refused — while this **overwrites**, which is what the comment beside
+/// the old channel claimed and the code did not do.
+///
+/// It matters because a document that has been superseded is worthless. A
+/// burst of writes used to make the blocking stores block their own watch
+/// loop and the async stores tear the connection down; now the newest
+/// document is simply the one that gets rendered.
+#[derive(Clone)]
+pub struct Deliver {
+    slot: tokio::sync::watch::Sender<Option<Fetched>>,
+}
+
+impl Deliver {
+    /// Puts `document` in the slot, replacing whatever was there.
+    ///
+    /// # Errors
+    ///
+    /// When the renderer is gone — the only condition that ends a watch.
+    pub fn send(&self, document: Fetched) -> Result<(), dynamic_config::Error> {
+        self.slot
+            .send(Some(document))
+            .map_err(|_| dynamic_config::Error::remote("the renderer stopped"))
+    }
+}
+
+/// The reading half.
+pub struct Delivered {
+    slot: tokio::sync::watch::Receiver<Option<Fetched>>,
+}
+
+impl Delivered {
+    /// Waits for a document that has not been taken yet.
+    ///
+    /// `None` when every sender is gone.
+    pub async fn recv(&mut self) -> Option<Fetched> {
+        loop {
+            self.slot.changed().await.ok()?;
+
+            let document = self.slot.borrow_and_update().clone();
+
+            if let Some(document) = document {
+                return Some(document);
+            }
+        }
+    }
+}
+
+/// A slot and its two halves.
+#[must_use]
+pub fn delivery() -> (Deliver, Delivered) {
+    let (slot, receiver) = tokio::sync::watch::channel(None);
+
+    (Deliver { slot }, Delivered { slot: receiver })
 }
 
 impl Built {
@@ -30,6 +100,7 @@ impl Built {
     pub fn describe(&self) -> String {
         match self {
             Self::Blocking(source) => source.describe(),
+            Self::Renewable(source) => source.describe(),
             Self::Async(source) => source.describe(),
         }
     }
@@ -43,6 +114,7 @@ impl Built {
     pub fn capability(&self) -> WatchCapability {
         match self {
             Self::Blocking(source) => source.watch_capability(),
+            Self::Renewable(source) => source.watch_capability(),
             Self::Async(source) => source.watch_capability(),
         }
     }
@@ -56,46 +128,33 @@ impl Built {
         &self,
         watching: Watching,
         interval: Duration,
-        deliver: tokio::sync::mpsc::Sender<Fetched>,
+        deliver: Deliver,
     ) -> Result<(), dynamic_config::Error> {
         match self {
-            Self::Blocking(source) => {
-                let source = Arc::clone(source);
+            Self::Blocking(_) | Self::Renewable(_) => {
+                let source = self.blocking().expect("a blocking arm");
 
                 tokio::task::spawn_blocking(move || {
                     source.watch(&watching, interval, &mut |document| {
-                        // A full channel means the renderer is behind, which
-                        // for a document that arrives seconds apart means it
-                        // is wedged. Blocking here is the backpressure: the
-                        // store's own loop waits rather than the agent
-                        // growing a queue of documents nobody read.
-                        deliver
-                            .blocking_send(document)
-                            .map_err(|_| dynamic_config::Error::remote("the renderer stopped"))
+                        // Latest wins. A burst of writes produces a burst of
+                        // documents, and every one but the newest is about
+                        // to be superseded — so the slot is overwritten
+                        // rather than queued, and nothing waits.
+                        deliver.send(document)
                     })
                 })
                 .await
                 .map_err(|error| dynamic_config::Error::remote(format!("watch task: {error}")))?
             }
             Self::Async(source) => {
-                // The async trait hands documents to a *synchronous*
-                // callback, so there is no `send().await` to wait on here
-                // the way the blocking arm does. A full channel therefore
-                // ends this watch rather than stalling it: the loop above
-                // reopens it after a spread wait, and the document that
-                // could not be delivered arrives again on the next event
-                // or on the resync. What is lost is a reconnect, not a
-                // change.
+                // The same slot, and the same rule. This arm used to *end
+                // the watch* when the channel was full — a burst against
+                // etcd or NATS tore the connection down and was counted as
+                // a reconnect, so the loudest signal an operator had for a
+                // sick stream fired hardest when the stream was working.
                 source
                     .watch(&watching, interval, &mut move |document| {
-                        deliver.try_send(document).map_err(|error| match error {
-                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                                dynamic_config::Error::remote("the renderer is behind")
-                            }
-                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                                dynamic_config::Error::remote("the renderer stopped")
-                            }
-                        })
+                        deliver.send(document)
                     })
                     .await
             }
@@ -105,8 +164,8 @@ impl Built {
     /// One document, whichever trait fetches it.
     pub async fn fetch(&self) -> Result<dynamic_config::Fetched, dynamic_config::Error> {
         match self {
-            Self::Blocking(source) => {
-                let source = Arc::clone(source);
+            Self::Blocking(_) | Self::Renewable(_) => {
+                let source = self.blocking().expect("a blocking arm");
 
                 tokio::task::spawn_blocking(move || source.fetch())
                     .await
@@ -116,6 +175,62 @@ impl Built {
             }
             Self::Async(source) => source.fetch().await,
         }
+    }
+
+    /// The blocking half of either blocking arm, as one type.
+    ///
+    /// `RenewableSource` is a `RemoteSource`, so reading is the same call
+    /// on both — only the lease calls need to know which one this is.
+    fn blocking(&self) -> Option<Arc<dyn RemoteSource>> {
+        match self {
+            Self::Blocking(source) => Some(Arc::clone(source)),
+            Self::Renewable(source) => Some(Arc::clone(source) as Arc<dyn RemoteSource>),
+            Self::Async(_) => None,
+        }
+    }
+
+    /// Extends a lease, when this store issues them.
+    ///
+    /// `None` from a store that does not — which is not a failure, and is
+    /// why this is an `Option` of a `Result` rather than a `Result` with an
+    /// unsupported variant nobody would match on.
+    pub async fn renew(&self, lease: Lease) -> Option<Result<Lease, dynamic_config::Error>> {
+        let Self::Renewable(source) = self else {
+            return None;
+        };
+
+        let source = Arc::clone(source);
+
+        // Blocking, like every other Vault call: it goes to the pool
+        // rather than parking the reactor for a network round trip.
+        Some(
+            tokio::task::spawn_blocking(move || source.renew(&lease))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(dynamic_config::Error::remote(format!(
+                        "renewal task: {error}"
+                    )))
+                }),
+        )
+    }
+
+    /// Hands a lease back. `None` from a store that issues none.
+    pub async fn revoke(&self, lease: Lease) -> Option<Result<(), dynamic_config::Error>> {
+        let Self::Renewable(source) = self else {
+            return None;
+        };
+
+        let source = Arc::clone(source);
+
+        Some(
+            tokio::task::spawn_blocking(move || source.revoke(&lease))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(dynamic_config::Error::remote(format!(
+                        "revocation task: {error}"
+                    )))
+                }),
+        )
     }
 }
 
@@ -134,8 +249,31 @@ macro_rules! tls_config {
             tls = tls.with_client_certificate_files(cert, key);
         }
 
+        if let Some(name) = &$spec.tls_server_name {
+            tls = tls.with_server_name(name);
+        }
+
+        if $spec.tls_skip_verify {
+            tls = tls.with_skip_verification(true);
+        }
+
         tls
     }};
+}
+
+/// `--timeout` where the store has a door for it.
+///
+/// Every store here defaults to ten seconds, which is right for a store on
+/// the same network and wrong for a Git remote across a WAN or a bucket in
+/// another region. The workload knows which it has; until this, it had no
+/// way to say so and its only recourse was a fetch that kept timing out.
+macro_rules! timed {
+    ($store:expr, $spec:expr) => {
+        match $spec.timeout {
+            Some(timeout) => $store.with_timeout(timeout),
+            None => $store,
+        }
+    };
 }
 
 pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
@@ -147,7 +285,10 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    let wants_tls = spec.ca.is_some() || spec.tls_cert.is_some();
+    let wants_tls = spec.ca.is_some()
+        || spec.tls_cert.is_some()
+        || spec.tls_server_name.is_some()
+        || spec.tls_skip_verify;
 
     let source: Box<dyn RemoteSource> = match spec.source.as_str() {
         "consul" => {
@@ -156,11 +297,11 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
             use dynamic_config_consul::Auth;
 
             store = match spec.auth.as_deref() {
-                None => match &spec.token {
+                None => match spec.token() {
                     Some(token) => store.with_token(token),
                     None => store,
                 },
-                Some("token") => store.with_token(spec.token.as_deref().expect("validated")),
+                Some("token") => store.with_token(spec.token().expect("validated")),
                 Some("kubernetes") => {
                     let method = spec.auth_mount.as_deref().expect("validated");
                     let mut auth = Auth::kubernetes(method);
@@ -173,7 +314,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 }
                 Some("jwt") => store.with_auth(Auth::jwt(
                     spec.auth_mount.as_deref().expect("validated"),
-                    spec.token.as_deref().expect("validated"),
+                    spec.token().expect("validated"),
                 )),
                 Some(_) => unreachable!("validated"),
             };
@@ -182,7 +323,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 store = store.with_tls(tls_config!(spec, dynamic_config_consul::TlsConfig));
             }
 
-            Box::new(store)
+            Box::new(timed!(store, spec))
         }
         "vault" => {
             // `--key mount/path`, the way vault CLI users write it.
@@ -196,7 +337,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
             use dynamic_config_vault::Auth;
 
             let mut auth = match spec.auth.as_deref() {
-                None | Some("token") => Auth::token(spec.token.as_deref().expect("validated")),
+                None | Some("token") => Auth::token(spec.token().expect("validated")),
                 Some("kubernetes") => {
                     let mut auth = Auth::kubernetes(spec.auth_role.as_deref().expect("validated"));
 
@@ -208,10 +349,10 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 }
                 Some("approle") => Auth::app_role(
                     spec.auth_role.as_deref().expect("validated"),
-                    spec.password.as_deref().expect("validated"),
+                    spec.password().expect("validated"),
                 ),
                 Some("jwt") => {
-                    let mut auth = Auth::jwt(spec.token.as_deref().expect("validated"));
+                    let mut auth = Auth::jwt(spec.token().expect("validated"));
 
                     if let Some(role) = &spec.auth_role {
                         auth = auth.with_role(role);
@@ -221,11 +362,11 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 }
                 Some("userpass") => Auth::userpass(
                     spec.auth_username.as_deref().expect("validated"),
-                    spec.password.as_deref().expect("validated"),
+                    spec.password().expect("validated"),
                 ),
                 Some("ldap") => Auth::ldap(
                     spec.auth_username.as_deref().expect("validated"),
-                    spec.password.as_deref().expect("validated"),
+                    spec.password().expect("validated"),
                 ),
                 Some("cert") => {
                     let mut auth = Auth::certificate();
@@ -253,7 +394,16 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 store = store.with_tls(tls_config!(spec, dynamic_config_vault::TlsConfig));
             }
 
-            Box::new(store)
+            // A dynamic engine leaves here by a different door: the lease it
+            // issues has to reach the loop that renews it, and a
+            // `Box<dyn RemoteSource>` has nowhere to put one.
+            if spec.dynamic {
+                return Ok(Built::Renewable(Arc::new(
+                    timed!(store, spec).with_dynamic(),
+                )));
+            }
+
+            Box::new(timed!(store, spec))
         }
         "config-server" => {
             let (application, profile) = spec
@@ -304,7 +454,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 })));
             }
 
-            if let Some(token) = &spec.token {
+            if let Some(token) = spec.token() {
                 store = store.with_token(token);
             }
 
@@ -315,7 +465,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                     store.with_tls(tls_config!(spec, dynamic_config_store_core::tls::TlsConfig));
             }
 
-            Box::new(store)
+            Box::new(timed!(store, spec))
         }
         "firestore" => {
             // `--endpoint <project>` or `<project>/<database>`.
@@ -336,9 +486,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 // The workload's own identity is the default: no secret
                 // distributed, and the token renews itself.
                 None | Some("metadata-server") => Auth::metadata_server(),
-                Some("access-token") => {
-                    Auth::access_token(spec.token.as_deref().expect("validated"))
-                }
+                Some("access-token") => Auth::access_token(spec.token().expect("validated")),
                 Some("emulator") => Auth::Emulator,
                 Some(_) => unreachable!("validated"),
             });
@@ -351,7 +499,7 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
                 store = store.with_tls(tls_config!(spec, dynamic_config_firestore::TlsConfig));
             }
 
-            Box::new(store)
+            Box::new(timed!(store, spec))
         }
         "git" => {
             let mut builder =
@@ -377,13 +525,13 @@ pub async fn build(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
             use dynamic_config_git::Credential;
 
             builder = builder.credential(match spec.auth.as_deref() {
-                None => match &spec.token {
+                None => match spec.token() {
                     Some(token) => Credential::token(token),
                     None => Credential::anonymous(),
                 },
                 Some("anonymous") => Credential::anonymous(),
                 Some("token") => {
-                    let token = spec.token.as_deref().expect("validated");
+                    let token = spec.token().expect("validated");
 
                     match &spec.auth_username {
                         // The host that turns out to care about the user half.
@@ -467,10 +615,13 @@ async fn etcd(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
     let mut options = ConnectOptions::new();
 
     if let Some(user) = &spec.auth_username {
-        options = options.with_user(user, spec.password.as_deref().expect("validated"));
+        options = options.with_user(user, spec.password().expect("validated"));
     }
 
-    let wants_tls = spec.ca.is_some() || spec.tls_cert.is_some();
+    let wants_tls = spec.ca.is_some()
+        || spec.tls_cert.is_some()
+        || spec.tls_server_name.is_some()
+        || spec.tls_skip_verify;
     let store = if wants_tls {
         let tls = tls_config!(spec, dynamic_config_etcd::TlsConfig);
 
@@ -492,11 +643,11 @@ async fn nats(spec: &Spec) -> Result<Built, Box<dyn std::error::Error>> {
         .split_once('/')
         .ok_or("nats' --key is <bucket>/<key>")?;
 
-    let options = match (&spec.auth_token_path, &spec.token) {
+    let options = match (&spec.auth_token_path, spec.token()) {
         (Some(path), _) => ConnectOptions::with_credentials_file(path)
             .await
             .map_err(|error| format!("nats credentials file: {error}"))?,
-        (None, Some(token)) => ConnectOptions::with_token(token.clone()),
+        (None, Some(token)) => ConnectOptions::with_token(token.to_owned()),
         (None, None) => ConnectOptions::new(),
     };
 

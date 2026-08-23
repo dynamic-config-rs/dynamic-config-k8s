@@ -74,6 +74,12 @@ app.kubernetes.io/component: operator
 {{- end }}
 
 {{/* commonAnnotations, rendered where a resource has no other notes. */}}
+{{- define "dynamic-config.nodeAgent.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "dynamic-config.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: node-agent
+{{- end }}
+
 {{- define "dynamic-config.annotations" -}}
 {{- with .Values.commonAnnotations }}
 annotations:

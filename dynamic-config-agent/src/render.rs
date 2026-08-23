@@ -49,6 +49,16 @@ pub fn render_fetched(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let document = resolve(&fetched.text, fetched.format, spec.section.as_deref())?;
 
+    // Before the template and before the write: a document that does not
+    // satisfy the schema must not reach the application, and the caller
+    // keeps serving the last good file instead. The engine's own validation
+    // is a *typed* one and belongs to Rust, Python and Node; this is the
+    // same guarantee for the consumers that are none of those — a Java
+    // service reading `.properties`, a daemon reading YAML.
+    if let Some(path) = &spec.schema {
+        validate(&document, path)?;
+    }
+
     // A template owns the bytes. The file variant is re-read at every
     // render on purpose: it is a mounted ConfigMap, and an edit there
     // should take on the next tick, not the next rollout.
@@ -91,6 +101,7 @@ fn templated(
             minijinja::escape_formatter(out, state, value)
         }
     });
+    register_filters(&mut environment);
     environment.add_template("out", text)?;
 
     let rendered = environment
@@ -325,6 +336,489 @@ fn ini_scalar(value: &serde_json::Value) -> Result<String, Box<dyn std::error::E
     })
 }
 
+/// The filters a configuration template needs and minijinja does not ship.
+///
+/// Six, and the list is short on purpose. Every one of them is a *pure
+/// function of the document already in hand* — which is the line this
+/// crate does not cross: a template cannot read a file, reach a store or
+/// see an environment variable, so the pipeline stays
+/// fetch → resolve → validate → render and a rendered document is a
+/// function of what was fetched. Consul Template's `secret()` is exactly
+/// the feature not being copied.
+///
+/// `indent`, `default`, `join` and `string` are minijinja's own and are
+/// not repeated here.
+fn register_filters(environment: &mut minijinja::Environment<'_>) {
+    // The one every Kubernetes template needs: a Secret's `data` is
+    // base64, so a template writing one has to encode.
+    environment.add_filter("b64encode", |value: &str| base64(value.as_bytes()));
+    environment.add_filter(
+        "b64decode",
+        |value: &str| -> Result<String, minijinja::Error> {
+            let bytes = unbase64(value).ok_or_else(|| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    "b64decode: not base64",
+                )
+            })?;
+
+            String::from_utf8(bytes).map_err(|_| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    "b64decode: not UTF-8",
+                )
+            })
+        },
+    );
+
+    // minijinja's `tojson` is behind a feature this build does not enable,
+    // and a configuration template that cannot emit JSON is missing the
+    // format half its consumers read.
+    environment.add_filter("json", |value: minijinja::Value| {
+        serde_json::to_string(&value).map_err(|error| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("json: {error}"),
+            )
+        })
+    });
+    environment.add_filter("yaml", |value: minijinja::Value| {
+        serde_yaml::to_string(&value).map_err(|error| {
+            minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                format!("yaml: {error}"),
+            )
+        })
+    });
+
+    // A password with a `#` in it ends a line in half the formats here.
+    environment.add_filter("quote", |value: minijinja::Value| {
+        serde_json::to_string(&value.to_string()).unwrap_or_else(|_| String::from("\"\""))
+    });
+
+    // `Strict` already refuses an *undefined* key. This refuses one that
+    // is defined and empty, which is the shape a missing secret usually
+    // arrives in — and it names the field rather than rendering a document
+    // with a blank password in it.
+    environment.add_filter(
+        "required",
+        |value: minijinja::Value,
+         message: Option<String>|
+         -> Result<minijinja::Value, minijinja::Error> {
+            let missing = value.is_none()
+                || value.is_undefined()
+                || value.as_str().is_some_and(str::is_empty);
+
+            if missing {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    message.unwrap_or_else(|| "required: the value is empty".to_owned()),
+                ));
+            }
+
+            Ok(value)
+        },
+    );
+}
+
+/// Standard-library base64, the same three-bytes-to-four this organisation
+/// writes wherever it needs one rather than taking a dependency for it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let block = u32::from(chunk[0]) << 16
+            | u32::from(chunk.get(1).copied().unwrap_or(0)) << 8
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+
+        for index in 0..4 {
+            if index <= chunk.len() {
+                let position = (block >> (18 - index * 6)) & 0x3F;
+                encoded.push(char::from(ALPHABET[position as usize]));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+
+    encoded
+}
+
+/// The other direction. `None` for anything that is not base64.
+fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let mut bits = 0u32;
+    let mut held = 0;
+    let mut bytes = Vec::with_capacity(text.len() / 4 * 3);
+
+    for character in text.bytes() {
+        let value = match character {
+            b'A'..=b'Z' => u32::from(character - b'A'),
+            b'a'..=b'z' => u32::from(character - b'a') + 26,
+            b'0'..=b'9' => u32::from(character - b'0') + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' => continue,
+            _ => return None,
+        };
+
+        bits = bits << 6 | value;
+        held += 6;
+
+        if held >= 8 {
+            held -= 8;
+            bytes.push(u8::try_from(bits >> held & 0xFF).ok()?);
+        }
+    }
+
+    Some(bytes)
+}
+
+/// Every file this document becomes, rendered and checked but not yet
+/// written.
+///
+/// **All or none.** The whole point is that a failure in the third file
+/// does not leave the first two published: an application reading two of
+/// them never sees one from before a change and one from after it. So
+/// everything is resolved, validated and rendered *first*, and only a
+/// complete set is handed back to be written.
+///
+/// What this does not claim: the writes themselves are separate renames.
+/// Each is atomic, the set is not, and a reader can in principle catch the
+/// microseconds between two of them. That window is a rename apart rather
+/// than a fetch apart, which is the difference worth having — and calling
+/// it atomicity would be a promise the filesystem does not make.
+///
+/// # Errors
+///
+/// If any rendering fails. Nothing is written either way; writing is the
+/// caller's, and it happens only on `Ok`.
+pub fn render_all(
+    fetched: &dynamic_config::Fetched,
+    spec: &Spec,
+) -> Result<Vec<Published>, Box<dyn std::error::Error>> {
+    // Before anything is parsed. The engine enforces the same ceiling at
+    // its own slot, which this agent does not use — it reads a
+    // `RemoteSource` directly — so the check has to be here, and here is
+    // also the right place: a document is held several times over between
+    // parsing and rendering, and the container has 64Mi.
+    let ceiling = spec
+        .max_document_bytes
+        .unwrap_or(dynamic_config::MAX_DOCUMENT_BYTES);
+
+    if fetched.text.len() > ceiling {
+        return Err(format!(
+            "the store answered with {} bytes, past the {ceiling}-byte ceiling; \
+             raise it with --max-document-bytes if the document is meant to be \
+             this large",
+            fetched.text.len()
+        )
+        .into());
+    }
+
+    let mut published = Vec::with_capacity(1 + spec.also.len());
+
+    published.push(Published {
+        out: spec.out.clone(),
+        document: render_fetched(fetched, spec)?,
+        file_mode: spec.file_mode,
+    });
+
+    for rendering in &spec.also {
+        let document = resolve(&fetched.text, fetched.format, rendering.section.as_deref())
+            .map_err(|error| format!("{}: {error}", rendering.out.display()))?;
+
+        if let Some(path) = &spec.schema {
+            validate(&document, path)
+                .map_err(|error| format!("{}: {error}", rendering.out.display()))?;
+        }
+
+        let rendered = render(
+            &document,
+            OutputFormat::of(&rendering.out).expect("validated in Spec"),
+        )
+        .map_err(|error| format!("{}: {error}", rendering.out.display()))?;
+
+        published.push(Published {
+            out: rendering.out.clone(),
+            document: rendered,
+            file_mode: rendering.file_mode,
+        });
+    }
+
+    Ok(published)
+}
+
+/// One file, rendered and waiting to be written.
+pub struct Published {
+    /// Where it goes.
+    pub out: std::path::PathBuf,
+    /// What goes in it.
+    pub document: String,
+    /// The permissions it lands with.
+    pub file_mode: Option<u32>,
+}
+
+/// The compiled schema, if one was configured.
+///
+/// Compiled once per process rather than per render: a schema is a mounted
+/// ConfigMap and compiling it is the expensive half, while a render happens
+/// every time the store moves.
+///
+/// A schema that will not compile is held as its message and returned on
+/// every render — the alternative is retrying the compilation on a tick,
+/// which turns one clear failure into a stream of identical ones.
+static SCHEMA: std::sync::OnceLock<Result<jsonschema::Validator, String>> =
+    std::sync::OnceLock::new();
+
+/// Checks the resolved document against the schema at `path`.
+///
+/// # Errors
+///
+/// If the schema is unreadable or will not compile, or if the document does
+/// not satisfy it.
+fn validate(
+    document: &serde_json::Value,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compiled = SCHEMA.get_or_init(|| {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("the schema at {} is unreadable: {error}", path.display()))?;
+
+        let schema: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("the schema at {} is not JSON: {error}", path.display()))?;
+
+        jsonschema::validator_for(&schema)
+            .map_err(|error| format!("the schema at {} will not compile: {error}", path.display()))
+    });
+
+    let compiled = compiled.as_ref().map_err(Clone::clone)?;
+
+    let mut refusals = compiled.iter_errors(document).peekable();
+
+    if refusals.peek().is_none() {
+        return Ok(());
+    }
+
+    // **The path and the rule, never the value.** A schema failure names the
+    // field that was wrong, and the field that is wrong is on a bad day the
+    // one holding the password — the same rule the engine's parse errors
+    // follow. `jsonschema`'s own `Display` prints the instance, so it is
+    // deliberately not used.
+    let named: Vec<String> = refusals
+        .take(FIRST_FEW)
+        .map(|refusal| {
+            let path = refusal.instance_path().to_string();
+            let at = if path.is_empty() {
+                "the document".to_owned()
+            } else {
+                path
+            };
+
+            format!("{at} does not satisfy {}", refusal.schema_path())
+        })
+        .collect();
+
+    Err(format!(
+        "the document does not satisfy the schema: {}",
+        named.join("; ")
+    )
+    .into())
+}
+
+/// How many schema refusals to name before stopping.
+///
+/// A document that is wrong everywhere produces a message nobody reads, and
+/// the first few are the ones somebody fixes first.
+const FIRST_FEW: usize = 5;
+
+/// The digest of a rendered document, for the meta file beside it.
+///
+/// Over the **bytes as written**, which is what makes it checkable: an
+/// operator can run `sha256sum` on the file and get this number back.
+/// Deliberately not the same thing as the engine's
+/// `Config::fingerprint()`, which digests the *resolved tree* with secrets
+/// masked — that answers "is this process's configuration the same as that
+/// one's", and this answers "is this file the same as that file".
+///
+/// It therefore *does* cover secret values, which is why it goes in a file
+/// beside the document rather than into a log line or a metric label.
+#[must_use]
+pub fn digest(document: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(document.as_bytes());
+
+    let mut rendered = String::from("sha256:");
+
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+
+        let _ = write!(rendered, "{byte:02x}");
+    }
+
+    rendered
+}
+
+/// What was rendered, beside what was rendered.
+///
+/// A sibling `.<name>.meta` answering the question an application cannot
+/// otherwise ask: *which configuration am I actually running?* Two pods
+/// holding the same file is a claim nobody can check from inside either of
+/// them; two pods printing the same fingerprint is one anybody can.
+///
+/// **Never a value.** The fingerprint has secrets masked by position, the
+/// revision is what the store called this version, and the rest is a clock
+/// — nothing here is the document, which is the whole reason this can sit
+/// beside a file mounted into an application that is not trusted with it.
+///
+/// Written through the same rename as the document, and *after* it: a meta
+/// file describing a document that is not there yet would be worse than no
+/// meta file at all.
+pub fn write_meta(
+    path: &Path,
+    generation: Option<&dynamic_config::Revision>,
+    fingerprint: &str,
+    mode: Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(meta) = meta_path(path) else {
+        return Ok(());
+    };
+
+    let revision =
+        generation.map_or_else(|| "null".to_owned(), |revision| format!("\"{revision}\""));
+
+    let rendered_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+
+    let document = format!(
+        "{{\n  \"fingerprint\": \"{fingerprint}\",\n  \"revision\": {revision},\n  \
+         \"rendered_at\": {rendered_at}\n}}\n"
+    );
+
+    write_atomically(&meta, &document, mode)
+}
+
+/// Keeps the generation that is being replaced, for the question an
+/// incident starts with.
+///
+/// *What was the file before?* is unanswerable today: the rename that
+/// publishes a new document is the same rename that destroys the old one,
+/// and by the time anybody asks, the store has moved on too.
+///
+/// **What this is not.** It is not a rollback. Putting an old document back
+/// needs the application to say the new one is bad, and nothing here can
+/// hear that — half a feature that implies the other half is worse than
+/// neither. This keeps files; a person reads them.
+///
+/// `/config/app.yaml` → `/config/.app.yaml.history/<unix>-<digest>.yaml`,
+/// newest kept, oldest pruned past `keep`.
+///
+/// # Errors
+///
+/// Never: a history that cannot be written is a diagnostic that is missing,
+/// not a render that failed. The caller logs what comes back and publishes
+/// regardless.
+pub fn keep_previous(path: &Path, keep: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if keep == 0 {
+        return Ok(());
+    }
+
+    // Nothing to keep on the first render, which is the common case for a
+    // pod that starts and never changes.
+    let Ok(previous) = std::fs::read_to_string(path) else {
+        return Ok(());
+    };
+
+    let directory = history_path(path).ok_or("--out needs a name")?;
+    std::fs::create_dir_all(&directory)?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+
+    // The digest in the name, so two generations with the same contents —
+    // a re-render that changed nothing but the store's revision — are one
+    // file rather than two, and so a reader can match a name against a meta
+    // file without opening it.
+    let digest = digest(&previous);
+    let short = digest.trim_start_matches("sha256:").get(..12).unwrap_or("");
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("txt");
+
+    let kept = directory.join(format!("{stamp}-{short}.{extension}"));
+
+    // The same mode as the render it is a copy of. A history file readable
+    // by more than the document would be a way around the document's own
+    // permissions.
+    write_atomically(&kept, &previous, mode_of(path))?;
+    prune(&directory, keep)?;
+
+    Ok(())
+}
+
+/// The mode the rendered file actually has, so a copy of it does not widen
+/// anything.
+#[cfg(unix)]
+fn mode_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn mode_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Drops the oldest until `keep` remain.
+fn prune(directory: &Path, keep: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut kept: Vec<std::path::PathBuf> = std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+
+    // By name, which sorts by the timestamp it starts with. Reading mtimes
+    // would be the same answer through more syscalls, and a tmpfs restored
+    // from anywhere has the names and not necessarily the times.
+    kept.sort();
+
+    let over = kept.len().saturating_sub(keep);
+
+    for path in kept.into_iter().take(over) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    Ok(())
+}
+
+/// `/config/app.yaml` → `/config/.app.yaml.history`.
+#[must_use]
+pub fn history_path(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+
+    Some(path.with_file_name(format!(".{name}.history")))
+}
+
+/// `/config/app.yaml` → `/config/.app.yaml.meta`.
+///
+/// Hidden, so a directory read by an application that globs `*.yaml` does
+/// not suddenly find a second file it will try to parse.
+#[must_use]
+pub fn meta_path(path: &Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_str()?;
+
+    Some(path.with_file_name(format!(".{name}.meta")))
+}
+
 /// Write-then-rename, the same courtesy every atomic-save editor pays:
 /// the application's watcher sees whole files, never half ones.
 pub fn write_atomically(
@@ -509,6 +1003,154 @@ mod tests {
             mode & 0o777,
             0o640,
             "the rendered file wears the asked mode"
+        );
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn rendered(template: &str) -> Result<String, String> {
+        let document = serde_json::json!({
+            "user": "app",
+            "password": "p@ss#word",
+            "port": 5432,
+            "tls": true,
+            "empty": "",
+            "pool": { "max": 10 },
+        });
+
+        templated(template, &document).map_err(|error| error.to_string())
+    }
+
+    /// A Secret's `data` is base64, so a template that writes one has to
+    /// encode — and minijinja ships no filter for it.
+    #[test]
+    fn base64_goes_both_ways() {
+        assert_eq!(rendered("{{ user | b64encode }}").unwrap(), "YXBw");
+        assert_eq!(rendered("{{ 'YXBw' | b64decode }}").unwrap(), "app");
+    }
+
+    #[test]
+    fn base64_pads_the_way_everything_else_expects() {
+        // One, two and three bytes: the three padding cases.
+        assert_eq!(base64(b"a"), "YQ==");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"abc"), "YWJj");
+
+        for text in ["", "a", "ab", "abc", "hello world", "p@ss#word"] {
+            assert_eq!(
+                unbase64(&base64(text.as_bytes())).as_deref(),
+                Some(text.as_bytes()),
+                "round trip: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_base64_is_an_error_rather_than_a_guess() {
+        assert!(rendered("{{ '!!!' | b64decode }}").is_err());
+    }
+
+    /// minijinja's own `tojson` is behind a feature this build does not
+    /// enable, so a configuration template could not emit JSON at all.
+    #[test]
+    fn json_and_yaml_are_available() {
+        assert_eq!(rendered("{{ pool | json }}").unwrap(), r#"{"max":10}"#);
+        assert!(rendered("{{ pool | yaml }}").unwrap().contains("max: 10"));
+    }
+
+    /// A password with a `#` in it ends a line in half the formats here.
+    #[test]
+    fn quote_escapes_what_would_otherwise_end_a_line() {
+        assert_eq!(
+            rendered("{{ password | quote }}").unwrap(),
+            r#""p@ss#word""#
+        );
+    }
+
+    /// `Strict` refuses an *undefined* key already. This refuses one that
+    /// is defined and empty — the shape a missing secret usually arrives
+    /// in — and names the field rather than rendering a blank password.
+    #[test]
+    fn required_refuses_an_empty_value() {
+        assert!(rendered("{{ empty | required }}").is_err());
+        assert_eq!(rendered("{{ user | required }}").unwrap(), "app");
+
+        let error = rendered(r#"{{ empty | required("no password was supplied") }}"#)
+            .expect_err("empty is refused");
+
+        assert!(error.contains("no password was supplied"), "{error}");
+    }
+
+    /// The line this crate does not cross: a template is a pure function of
+    /// the document already in hand. Consul Template's `secret()` is
+    /// exactly the feature not being copied — so there is nothing here that
+    /// reads a file, an environment variable or a store.
+    #[test]
+    fn a_template_cannot_reach_outside_the_document() {
+        for reaching in [
+            "{{ secret('secret/myapp') }}",
+            "{{ env('HOME') }}",
+            "{{ file('/etc/passwd') }}",
+        ] {
+            assert!(
+                rendered(reaching).is_err(),
+                "a template must not be able to call {reaching}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_builtin_filters_are_still_there() {
+        assert_eq!(rendered("{{ port | string }}").unwrap(), "5432");
+        assert_eq!(rendered("{{ missing | default('none') }}").unwrap(), "none");
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    /// The engine's own validation is a *typed* one and belongs to Rust,
+    /// Python and Node. This is the same guarantee for the consumers that
+    /// are none of those — a Java service reading `.properties`, a daemon
+    /// reading YAML — so it is checked before the write and the last good
+    /// file goes on serving when it fails.
+    #[test]
+    fn a_document_that_does_not_satisfy_the_schema_is_refused() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let schema = directory.path().join("schema.json");
+
+        std::fs::write(
+            &schema,
+            r#"{
+                "type": "object",
+                "properties": {
+                    "port": { "type": "integer", "minimum": 1 },
+                    "password": { "type": "string" }
+                },
+                "required": ["port"]
+            }"#,
+        )
+        .expect("the schema writes");
+
+        let good = serde_json::json!({ "port": 5432, "password": "hunter2-planted" });
+        assert!(validate(&good, &schema).is_ok());
+
+        let bad = serde_json::json!({ "port": "not-a-number", "password": "hunter2-planted" });
+        let error = validate(&bad, &schema)
+            .expect_err("a string is not an integer")
+            .to_string();
+
+        // The path and the rule, never the value: a schema failure names
+        // the field that was wrong, and on a bad day that is the one
+        // holding the password.
+        assert!(error.contains("port"), "{error}");
+        assert!(
+            !error.contains("hunter2-planted"),
+            "the document must not reach the message: {error}"
         );
     }
 }

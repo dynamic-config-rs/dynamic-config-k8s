@@ -166,11 +166,42 @@ not own. The password never appears in values, in git, or in a
 developer's hands; the store document is the single source, and the
 Secret follows it on the Render's interval.
 
-Deleting the Render deletes its target: it is owned via
-`ownerReferences`, so the cleanup is Kubernetes' own garbage collector
-— no finalizer to get wrong. `status.renderedAt` says when the last
-render landed; `status.lastError` carries kind and shape only, never a
-value.
+Deleting the Render deletes its target **unless it says otherwise**:
+
+```yaml
+spec:
+  target:
+    secret: billing-credentials
+    deletionPolicy: Retain          # or Delete, the default
+```
+
+`Delete` owns the target via `ownerReferences`, so the cleanup is
+Kubernetes' own garbage collector — no finalizer to get wrong. `Retain`
+writes no owner reference at all, which is the right answer for a Secret
+something else still needs: deleting the Render that *produced* a
+credential should not be the same act as revoking it everywhere.
+
+`status.renderedAt` says when the last render landed and
+`status.lastError` carries kind and shape only, never a value.
+`status.observedGeneration` is the `metadata.generation` this status was
+written for, so a controller or a `kubectl wait` can tell "this succeeded"
+from "this has not been looked at since it changed".
+
+### Why a render is not ready
+
+The `Ready` condition carries a machine-readable reason, and the three are
+kept apart because they belong to different people:
+
+| reason | what it means | who fixes it |
+|---|---|---|
+| `ClassNotFound` | the class this render names does not exist | whoever wrote the Render |
+| `ClassNotAllowed` | it exists, and does not admit this namespace | the platform team that owns the class |
+| `RenderFailed` | the store could not be read, or the document could not be rendered | depends on the message |
+
+Before 0.3.0 all three were `RenderFailed`, so every alert grepped a
+message. **These strings are API** on the same terms as the annotation
+contract: a dashboard aggregates on them, and a rename is a breaking
+change.
 
 Two honesty notes, stated before the reconciler shipped and still
 true:

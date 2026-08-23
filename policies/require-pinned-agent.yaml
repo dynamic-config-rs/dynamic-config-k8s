@@ -1,0 +1,36 @@
+# The injected agent runs beside the application and holds the store
+# credential, so which image it is matters as much as the application's.
+# This one runs AFTER injection — it reads the container the webhook wrote,
+# which is why its match is on the status annotation rather than on
+# `inject`.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dynamic-config-require-pinned-agent
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        object.metadata.annotations['dynamic-config.rs/status'] != 'injected' ||
+        (object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : []))
+          .filter(c, c.name.startsWith('dynamic-config-agent'))
+          .all(c, c.image.contains('@sha256:'))
+      message: >-
+        the injected dynamic-config agent must be pinned by digest. Set
+        agent.image to a name@sha256:... in the chart values.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dynamic-config-require-pinned-agent
+spec:
+  policyName: dynamic-config-require-pinned-agent
+  validationActions: [Warn]
+  matchResources: {}

@@ -11,6 +11,7 @@ description = "Init-container and sidecar: renders dynamic-config documents from
 publish = false   # ships as an image, not a crate
 
 [dependencies]
+dynamic-config-telemetry = { path = "../dynamic-config-telemetry" }
 dynamic-config = { workspace = true, features = ["json", "toml", "yaml", "ini", "properties", "watch", "tracing"] }
 dynamic-config-consul = { workspace = true }
 dynamic-config-vault = { workspace = true }
@@ -26,6 +27,14 @@ dynamic-config-s3 = { workspace = true }
 tokio = { workspace = true }
 aws-config = { workspace = true }
 serde_json = { workspace = true }
+# Already in this binary's tree for Consul, Vault and Firestore — a direct
+# edge rather than a new dependency, so the Events reporter can build one
+# request without `kube` and `k8s-openapi`, which would roughly double the
+# image for one POST.
+ureq = { version = "3.0.12", default-features = false, features = ["rustls", "json"] }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+jsonschema = { workspace = true }
 toml = "0.8"
 serde_yaml = "0.9"
 tracing = { workspace = true }

@@ -32,7 +32,7 @@ jobs:
         env:
           SOAK_HOURS: "5"
 
-  # The three images, built once for the whole run.
+  # The four images, built once for the whole run.
   #
   # Each e2e leg used to build all three itself: three legs, nine builds,
   # every one of them compiling the same dependency graph from nothing.
@@ -79,7 +79,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [smoke, operator-smoke, stores-smoke]
+        # `upgrade` is here rather than in the pull-request suite because
+        # it installs a *published* chart from a registry: it is the one
+        # leg that is not hermetic, and the one that catches what only an
+        # upgrade can — CRDs Helm will not touch, and a `caBundle` the
+        # chart would happily render empty over.
+        # `scale` is output rather than a gate: a shared runner cannot
+        # produce a number worth publishing as a guarantee, and a
+        # threshold tuned on one would fail on another. It fails only on
+        # what is qualitatively wrong — a refusal, or an admission that ate
+        # a second of the API server's ten.
+        leg: [smoke, operator-smoke, stores-smoke, upgrade, scale]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1

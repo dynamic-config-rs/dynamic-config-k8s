@@ -19,7 +19,63 @@ commonAnnotations: {}
 imagePullSecrets: []
 
 # ── The agent (what gets injected) ───────────────────────────────────
+# One agent per node instead of one beside every render, delivering
+# configuration as a CSI volume.
+#
+# OFF, and the sidecar stays the default. It trades away the property the
+# sidecar shape is built on — a sidecar holds one workload's credential;
+# this process holds the store credentials of every pod on its node — and
+# it runs as root, because the kubelet creates pod volume directories owned
+# by root and a process that cannot write into them cannot publish.
+#
+# What it buys is the number it exists for: 10,000 pods at 2.5 renders each
+# is 25,000 sidecar containers, and a node whose hundred pods read one
+# Consul key opens one connection rather than a hundred.
+#
+# Not a better shape. A different trade, for a scale that makes the first
+# one untenable.
+nodeAgent:
+  enabled: false
+  image: ghcr.io/dynamic-config-rs/dynamic-config-node-agent
+  tag: ""
+  # Where the kubelet keeps its plugin and pod directories. `/var/lib/kubelet`
+  # everywhere except a few distributions — k0s and some managed offerings
+  # move it, and a wrong value is a driver the kubelet never registers.
+  kubeletPath: /var/lib/kubelet
+  metricsPort: 9111
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar
+    tag: v2.13.0
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
 agent:
+  # Kubernetes Events written by the injected agent about its own pod, so
+  # `kubectl describe pod` shows a render failure where somebody is already
+  # looking rather than one `kubectl logs -c` away.
+  #
+  # OFF, and worth the sentence: the sidecar carries no API credential in
+  # any other configuration. Turning this on puts a service account beside
+  # every application that asks for it, to improve a diagnostic — a real
+  # trade rather than an obvious win. The grant is `create` on `events`,
+  # namespaced, and nothing more.
+  #
+  # `webhook.allowEvents` has to be true as well; the two are separate so
+  # that a cluster can create the Roles ahead of letting pods ask.
+  events:
+    enabled: false
+    # The namespaces to create the Role and RoleBinding in. Events are
+    # namespaced, so there is no cluster-wide form of this and there should
+    # not be.
+    namespaces: []
+    # The service accounts to bind. Empty binds every account in the
+    # namespace, which is what works before somebody knows the names;
+    # naming them is the better shape once they do.
+    serviceAccounts: []
   image: ghcr.io/dynamic-config-rs/dynamic-config-agent
   tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""            # wins over tag when set — pin in production
@@ -53,9 +109,16 @@ agent:
     # 0 is refused — the agent stays nonroot in every configuration.
     runAsUser: ""
     runAsGroup: ""
-    # Serve agent metrics on this port by default (empty = no metrics
-    # endpoint); a pod opts out with `metrics-port: "0"`.
-    metricsPort: ""
+    # Serve agent metrics on this port by default; a pod opts out with
+    # `metrics-port: "0"`, and an empty value here means no endpoint at all.
+    #
+    # On by default, because the port is also what the injected container's
+    # readiness probe answers on: `/readyz` is 503 until a document has been
+    # rendered, and pod readiness is AND-ed across containers — so a Service
+    # sends no traffic to a pod whose configuration does not exist yet. A
+    # pod that would rather start regardless says
+    # `dynamic-config.rs/readiness: "false"`.
+    metricsPort: 9110
     # Environment every injected agent gets, installer-set so no
     # allowlist applies; a pod's own `agent-env` overrides it name by
     # name. Same NAME=value grammar: "HTTPS_PROXY=http://egress:3128"
@@ -156,6 +219,52 @@ webhook:
   #   sourceDeny: "sandbox: git"
   sourceAllow: ""
   sourceDeny: ""
+  # Whether a pod may set `dynamic-config.rs/tls-skip-verify`, which
+  # connects to its store WITHOUT authenticating it — anything on the
+  # network path can then supply that pod's configuration and its
+  # credentials.
+  #
+  # Off, and this is the one annotation in the contract a workload cannot
+  # reach on its own: it is a cluster's decision rather than a namespace's.
+  # Try `ca-configmap` first — trusting one more certificate covers both
+  # the self-signed development server and the enterprise private CA, and
+  # keeps the server authenticated.
+  #
+  # Pods that use it still earn an admission warning, log a line at start,
+  # and report `dynamic_config_agent_tls_verification_skipped 1`.
+  allowTlsSkipVerify: false
+  # Whether a pod may set `dynamic-config.rs/events`. Mirrors
+  # `agent.events.enabled` below, and exists so a pod cannot ask for a
+  # permission nobody granted and then fail at runtime with a 403.
+  allowEvents: false
+  # Image prefixes a pod may name in `dynamic-config.rs/agent-image` for its
+  # own injected agent. Empty means no pod may, which is the default.
+  #
+  # The injected container runs beside the application holding the store's
+  # credential, so an unconstrained image annotation is a way to run chosen
+  # code there. A prefix list rather than exact names, because the useful
+  # case is "our registry, any tag":
+  #
+  #   agentImageAllow: "ghcr.io/dynamic-config-rs/,registry.internal/config/"
+  agentImageAllow: ""
+  # Whether the webhook resolves `dynamic-config.rs/class` against the
+  # cluster's DynamicConfigClass objects, so a pod names a store instead of
+  # repeating its endpoint and auth.
+  #
+  # OFF, and the reason is the admission path: it calls the API server
+  # nowhere, which is what keeps a busy API server from failing every pod
+  # creation in the cluster. Enabling this does NOT put a call on that path
+  # — the classes are listed on a background timer into memory and
+  # admission reads the map — but it does give the webhook a credential and
+  # a cluster-wide read of two custom resources, which is worth having only
+  # if pods actually name classes.
+  #
+  # The synchronisation delay is the one a mounted ConfigMap already has: a
+  # class created seconds ago may not have been polled yet, and a pod
+  # naming it is refused with that sentence rather than admitted without a
+  # store.
+  classes:
+    enabled: false
   image: ghcr.io/dynamic-config-rs/dynamic-config-webhook
   tag: ""              # empty = the chart appVersion, v-prefixed (what release.yml pushes)
   digest: ""

@@ -231,6 +231,21 @@ spec:
           image: {{ include "dynamic-config.image" (dict "component" .Values.webhook "root" $) | quote }}
           imagePullPolicy: {{ .Values.webhook.imagePullPolicy }}
           env:
+            # The downward API, for the resource attributes a trace needs to
+            # be findable. Absent rather than wrong when nobody wires them:
+            # a made-up pod name is worse than none.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
               value: {{ include "dynamic-config.image" (dict "component" .Values.agent "root" $) | quote }}
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
@@ -330,6 +345,22 @@ spec:
             - name: DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY
               value: {{ . | quote }}
             {{- end }}
+            {{- end }}
+            {{- if .Values.webhook.classes.enabled }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_CLASSES
+              value: "true"
+            {{- end }}
+            {{- with .Values.webhook.agentImageAllow }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_AGENT_IMAGE_ALLOW
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.webhook.allowEvents }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_ALLOW_EVENTS
+              value: "true"
+            {{- end }}
+            {{- if .Values.webhook.allowTlsSkipVerify }}
+            - name: DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY
+              value: "true"
             {{- end }}
             {{- if (include "dynamic-config.installationDocument" .) }}
             - name: DYNAMIC_CONFIG_WEBHOOK_DEFAULTS_FILE

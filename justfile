@@ -37,22 +37,31 @@ crds-write:
 # images share the layer that holds the gRPC stack, the AWS SDK and
 # rustls, which is where the minutes were going.
 #
-# **Blocked until the engine's 0.9 is published.** While the `[patch]`
-# table in Cargo.toml points at sibling working trees, those paths are
-# outside the build context and `cargo chef` cannot resolve them. Delete
-# the patch table with the 0.9 pin and this works again — which is the
-# same step the release already has to take.
+# **Blocked until the engine's 0.10 is published.** A `[patch]` table
+# pointing at sibling working trees — whether in this manifest or in the
+# organisation-level `.cargo/config.toml` above it — names paths that are
+# outside the build context, and `cargo chef` cannot resolve them. The
+# table goes when the engine and the stores are on crates.io, which is a
+# step the release already has to take; until then these three build in
+# CI and in the release, and not here.
 images:
     docker build -f docker/Dockerfile --target agent -t dynamic-config-agent:dev .
     docker build -f docker/Dockerfile --target webhook -t dynamic-config-webhook:dev .
     docker build -f docker/Dockerfile --target operator -t dynamic-config-operator:dev .
+    docker build -f docker/Dockerfile --target node-agent -t dynamic-config-node-agent:dev .
 
-# The three images as one tarball, for a CI run that builds once and
+# The four images as one tarball, for a CI run that builds once and
 # hands the result to every e2e leg instead of rebuilding per leg.
 images-save out="images.tar": images
     docker save -o {{out}} \
-      dynamic-config-agent:dev dynamic-config-webhook:dev dynamic-config-operator:dev
+      dynamic-config-agent:dev dynamic-config-webhook:dev \
+      dynamic-config-operator:dev dynamic-config-node-agent:dev
 
 # The kind end-to-end smoke: needs docker + kind + kubectl.
 e2e-smoke:
     e2e/smoke.sh
+
+# The CSI node plugin against a real kubelet: registration, publishing,
+# and the sharing claim the component exists for.
+e2e-node-agent:
+    e2e/node-agent.sh

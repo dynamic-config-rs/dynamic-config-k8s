@@ -3,7 +3,7 @@
 ```sh
 # From the OCI registry (ArtifactHub lists the same chart):
 helm install dynamic-config \
-  oci://ghcr.io/dynamic-config-rs/charts/dynamic-config --version 0.2.0
+  oci://ghcr.io/dynamic-config-rs/charts/dynamic-config --version 0.3.0
 
 # Or from a checkout:
 helm install dynamic-config deploy/helm
@@ -221,6 +221,30 @@ Its [README](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/d
 is the three-step walkthrough, including the one `caBundle` patch
 kustomize cannot express. The CRDs ship inside the base, drift-gated
 against the operator's `--crds` output like every other copy.
+
+## Without a registry: an air-gapped install
+
+```sh
+./scripts/airgap-bundle.sh 0.3.0        # on the connected side
+# move dynamic-config-0.3.0-airgap.tar.gz across
+tar xzf dynamic-config-0.3.0-airgap.tar.gz
+cd dynamic-config-0.3.0-airgap
+./load.sh registry.internal:5000
+./verify.sh
+kubectl apply --server-side -f crds/
+helm install dynamic-config ./chart --values values-airgap.yaml
+```
+
+The bundle carries the chart, the CRDs, the three image indexes **and their
+signatures and attestations** — because the supply-chain work this project
+does is worth nothing offline if the signatures are left behind with the
+registry. `verify.sh` runs `cosign --offline` against the images as they
+landed rather than as they were published.
+
+Two things the procedure insists on. `load.sh` pushes **by digest**, because
+the digests are what the signatures cover; and the CRDs are applied by hand,
+because Helm installs `crds/` once and never upgrades it — the same step an
+upgrade needs on a connected cluster.
 
 ## The smoke test
 

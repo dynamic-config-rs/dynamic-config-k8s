@@ -1,0 +1,140 @@
+# Recording and alerting rules over the metrics this integration documents.
+#
+# Every series named here is API on the same terms as the annotation
+# contract, so these rules keep working across a minor release. Load them
+# with kube-prometheus-stack's `PrometheusRule`, or paste the groups into a
+# Prometheus configuration.
+#
+#   kubectl apply -f deploy/observability/rules.yaml
+#
+# The thresholds are starting points, not measurements of your cluster.
+# Every `for:` here is long on purpose: a config agent that fails one fetch
+# and recovers is doing what it was built to do, and paging on it teaches
+# people to silence the alert.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dynamic-config
+  labels:
+    app.kubernetes.io/name: dynamic-config
+spec:
+  groups:
+    - name: dynamic-config.recording
+      interval: 30s
+      rules:
+        # The fleet in one number each. Aggregated without pod, so a
+        # thousand agents cost four series rather than four thousand.
+        - record: dynamic_config:agents:count
+          expr: count(dynamic_config_agent_renders_total)
+        - record: dynamic_config:agents:stale_over_5m
+          expr: count(dynamic_config_agent_staleness_seconds > 300) or vector(0)
+        - record: dynamic_config:agents:never_rendered
+          expr: count(dynamic_config_agent_renders_total == 0) or vector(0)
+        - record: dynamic_config:agents:unauthenticated_stores
+          expr: count(dynamic_config_agent_tls_verification_skipped == 1) or vector(0)
+
+    - name: dynamic-config.alerts
+      rules:
+        # The one that means an application is running on a document nobody
+        # can vouch for any more. Staleness is the gauge to page on rather
+        # than a failure counter: failures recover, staleness accumulates.
+        - alert: DynamicConfigStale
+          expr: dynamic_config_agent_staleness_seconds > 1800
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: configuration has not been refreshed for 30 minutes
+            description: >-
+              {{ $labels.pod }} last read its store
+              {{ $value | humanizeDuration }} ago. The rendered file is
+              still being served; whether that is acceptable is what
+              dynamic-config.rs/max-staleness exists to say.
+
+        # A pod that has never rendered is a pod that never became ready,
+        # which a Deployment surfaces on its own — unless readiness was
+        # opted out of, which is exactly when this is the only signal.
+        - alert: DynamicConfigNeverRendered
+          expr: dynamic_config_agent_renders_total == 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: an agent has never produced a document
+            description: >-
+              {{ $labels.pod }} has been running for ten minutes without a
+              successful render. Check its logs for the store's refusal.
+
+        # A document that was deleted from the store. Whether the agent
+        # keeps serving it is dynamic-config.rs/on-delete; either way,
+        # somebody should know.
+        - alert: DynamicConfigDocumentAbsent
+          expr: dynamic_config_agent_absent == 1
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: the document is gone from the store
+            description: >-
+              The store told {{ $labels.pod }} that its document is not
+              there. This is a deletion, not an outage — waiting will not
+              bring it back.
+
+        # Renewal failures should be zero. A lease the store marked
+        # non-renewable is never sent a renewal, so anything here is a
+        # lease that was expected to renew and did not.
+        - alert: DynamicConfigLeaseRenewalFailing
+          expr: increase(dynamic_config_agent_lease_renewal_failures_total[15m]) > 3
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: a dynamic credential is not renewing
+            description: >-
+              {{ $labels.pod }} has failed to renew its lease repeatedly.
+              The credential is being re-issued instead, which re-renders
+              the file — check whether the role's max_ttl has been reached.
+
+        # Not a paging alert, and it should never fire: the annotation is
+        # refused unless an administrator turned it on installation-wide.
+        - alert: DynamicConfigStoreNotAuthenticated
+          expr: dynamic_config_agent_tls_verification_skipped == 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: an agent is talking to its store without authenticating it
+            description: >-
+              {{ $labels.pod }} runs with dynamic-config.rs/tls-skip-verify.
+              Anything on the network path can supply this pod's
+              configuration and its credentials.
+
+        # Something else in the pod is writing to the rendered file.
+        - alert: DynamicConfigArtifactDrift
+          expr: dynamic_config_agent_drift == 1
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: the rendered file is not what was rendered
+            description: >-
+              Something other than the agent has written to
+              {{ $labels.pod }}'s configuration file, and the policy is not
+              repairing it.
+
+        # The webhook is on the path of every pod creation in the cluster.
+        - alert: DynamicConfigAdmissionSlow
+          expr: >-
+            histogram_quantile(0.99,
+              sum by (le) (rate(dynamic_config_admission_duration_seconds_bucket[5m]))) > 1
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: admission p99 is past a second
+            description: >-
+              The API server's admission budget is ten seconds and this
+              webhook is on the path of every pod creation.
+
+        - alert: DynamicConfigWebhookDown
+          expr: up{job=~".*dynamic-config-webhook.*"} == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: the admission webhook is not answering
+            description: >-
+              With failurePolicy Ignore, pods are being created
+              un-injected; with Fail, they are not being created at all.

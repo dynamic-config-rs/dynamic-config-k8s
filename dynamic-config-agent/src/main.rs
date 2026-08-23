@@ -33,35 +33,64 @@ use dynamic_config_agent::{render, sources, spec};
 
 use tracing::{info, warn};
 
+/// SIGTERM is how Kubernetes asks; ctrl-c is how a terminal does.
+///
+/// The same shape the webhook uses, for the same reason: a shutdown that
+/// only hears one of the two is a shutdown that works in exactly one of
+/// the two places it runs.
+async fn shutdown_signal() {
+    let interrupt = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler installs");
+
+        tokio::select! {
+            _ = interrupt => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = interrupt.await;
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     // Structured logs from the first line: this process's audience is
     // `kubectl logs`, and JSON is what log pipelines index. The engine's
-    // own diagnostics join via its `tracing` feature.
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // own diagnostics join via its `tracing` feature. OTLP traces ride
+    // beside them when a collector is configured, and nothing is exported
+    // unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set — so no existing
+    // deployment changes behaviour.
+    let telemetry = dynamic_config_telemetry::install("dynamic-config-agent");
 
     let spec = match spec::Spec::from_args(std::env::args().skip(1)) {
         Ok(spec) => spec,
         Err(error) => {
             eprintln!("dynamic-config-agent: {error}");
             eprintln!("{}", spec::USAGE);
+            telemetry.shutdown();
             return std::process::ExitCode::FAILURE;
         }
     };
 
-    match run(&spec).await {
+    let outcome = match run(&spec).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             warn!(error = %error, "agent stopped");
             std::process::ExitCode::FAILURE
         }
-    }
+    };
+
+    // Explicitly, before the process goes: a batch exporter holds spans
+    // for up to its scheduled delay, and the last seconds of a pod that is
+    // shutting down are usually the interesting ones.
+    telemetry.shutdown();
+
+    outcome
 }
 
 async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
@@ -75,10 +104,46 @@ async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
         "agent starting"
     );
 
+    // Once, loudly, at startup — and as a gauge, which is the half that
+    // scales: a fleet-wide alert finds every pod doing this, where a log
+    // line repeated per fetch would only bury it.
+    if spec.tls_skip_verify {
+        dynamic_config_agent::metrics::TLS_VERIFICATION_SKIPPED
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+
+        warn!(
+            endpoint = %spec.endpoint,
+            "TLS verification is OFF for this store: anything on the network \
+             path can read this configuration and rewrite it before it \
+             arrives. --ca trusts one more certificate and keeps the server \
+             authenticated"
+        );
+    }
+
+    // Before the server starts, so a probe can never see the default while
+    // the configured ceiling is still on its way.
+    if let Some(ceiling) = spec.max_staleness {
+        dynamic_config_agent::metrics::set_max_staleness(ceiling.as_secs());
+    }
+
     if let Some(address) = &spec.metrics_addr {
         tokio::spawn(dynamic_config_agent::metrics::serve(
             address.clone(),
             "dynamic_config_agent",
+            // Ready means a document exists. A pod whose configuration has
+            // not arrived yet is one a Service should not be sending
+            // traffic to, and pod readiness is already AND-ed across
+            // containers — so this is the whole mechanism.
+            //
+            // With `--require-ack` it means more: the application has said
+            // it is *running* that document. Stronger, and off by default,
+            // because it needs the application to say so and one that
+            // never does would never become ready.
+            if spec.require_ack {
+                dynamic_config_agent::metrics::rendered_and_applied
+            } else {
+                dynamic_config_agent::metrics::rendered_at_least_once
+            },
         ));
     }
 
@@ -95,7 +160,34 @@ async fn run(spec: &spec::Spec) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    // A sidecar runs until the pod does not: the stop future never
-    // completes, and the loop ends when the process does.
-    dynamic_config_agent::sidecar::run(spec, &source, interval, std::future::pending()).await
+    // A sidecar runs until the pod is asked to stop. That used to be a
+    // future which never completes — the loop ended when the process was
+    // killed, which is fine for a file and not fine for a lease: a
+    // credential minted for this pod alone would outlive it, valid until
+    // its TTL ran out with nobody holding it.
+    //
+    // The loop can also come back asking to be rebuilt, which is how a
+    // rotated CA is picked up **without a pod restart**: a new client, the
+    // same process, and the rendered file never leaves the volume.
+    let mut source = source;
+
+    loop {
+        match dynamic_config_agent::sidecar::run(spec, &source, interval, shutdown_signal()).await?
+        {
+            dynamic_config_agent::sidecar::Ended::Stopped => return Ok(()),
+            dynamic_config_agent::sidecar::Ended::Rebuild => {
+                // A build that fails against the *new* material is fatal
+                // rather than a retry: the old client is already gone, the
+                // material on disk is what the store now expects, and a
+                // process looping on a bad certificate is worse than a pod
+                // that restarts with the failure in its events.
+                source = std::sync::Arc::new(sources::build(spec).await?);
+
+                info!(
+                    source = %source.describe(),
+                    "the store's client was rebuilt from the new trust material"
+                );
+            }
+        }
+    }
 }

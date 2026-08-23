@@ -34,6 +34,43 @@ use serde_json::Value;
 /// reworded. A test walks every pin path and asserts the phrase survives.
 pub(crate) const PINS: &str = "the installation pins";
 
+/// A value on its way into a refusal, with any URL userinfo taken out.
+///
+/// A refusal echoes what the pod asked for on purpose: a value the author
+/// wrote and did not get is a debugging session, and the whole point of
+/// answering at admission is to end that session before the pod exists.
+///
+/// `endpoint` is the exception that needs handling rather than an
+/// exception to the rule. It is a URL, and a URL can carry
+/// `user:password@` — and a refusal is not only read by the author. It is
+/// the `status.message` of a rejected API call, which lands in the
+/// server's audit log and in the events of whatever controller was
+/// creating the pod. Keeping the credential out of those is not hiding
+/// the value from the person who wrote it.
+fn without_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let Some(scheme) = value.find("://") else {
+        return Cow::Borrowed(value);
+    };
+
+    let rest = &value[scheme + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+
+    // The last `@`, not the first: a password may contain one.
+    let Some(at) = authority.rfind('@') else {
+        return Cow::Borrowed(value);
+    };
+
+    Cow::Owned(format!(
+        "{}\u{2026}@{}{}",
+        &value[..scheme + 3],
+        &authority[at + 1..],
+        &rest[end..]
+    ))
+}
+
 /// The mark an injection leaves on the pod it patched.
 ///
 /// **An injection has to be idempotent, and a mutating webhook is not
@@ -60,6 +97,243 @@ pub const CA_MOUNT: &str = "/etc/dynamic-config/ca";
 pub const SSH_MOUNT: &str = "/etc/dynamic-config/ssh";
 pub const TLS_MOUNT: &str = "/etc/dynamic-config/tls";
 pub const TEMPLATE_MOUNT: &str = "/etc/dynamic-config/template";
+/// One annotation, and everything the contract knows about it.
+///
+/// **`KNOWN` and `PER_RENDER` used to be two lists**, and two lists of the
+/// same names are two lists that drift: a key added to one and forgotten in
+/// the other is either an annotation nothing accepts with a `.name` suffix
+/// or — worse — one accepted with a suffix that no code reads. Both are now
+/// views of [`REGISTRY`], so the question "may this key take a suffix?" has
+/// one answer in one place.
+///
+/// There is no `since` field. It would be documentation nothing consumes,
+/// and filling it in for the forty keys that predate this table means
+/// splitting three releases apart by archaeology — a column half of which
+/// would be a guess is worse than no column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnotationSpec {
+    /// The key, without the `dynamic-config.rs/` prefix.
+    pub name: &'static str,
+    /// Whether it may carry a `.name` suffix for a named render.
+    pub per_render: bool,
+    /// The version that stopped meaning this, if one has.
+    pub deprecated_since: Option<&'static str>,
+    /// What to write instead. `None` means the key is going away with
+    /// nothing taking its place, which is a different sentence and reads as
+    /// one in the warning.
+    pub replacement: Option<&'static str>,
+}
+
+const fn known(name: &'static str) -> AnnotationSpec {
+    AnnotationSpec {
+        name,
+        per_render: false,
+        deprecated_since: None,
+        replacement: None,
+    }
+}
+
+impl AnnotationSpec {
+    const fn per_render(mut self) -> Self {
+        self.per_render = true;
+        self
+    }
+
+    /// Marks a key retired, naming the release and what replaces it.
+    ///
+    /// Unused today — **nothing here is deprecated yet**, and that is the
+    /// state this table exists to be ready for rather than a sign it is
+    /// not working. `deprecation_warnings` is tested against a table of its
+    /// own so the mechanism is proved before it is needed, which is the
+    /// only moment it can be proved without a real deprecation to point at.
+    #[allow(dead_code)]
+    const fn deprecated(mut self, since: &'static str, replacement: Option<&'static str>) -> Self {
+        self.deprecated_since = Some(since);
+        self.replacement = replacement;
+        self
+    }
+}
+
+/// Every `dynamic-config.rs/*` key this contract accepts.
+///
+/// A key not in this table **fails the admission**. The rule exists for the
+/// typo: `tokne-secret` silently ignored is a pod running without the
+/// authentication it declared, and nobody would know until the audit.
+pub const REGISTRY: &[AnnotationSpec] = &[
+    known("inject"),
+    known("source").per_render(),
+    known("endpoint").per_render(),
+    known("endpoint-secret").per_render(),
+    known("key").per_render(),
+    known("path").per_render(),
+    known("mode"),
+    known("watch-seconds").per_render(),
+    known("timeout").per_render(),
+    known("agent-image"),
+    known("section").per_render(),
+    known("auth").per_render(),
+    known("auth-mount").per_render(),
+    known("auth-role").per_render(),
+    known("auth-username").per_render(),
+    known("auth-token-path").per_render(),
+    known("namespace").per_render(),
+    known("ref").per_render(),
+    known("api-url").per_render(),
+    known("token-secret").per_render(),
+    known("password-secret").per_render(),
+    known("ca-configmap").per_render(),
+    known("tls-secret").per_render(),
+    known("ssh-secret").per_render(),
+    known("volume-medium"),
+    known("native-sidecar"),
+    known("agent-cpu-request"),
+    known("agent-memory-request"),
+    known("agent-cpu-limit"),
+    known("agent-memory-limit"),
+    known("file-mode").per_render(),
+    known("agent-run-as-user"),
+    known("agent-run-as-group"),
+    known("agent-ephemeral-request"),
+    known("agent-ephemeral-limit"),
+    known("env-inject"),
+    known("env-restart"),
+    known("metrics-port").per_render(),
+    known("readiness"),
+    known("inject-containers"),
+    known("revoke-grace"),
+    known("init-first"),
+    known("notify-http"),
+    known("on-drift"),
+    known("tls-reload").per_render(),
+    known("history"),
+    known("require-ack"),
+    known("events"),
+    known("class"),
+    known("canary-configmap"),
+    known("agent-run-as-same-user"),
+    known("extra-secret"),
+    known("tls-server-name").per_render(),
+    known("tls-skip-verify").per_render(),
+    known("schema-configmap"),
+    known("startup-policy"),
+    known("on-delete"),
+    known("max-document-bytes"),
+    known("max-staleness"),
+    known("meta"),
+    known("dynamic"),
+    known("revoke-on-shutdown"),
+    known("aws-secret"),
+    known("agent-env"),
+    known("template").per_render(),
+    known("template-configmap").per_render(),
+];
+
+/// Whether the contract knows this key at all.
+#[must_use]
+pub fn is_known(name: &str) -> bool {
+    REGISTRY.iter().any(|spec| spec.name == name)
+}
+
+/// Whether this key may carry a `.name` suffix for a named render.
+#[must_use]
+pub fn is_per_render(name: &str) -> bool {
+    REGISTRY
+        .iter()
+        .any(|spec| spec.name == name && spec.per_render)
+}
+
+/// A warning per deprecated key this pod actually set.
+///
+/// Empty today, and that is the point of the table rather than a fault in
+/// it: nothing is deprecated yet, and the mechanism is here so that the
+/// first retirement is a one-line change instead of a design.
+#[must_use]
+pub fn deprecations(annotations: &serde_json::Map<String, Value>) -> Vec<String> {
+    deprecation_warnings(REGISTRY, annotations.keys().map(String::as_str))
+}
+
+/// [`deprecations`], against a table a test can supply — the only way to
+/// prove the mechanism while nothing real is deprecated.
+fn deprecation_warnings<'a>(
+    registry: &[AnnotationSpec],
+    present: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for key in present {
+        let Some(name) = key.strip_prefix(PREFIX) else {
+            continue;
+        };
+
+        // A named render's `source.cache` carries the deprecation of
+        // `source`: it is the same key wearing a suffix.
+        let base = name.split_once('.').map_or(name, |(base, _)| base);
+
+        let Some(spec) = registry
+            .iter()
+            .find(|spec| spec.name == base && spec.deprecated_since.is_some())
+        else {
+            continue;
+        };
+
+        let since = spec.deprecated_since.unwrap_or("a previous release");
+
+        warnings.push(match spec.replacement {
+            Some(replacement) => format!(
+                "{PREFIX}{name} is deprecated since {since}; use \
+                 {PREFIX}{replacement}"
+            ),
+            None => format!(
+                "{PREFIX}{name} is deprecated since {since} and will be \
+                 removed; it has no replacement"
+            ),
+        });
+    }
+
+    warnings
+}
+
+/// Where a `schema-configmap` is mounted.
+pub const SCHEMA_MOUNT: &str = "/etc/dynamic-config/schema";
+
+/// The most generations `history` will keep.
+///
+/// The same number the agent enforces, stated twice on purpose: this crate
+/// does not depend on that one, and the agent's own refusal is the backstop
+/// for every knob here — whatever passes admission is validated again where
+/// it runs.
+pub const MOST_HISTORY: usize = 10;
+
+/// A Kubernetes quantity as bytes, for the one comparison that needs it.
+///
+/// `None` for anything this does not recognise, which makes the caller skip
+/// the comparison rather than refuse a quantity Kubernetes accepts — the
+/// suffix list here is the storage half, and the scheduler is the authority
+/// on the rest.
+fn bytes_of(quantity: &str) -> Option<u64> {
+    let (number, scale) = match quantity {
+        text if text.ends_with("Ki") => (&text[..text.len() - 2], 1024_u64),
+        text if text.ends_with("Mi") => (&text[..text.len() - 2], 1024 * 1024),
+        text if text.ends_with("Gi") => (&text[..text.len() - 2], 1024 * 1024 * 1024),
+        text if text.ends_with('k') => (&text[..text.len() - 1], 1000),
+        text if text.ends_with('M') => (&text[..text.len() - 1], 1_000_000),
+        text if text.ends_with('G') => (&text[..text.len() - 1], 1_000_000_000),
+        text => (text, 1),
+    };
+
+    number.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+/// Where a `canary-configmap` is mounted.
+pub const CANARY_MOUNT: &str = "/etc/dynamic-config/canary";
+
+/// Where an `extra-secret` is mounted.
+///
+/// A fixed path rather than one the pod chooses, for the same reason the
+/// four above are fixed: an annotation that took a mount path could be
+/// pointed at the rendered volume, at the service-account token, or at
+/// anything else the agent reads.
+pub const EXTRA_MOUNT: &str = "/etc/dynamic-config/extra";
 
 /// The injected container's resource ask. Defaults sized for "fetch a
 /// document and write a file", overridable fleet-wide through the
@@ -72,6 +346,17 @@ pub struct Resources {
     pub memory_request: String,
     pub cpu_limit: Option<String>,
     pub memory_limit: String,
+    /// Ephemeral storage, which matters for exactly one configuration and
+    /// is unbounded without it.
+    ///
+    /// The rendered volume is `medium: Memory` by default, and tmpfs pages
+    /// are charged to the pod's memory limit — which is always set. On
+    /// `volume-medium: disk` the volume is node storage instead, charged
+    /// to a resource nothing here declares, and `history` keeps copies
+    /// beside the render. A pod could fill a node's disk without exceeding
+    /// any limit it had declared.
+    pub ephemeral_request: Option<String>,
+    pub ephemeral_limit: Option<String>,
 }
 
 /// Every store the agent speaks — the one list the source annotation,
@@ -597,6 +882,32 @@ pub struct Installation {
     source_allow: ScopedNames,
     /// Always subtractive, and it outranks the allowlist.
     source_deny: ScopedNames,
+    /// `DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY`: whether a pod may
+    /// turn off certificate verification for its store at all.
+    ///
+    /// **Off unless an installer turns it on**, which is the one place in
+    /// this contract where a pod annotation is not enough by itself. Every
+    /// other refusal here is about a value being wrong; this one is about a
+    /// value being *available*, and it is a cluster's decision rather than a
+    /// workload's — a namespace that can set it can arrange to be handed any
+    /// configuration and any credential by anything on the network path.
+    allow_tls_skip_verify: bool,
+    /// `DYNAMIC_CONFIG_WEBHOOK_ALLOW_EVENTS`: whether a pod may ask the
+    /// agent to write Kubernetes Events.
+    ///
+    /// Off unless the chart created the Role that makes it possible, which
+    /// is the same chart value — so a pod cannot ask for a permission
+    /// nobody granted and then fail at runtime with a 403.
+    allow_events: bool,
+    /// `DYNAMIC_CONFIG_WEBHOOK_AGENT_IMAGE_ALLOW`: image prefixes a pod may
+    /// name for its own agent.
+    ///
+    /// Empty means **no pod may**, which is the default: the injected
+    /// container runs beside the application with the store's credential,
+    /// and an unconstrained image annotation is a way to run chosen code
+    /// there. A prefix list rather than exact names, because the useful
+    /// case is "our registry, any tag".
+    agent_image_allow: Vec<String>,
 }
 
 impl Installation {
@@ -719,6 +1030,37 @@ impl Installation {
             )?,
             source_allow: scoped("DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW", ScopedNames::sources)?,
             source_deny: scoped("DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY", ScopedNames::sources)?,
+            agent_image_allow: var("DYNAMIC_CONFIG_WEBHOOK_AGENT_IMAGE_ALLOW")
+                .map(|list| {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|prefix| !prefix.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            allow_events: match var("DYNAMIC_CONFIG_WEBHOOK_ALLOW_EVENTS").as_deref() {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "DYNAMIC_CONFIG_WEBHOOK_ALLOW_EVENTS is {other:?}: \
+                         \"true\" or \"false\""
+                    ))
+                }
+            },
+            allow_tls_skip_verify: match var("DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY")
+                .as_deref()
+            {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(other) => {
+                    return Err(format!(
+                        "DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY is {other:?}: \
+                         \"true\" or \"false\""
+                    ))
+                }
+            },
         })
     }
 
@@ -854,6 +1196,32 @@ impl Installation {
         self.source_allow.is_empty() || self.source_allow.allows(namespace, source)
     }
 
+    /// May a pod name this image for its own agent?
+    ///
+    /// Never, unless the installation listed a prefix it starts with.
+    #[must_use]
+    pub fn agent_image_allowed(&self, image: &str) -> bool {
+        self.agent_image_allow
+            .iter()
+            .any(|prefix| image.starts_with(prefix))
+    }
+
+    /// May a pod ask the agent to write Kubernetes Events?
+    #[must_use]
+    pub const fn events_allowed(&self) -> bool {
+        self.allow_events
+    }
+
+    /// May a pod turn off certificate verification for its store?
+    ///
+    /// Cluster-wide rather than per namespace, because there is nothing to
+    /// scope: an installer who wants this in one namespace and not another
+    /// wants two installations.
+    #[must_use]
+    pub const fn tls_skip_verify_allowed(&self) -> bool {
+        self.allow_tls_skip_verify
+    }
+
     /// May a pod in this namespace set this agent-env name?
     #[must_use]
     pub fn agent_env_allowed(&self, namespace: &str, name: &str) -> bool {
@@ -893,7 +1261,7 @@ pub fn verify_installation() -> Result<(), String> {
     Installation::from_environment().map(|_| ())
 }
 
-pub(crate) fn installation() -> &'static Installation {
+pub fn installation() -> &'static Installation {
     static INSTALLATION: std::sync::OnceLock<Installation> = std::sync::OnceLock::new();
 
     // `verify_installation` ran before serving, so this cannot fail in
@@ -960,6 +1328,88 @@ pub struct Request {
     pub env_restart: bool,
     /// `metrics-port`: the agent serves its Prometheus text here.
     pub metrics_port: Option<u16>,
+    /// `notify-http`: a localhost endpoint the agent POSTs to after a
+    /// render, for an application that reloads on a request and on nothing
+    /// else.
+    pub notify_http: Option<String>,
+    /// `on-drift`: what to do when something else writes to the rendered
+    /// file.
+    pub on_drift: Option<String>,
+    /// `tls-reload`: whether the agent rebuilds its store client when the
+    /// mounted trust material changes. On unless the pod says otherwise.
+    pub tls_reload: bool,
+    /// `history`: how many replaced generations to keep beside each render.
+    pub history: Option<usize>,
+    /// `require-ack`: readiness waits for the application to say it is
+    /// running what was published.
+    pub require_ack: bool,
+    /// `canary-configmap`: `<name>` or `<name>/<key>` holding the cohort
+    /// percentage, mounted and watched.
+    pub canary: Option<ObjectRef>,
+    /// `agent-image`: the image for **this pod's** injected agent.
+    ///
+    /// `None` is the installation's, which is where it should almost always
+    /// come from. Naming one per pod is how an agent upgrade stops being
+    /// all-or-nothing — one Deployment tries it first — and it is also a
+    /// way to run a chosen image beside every application, which is why an
+    /// installation has to allow it.
+    pub agent_image: Option<String>,
+    /// `timeout`: the deadline for one fetch attempt, in seconds.
+    pub timeout: Option<u64>,
+    /// `events`: the agent writes Kubernetes Events on this pod.
+    ///
+    /// Costs the pod's own service-account token being mounted into the
+    /// agent, which is why the installation has to offer it first.
+    pub events: bool,
+    /// `revoke-grace`: how long the agent spends handing a lease back.
+    ///
+    /// `None` leaves the agent's own default; a value is refused if it
+    /// outlasts the pod's `terminationGracePeriodSeconds`, because the two
+    /// disagreeing means the agent is killed mid-revocation and the lease
+    /// stays out anyway.
+    pub revoke_grace: Option<u64>,
+    /// `init-first`: put the injected init container ahead of the pod's own.
+    pub init_first: bool,
+    /// `extra-secret`: a Secret mounted read-only into the agent alone.
+    pub extra_secret: Option<String>,
+    /// `tls-server-name`: the name the store's certificate must carry.
+    pub tls_server_name: Option<String>,
+    /// `tls-skip-verify`: connect to the store without authenticating it.
+    pub tls_skip_verify: bool,
+    /// `inject-containers`: which of the pod's own containers receive the
+    /// rendered volume.
+    ///
+    /// `None` is every one of them, which is the default and what the
+    /// reference implementation defaults to as well. Naming a subset is
+    /// for the pod that runs something beside its application — a log
+    /// shipper, a mesh proxy, a debug sidecar — that has no business
+    /// reading a rendered credential. File mode does not help there: a
+    /// sidecar running as the same UID reads a `0600` file perfectly well.
+    pub inject_containers: Option<Vec<String>>,
+    /// `readiness`: whether the injected container gets a readiness probe
+    /// on `/readyz`.
+    ///
+    /// On unless a pod says otherwise, and only ever attached where a
+    /// metrics port exists — the probe answers on that port.
+    pub readiness: bool,
+    /// `meta`: write a sibling file describing the render.
+    pub meta: bool,
+    /// `schema-configmap`: a JSON Schema the resolved document must
+    /// satisfy before it is written.
+    pub schema: Option<ObjectRef>,
+    /// `also.<name>`: further files cut from the **same** fetched
+    /// document, published all-or-none with the main one.
+    ///
+    /// Deliberately not a second source. Two stores have no common
+    /// instant, so "these files are one generation" is not something
+    /// either could promise — a *named render* is the shape for a second
+    /// store, and it is a separate container with a separate generation
+    /// because that is the truth about it.
+    pub also: Vec<Rendering>,
+    /// `dynamic`: read a dynamic-secret engine rather than KV.
+    pub dynamic: bool,
+    /// `revoke-on-shutdown`: hand the lease back when the pod stops.
+    pub revoke_on_shutdown: bool,
     /// `aws-secret`: a Secret whose `AWS_ACCESS_KEY_ID` and
     /// `AWS_SECRET_ACCESS_KEY` keys become exactly those variables on
     /// the agent — static credentials for S3-compatible stores that are
@@ -988,6 +1438,14 @@ pub struct Request {
 #[derive(Debug, PartialEq)]
 pub struct ExtraRender {
     pub name: String,
+    /// `metrics-port.<name>`: this render's own Prometheus endpoint.
+    ///
+    /// Per render rather than inherited, because a port is a pod-wide
+    /// resource and N containers cannot share one. There is deliberately no
+    /// allocation scheme — `port + n` reads as tidy and collides with
+    /// whatever the application is already listening on — so a named render
+    /// is observable when somebody names its port and not before.
+    pub metrics_port: Option<u16>,
     pub source: String,
     pub endpoint: Option<String>,
     pub key: String,
@@ -999,6 +1457,17 @@ pub struct ExtraRender {
     pub ssh: Option<ObjectRef>,
     pub tls: Option<String>,
     pub template: Option<ObjectRef>,
+}
+
+/// One more file cut from the same document.
+#[derive(Debug, PartialEq)]
+pub struct Rendering {
+    /// The suffix that named it, for diagnostics.
+    pub name: String,
+    /// Where it goes; its extension picks the format.
+    pub path: String,
+    /// Which section to cut, or the whole document.
+    pub section: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -1087,7 +1556,10 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         Some(INJECTED) if already_injected(pod) => return Ok(None),
         Some(INJECTED) => {
             return Err(format!(
-                "{PREFIX}{STATUS} is {INJECTED:?} but this pod carries no                  injected container: the mark is this webhook's to write,                  and a pod copied from another cluster keeps the mark                  without what it stood for"
+                "{PREFIX}{STATUS} is {INJECTED:?} but this pod carries no \
+                 injected container: the mark is this webhook's to write, \
+                 and a pod copied from another cluster keeps the mark \
+                 without what it stood for"
             ))
         }
         Some(other) => {
@@ -1109,81 +1581,11 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         }
     }
 
-    // Every dynamic-config.rs/* key must be one this contract knows. A
-    // typo'd `tokne-secret` silently ignored is a pod running without
-    // the authentication it declared — the annotation prefix is claimed
-    // territory, and an unknown key in it fails the admission.
-    const KNOWN: &[&str] = &[
-        "inject",
-        // Written by this webhook, never by a pod's author — a value
-        // other than `injected` is refused below rather than ignored.
-        STATUS,
-        "source",
-        "endpoint",
-        "endpoint-secret",
-        "key",
-        "path",
-        "mode",
-        "watch-seconds",
-        "section",
-        "auth",
-        "auth-mount",
-        "auth-role",
-        "auth-username",
-        "auth-token-path",
-        "namespace",
-        "ref",
-        "api-url",
-        "token-secret",
-        "password-secret",
-        "ca-configmap",
-        "tls-secret",
-        "ssh-secret",
-        "volume-medium",
-        "native-sidecar",
-        "agent-cpu-request",
-        "agent-memory-request",
-        "agent-cpu-limit",
-        "agent-memory-limit",
-        "file-mode",
-        "agent-run-as-user",
-        "agent-run-as-group",
-        "env-inject",
-        "env-restart",
-        "metrics-port",
-        "aws-secret",
-        "agent-env",
-        "template",
-        "template-configmap",
-    ];
-
-    /// The keys a NAMED render may carry — everything store-shaped;
-    /// mode, volume, resources and identity stay pod-wide.
-    const PER_RENDER: &[&str] = &[
-        "source",
-        "endpoint",
-        "endpoint-secret",
-        "key",
-        "path",
-        "watch-seconds",
-        "section",
-        "auth",
-        "auth-mount",
-        "auth-role",
-        "auth-username",
-        "auth-token-path",
-        "namespace",
-        "ref",
-        "api-url",
-        "token-secret",
-        "password-secret",
-        "ca-configmap",
-        "tls-secret",
-        "ssh-secret",
-        "template",
-        "template-configmap",
-        "file-mode",
-    ];
+    // A second namespace, and it has to be: `section` is already a
+    // per-render key, so `section.db` beside `also.db` would read as a
+    // *named render* called `db` and then demand a `source.db` nobody
+    // wrote. `also-section` cannot collide with anything.
+    const ALSO: &[&str] = &["also", "also-section"];
 
     let valid_suffix = |suffix: &str| {
         !suffix.is_empty()
@@ -1194,18 +1596,26 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     };
 
     let mut extra_names: Vec<String> = Vec::new();
+    let mut also_names: Vec<String> = Vec::new();
 
     for key in annotations.keys() {
         let Some(name) = key.strip_prefix(PREFIX) else {
             continue;
         };
 
-        if KNOWN.contains(&name) {
+        if is_known(name) {
             continue;
         }
 
         if let Some((base, suffix)) = name.split_once('.') {
-            if PER_RENDER.contains(&base) && valid_suffix(suffix) {
+            if ALSO.contains(&base) && valid_suffix(suffix) {
+                if !also_names.iter().any(|n| n == suffix) {
+                    also_names.push(suffix.to_owned());
+                }
+                continue;
+            }
+
+            if is_per_render(base) && valid_suffix(suffix) {
                 if !extra_names.iter().any(|n| n == suffix) {
                     extra_names.push(suffix.to_owned());
                 }
@@ -1214,11 +1624,13 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         }
 
         return Err(format!(
-            "{PREFIX}{name} is not part of the contract; the reference                  lists every key it takes"
+            "{PREFIX}{name} is not part of the contract; the annotation \
+             reference lists every key it takes"
         ));
     }
 
     extra_names.sort();
+    also_names.sort();
 
     // The agent would refuse these too — but at container start, after
     // scheduling. The admission is earlier and the message lands where
@@ -1241,6 +1653,8 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // because a value the author wrote and did not get is a debugging
     // session; the SAME value restated passes.
     let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        let (pod, tier) = (without_userinfo(pod), without_userinfo(tier));
+
         format!(
             "{PREFIX}{key} is {pod:?}, but the installation pins it to \
              {tier:?} — match it or drop the annotation (the installer \
@@ -1455,6 +1869,15 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         ("namespace", "--namespace"),
         ("ref", "--ref"),
         ("api-url", "--api-url"),
+        // What a failed *first* fetch means. Validated by the agent rather
+        // than here, so the two cannot disagree about which policies exist.
+        ("startup-policy", "--startup-policy"),
+        // What a document that stopped being there means. Validated by
+        // the agent, like the policy above.
+        ("on-delete", "--on-delete"),
+        ("max-document-bytes", "--max-document-bytes"),
+        // Seconds. Validated by the agent, like the policy above.
+        ("max-staleness", "--max-staleness"),
     ] {
         if let Some(value) = defaulted(annotation) {
             arguments.push((flag.to_owned(), value.to_owned()));
@@ -1483,6 +1906,52 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
 
     if let Some(ca) = &ca {
         arguments.push(("--ca".to_owned(), format!("{CA_MOUNT}/{}", ca.key)));
+    }
+
+    let tls_server_name = defaulted("tls-server-name").map(str::to_owned);
+
+    let tls_skip_verify = match defaulted("tls-skip-verify") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}tls-skip-verify is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    if tls_skip_verify {
+        // The one annotation an installer has to enable before a pod may
+        // use it. Everything else here is refused for being wrong; this is
+        // refused for not being on offer.
+        if !install.tls_skip_verify_allowed() {
+            return Err(format!(
+                "{PREFIX}tls-skip-verify is not available in this \
+                 installation: it turns off authentication of the store \
+                 entirely, so it is a cluster decision rather than a \
+                 workload's. An administrator enables it with \
+                 `webhook.allowTlsSkipVerify: true`"
+            ));
+        }
+
+        // Two answers to the same question, pointing opposite ways. A pod
+        // that named an authority has one it means to trust, and turning
+        // verification off would make that CA decorative.
+        if ca.is_some() {
+            return Err(format!(
+                "{PREFIX}tls-skip-verify with {PREFIX}ca-configmap: naming an \
+                 authority and then not checking it are contradictory. Drop \
+                 one — the authority is the one that keeps working"
+            ));
+        }
+    }
+
+    if let Some(name) = &tls_server_name {
+        arguments.push(("--tls-server-name".to_owned(), name.clone()));
+    }
+
+    if tls_skip_verify {
+        arguments.push(("--tls-skip-verify".to_owned(), String::new()));
     }
 
     let volume_memory = match get("volume-medium") {
@@ -1599,7 +2068,35 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         .unwrap_or_else(|| "64Mi".to_owned());
     let cpu_limit = install.knob(source_name, |k| k.cpu_limit.clone());
 
+    let ephemeral = |key: &str| -> Result<Option<String>, String> {
+        match get(key) {
+            None => Ok(None),
+            Some(value) => Ok(Some(quantity(key, value)?)),
+        }
+    };
+
+    let ephemeral_request = ephemeral("agent-ephemeral-request")?;
+    let ephemeral_limit = ephemeral("agent-ephemeral-limit")?;
+
+    // A request above its own limit is a pod the scheduler refuses, with a
+    // message about the pod rather than about the annotation that caused
+    // it. Compared as bytes so `1Gi` and `1024Mi` are the same number.
+    if let (Some(request), Some(limit)) = (&ephemeral_request, &ephemeral_limit) {
+        if let (Some(request), Some(limit)) = (bytes_of(request), bytes_of(limit)) {
+            if request > limit {
+                return Err(format!(
+                    "{PREFIX}agent-ephemeral-request is larger than \
+                     {PREFIX}agent-ephemeral-limit; the scheduler would \
+                     refuse the pod and say so about the pod rather than \
+                     about these"
+                ));
+            }
+        }
+    }
+
     let resources = Resources {
+        ephemeral_request,
+        ephemeral_limit,
         cpu_request: quantity("agent-cpu-request", &cpu_request)?,
         memory_request: quantity("agent-memory-request", &memory_request)?,
         cpu_limit: match get("agent-cpu-limit").or(cpu_limit.as_deref()) {
@@ -1655,8 +2152,69 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         }
     }
 
-    let run_as_user =
-        identity("agent-run-as-user")?.or_else(|| install.knob(source_name, |k| k.run_as_user));
+    // `agent-run-as-same-user`: take the application's UID instead of
+    // naming one. Read from the first container's own securityContext, then
+    // the pod's — the order the kubelet resolves them in.
+    let same_user = match get("agent-run-as-same-user") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}agent-run-as-same-user is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    let inherited = if same_user {
+        if get("agent-run-as-user").is_some() {
+            return Err(format!(
+                "{PREFIX}agent-run-as-same-user with {PREFIX}agent-run-as-user: \
+                 one of them says which UID to use and the other says where \
+                 to read it from. Keep the one that is right for the pod"
+            ));
+        }
+
+        let containers = pod.pointer("/spec/containers").and_then(Value::as_array);
+
+        let from_container = containers
+            .and_then(|list| list.first())
+            .and_then(|container| container.pointer("/securityContext/runAsUser"))
+            .and_then(Value::as_u64);
+
+        let from_pod = pod
+            .pointer("/spec/securityContext/runAsUser")
+            .and_then(Value::as_u64);
+
+        // Absent is refused rather than guessed. Inheriting "whatever the
+        // image happens to run as" would be a UID that changes when the
+        // image does, silently, and the file's owner with it.
+        let Some(uid) = from_container.or(from_pod) else {
+            return Err(format!(
+                "{PREFIX}agent-run-as-same-user, and the application names no \
+                 runAsUser to inherit — not on its container and not on the \
+                 pod. Set one, or name the UID with {PREFIX}agent-run-as-user"
+            ));
+        };
+
+        let uid = u32::try_from(uid).map_err(|_| {
+            format!("{PREFIX}agent-run-as-same-user: the application's runAsUser is not a UID")
+        })?;
+
+        if uid == 0 {
+            return Err(format!(
+                "{PREFIX}agent-run-as-same-user, and the application runs as \
+                 root; the agent stays nonroot in every configuration"
+            ));
+        }
+
+        Some(uid)
+    } else {
+        None
+    };
+
+    let run_as_user = inherited
+        .or(identity("agent-run-as-user")?)
+        .or_else(|| install.knob(source_name, |k| k.run_as_user));
     let run_as_group =
         identity("agent-run-as-group")?.or_else(|| install.knob(source_name, |k| k.run_as_group));
     let env_inject = get("env-inject").map(str::to_owned);
@@ -1728,6 +2286,299 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         }
     };
 
+    // A sibling file describing what was rendered — a digest, the store's
+    // revision, a clock. Off unless asked for: it is a second file in a
+    // directory an application may be globbing.
+    let meta = match get("meta") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => return Err(format!("{PREFIX}meta is {other:?}: \"true\" or \"false\"")),
+    };
+
+    // Vault's dynamic-secret engines. It changes what a read *is*: every
+    // fetch mints a credential with a lease, which the agent then renews
+    // and hands back.
+    let dynamic = match get("dynamic") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}dynamic is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    // Revoking is the default: a credential minted for one pod should not
+    // outlive it. The opt-out is for a lease something else is still using.
+    let revoke_on_shutdown = match get("revoke-on-shutdown") {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}revoke-on-shutdown is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    // How long the agent may spend handing the lease back. Bounded by the
+    // pod's own grace period rather than left to disagree with it: past
+    // that number the kubelet sends SIGKILL, the revocation is cut off
+    // mid-request, and the lease stays out anyway — which is the outcome
+    // the annotation was set to avoid.
+    let revoke_grace = match get("revoke-grace") {
+        None => None,
+        Some(text) => {
+            let seconds: u64 = text
+                .strip_suffix('s')
+                .unwrap_or(text)
+                .parse()
+                .map_err(|_| {
+                    format!("{PREFIX}revoke-grace is {text:?}: whole seconds, like \"10s\"")
+                })?;
+
+            if seconds == 0 {
+                return Err(format!(
+                    "{PREFIX}revoke-grace is \"0\", which revokes nothing; \
+                     {PREFIX}revoke-on-shutdown: \"false\" is how to say that"
+                ));
+            }
+
+            // 30 is Kubernetes' own default, and what the pod gets when it
+            // says nothing.
+            let grace = pod
+                .pointer("/spec/terminationGracePeriodSeconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(30);
+
+            if seconds > grace {
+                return Err(format!(
+                    "{PREFIX}revoke-grace is {seconds}s and this pod's \
+                     terminationGracePeriodSeconds is {grace}s: the kubelet \
+                     would send SIGKILL first and the lease would stay out \
+                     anyway. Raise the grace period, or lower this"
+                ));
+            }
+
+            Some(seconds)
+        }
+    };
+
+    if revoke_grace.is_some() && !dynamic {
+        return Err(format!(
+            "{PREFIX}revoke-grace without {PREFIX}dynamic: only a \
+             dynamic-secret source holds a lease to revoke"
+        ));
+    }
+
+    let init_first = match get("init-first") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}init-first is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    if init_first && mode == Mode::Sidecar {
+        return Err(format!(
+            "{PREFIX}init-first with {PREFIX}mode \"sidecar\": there is no \
+             init container to put first"
+        ));
+    }
+
+    let extra_secret = get("extra-secret").map(str::to_owned);
+
+    // Checked here as well as in the agent: the two run in different
+    // places, and an operator finds out at `kubectl apply` rather than
+    // from a CrashLoopBackOff.
+    let notify_http = match get("notify-http") {
+        None => None,
+        Some(url) => {
+            if mode == Mode::Init {
+                return Err(format!(
+                    "{PREFIX}notify-http with {PREFIX}mode \"init\": an init \
+                     container writes once and exits, before the application \
+                     it would notify has started"
+                ));
+            }
+
+            Some(url.to_owned())
+        }
+    };
+
+    let tls_reload = match get("tls-reload") {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}tls-reload is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    let history = match get("history") {
+        None => None,
+        Some(text) => {
+            let keep: usize = text
+                .parse()
+                .map_err(|_| format!("{PREFIX}history is {text:?}: a count, like \"3\""))?;
+
+            if keep == 0 {
+                return Err(format!(
+                    "{PREFIX}history is \"0\", which keeps nothing; leave the \
+                     annotation off to mean that"
+                ));
+            }
+
+            if keep > MOST_HISTORY {
+                return Err(format!(
+                    "{PREFIX}history is {keep}: at most {MOST_HISTORY}. Every \
+                     kept generation is charged to the pod's memory limit"
+                ));
+            }
+
+            // The rendered volume is where these live. On `medium: Memory`
+            // that is the pod's own memory, which the ceiling above bounds;
+            // on disk it is the node's, where a replaced *secret* would
+            // outlive the pod that held it and survive a reboot.
+            if !volume_memory {
+                return Err(format!(
+                    "{PREFIX}history with {PREFIX}volume-medium \"disk\": kept \
+                     generations would sit on node-backed storage, where a \
+                     replaced secret outlives the pod. Keep the volume in \
+                     memory, or drop the history"
+                ));
+            }
+
+            Some(keep)
+        }
+    };
+
+    let canary = object_ref("canary-configmap", "percent");
+
+    if canary.is_some() && mode == Mode::Init {
+        return Err(format!(
+            "{PREFIX}canary-configmap with {PREFIX}mode \"init\": an init \
+             container publishes once and exits, so there is no later \
+             document for a cohort to hold back"
+        ));
+    }
+
+    let timeout = match defaulted("timeout") {
+        None => None,
+        Some(text) => {
+            let seconds: u64 = text
+                .parse()
+                .map_err(|_| format!("{PREFIX}timeout is {text:?}: whole seconds, like \"30\""))?;
+
+            if seconds == 0 {
+                return Err(format!(
+                    "{PREFIX}timeout is \"0\", which is no deadline at all; \
+                     leave it off to keep the store's own"
+                ));
+            }
+
+            Some(seconds)
+        }
+    };
+
+    let agent_image = match get("agent-image") {
+        None => None,
+        Some(image) => {
+            if !install.agent_image_allowed(image) {
+                return Err(format!(
+                    "{PREFIX}agent-image is {image:?}, which this installation \
+                     does not allow. An arbitrary image on the injected \
+                     container runs chosen code beside every application \
+                     that asks, so an administrator lists the prefixes that \
+                     are permitted in `webhook.agentImageAllow`"
+                ));
+            }
+
+            Some(image.to_owned())
+        }
+    };
+
+    let events = match get("events") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}events is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    if events && !install.events_allowed() {
+        return Err(format!(
+            "{PREFIX}events is not available in this installation: writing \
+             Events needs the pod's service-account token mounted into the \
+             agent, which is a credential the sidecar otherwise never \
+             carries. An administrator enables it with \
+             `agent.events.enabled: true`, which also creates the Role that \
+             grants `create` on events"
+        ));
+    }
+
+    let on_drift = match get("on-drift") {
+        None => None,
+        Some(policy @ ("warn" | "repair" | "fail")) => Some(policy.to_owned()),
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}on-drift is {other:?}: \"warn\", \"repair\" or \"fail\""
+            ))
+        }
+    };
+
+    if !revoke_on_shutdown && !dynamic {
+        return Err(format!(
+            "{PREFIX}revoke-on-shutdown without {PREFIX}dynamic: only a \
+             dynamic-secret source holds a lease to revoke"
+        ));
+    }
+
+    // On unless the pod says otherwise. The probe is what makes `/readyz`
+    // worth answering, and the default a config sidecar should have is
+    // "no traffic until there is configuration" — a pod that would rather
+    // start regardless has to say so, because that is the surprising choice.
+    let readiness = match get("readiness") {
+        None => true,
+        Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}readiness is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    let require_ack = match get("require-ack") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "{PREFIX}require-ack is {other:?}: \"true\" or \"false\""
+            ))
+        }
+    };
+
+    if require_ack && !readiness {
+        return Err(format!(
+            "{PREFIX}require-ack with {PREFIX}readiness \"false\": the \
+             acknowledgement is only ever read by the readiness probe, so \
+             asking for one without a probe asks for nothing"
+        ));
+    }
+
+    if require_ack && mode == Mode::Init {
+        return Err(format!(
+            "{PREFIX}require-ack with {PREFIX}mode \"init\": an init \
+             container exits before the application starts, so there is \
+             nothing left to acknowledge to"
+        ));
+    }
+
     // The format is validated here; whether the NAMES may pass at all
     // is the installation's allowlist, checked by the admission with
     // the namespace in hand.
@@ -1761,7 +2612,63 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         .cloned()
         .collect();
 
+    // Which containers see the rendered document. Absent is all of them.
+    let inject_containers = match get("inject-containers") {
+        None => None,
+        Some(text) => {
+            let named: Vec<String> = text
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect();
+
+            if named.is_empty() {
+                return Err(format!(
+                    "{PREFIX}inject-containers is empty — a render nothing can \
+                     read is a render nobody asked for. Drop the annotation to \
+                     mount into every container"
+                ));
+            }
+
+            let present: Vec<&str> = pod
+                .pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|container| container["name"].as_str())
+                .collect();
+
+            // A typo here fails open in the worst possible direction: the
+            // application never sees its configuration, and every *other*
+            // container still does not. So it is refused, like every other
+            // name in this contract.
+            if let Some(missing) = named.iter().find(|name| !present.contains(&name.as_str())) {
+                return Err(format!(
+                    "{PREFIX}inject-containers names container {missing:?}, and \
+                     the pod has no such container"
+                ));
+            }
+
+            Some(named)
+        }
+    };
+
     if let Some(name) = &env_inject {
+        // The env wrapper sources the rendered file, so the container it
+        // wraps has to be able to read it. Refused rather than quietly
+        // mounted: two annotations disagreeing is a configuration nobody
+        // meant to write.
+        if let Some(named) = &inject_containers {
+            if !named.contains(name) {
+                return Err(format!(
+                    "{PREFIX}env-inject wraps container {name:?}, which \
+                     {PREFIX}inject-containers leaves out — the wrapper sources \
+                     the rendered file, so that container must be in the list"
+                ));
+            }
+        }
+
         let container = pod
             .pointer("/spec/containers")
             .and_then(Value::as_array)
@@ -1845,6 +2752,17 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         (None, None) => {}
     }
 
+    // The default key is `schema.json`, which is what a ConfigMap made by
+    // `kubectl create configmap --from-file` is called.
+    let schema = object_ref("schema-configmap", "schema.json");
+
+    if let Some(reference) = &schema {
+        arguments.push((
+            "--schema".to_owned(),
+            format!("{SCHEMA_MOUNT}/{}", reference.key),
+        ));
+    }
+
     if tls.is_some() {
         arguments.push(("--tls-cert".to_owned(), format!("{TLS_MOUNT}/tls.crt")));
         arguments.push(("--tls-key".to_owned(), format!("{TLS_MOUNT}/tls.key")));
@@ -1862,6 +2780,44 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
             resolved_path,
             install,
         )?);
+    }
+
+    // The all-or-none set. Each is a *rendering* of the document the main
+    // one reads, so it takes a path and optionally a section and nothing
+    // else: a source or a key here would make it a second render, which is
+    // what `source.<name>` already is and is deliberately not this.
+    let mut also = Vec::new();
+
+    for suffix in &also_names {
+        let path = get(&format!("also.{suffix}")).ok_or_else(|| {
+            format!("{PREFIX}also-section.{suffix} without {PREFIX}also.{suffix}: a rendering needs somewhere to go")
+        })?;
+
+        if !path.starts_with('/') {
+            return Err(format!(
+                "{PREFIX}also.{suffix} is {path:?}: an absolute path"
+            ));
+        }
+
+        // Same directory as the main render, because that is the volume
+        // the injection mounts — a path outside it would be written into
+        // the container's read-only root and fail at the first render.
+        let directory = std::path::Path::new(&path).parent();
+        let main = resolved_path.and_then(|path| std::path::Path::new(path).parent());
+
+        if directory != main {
+            return Err(format!(
+                "{PREFIX}also.{suffix} is {path:?}: every rendering lands in \
+                 the same directory as {PREFIX}path, which is the volume the \
+                 injection mounts"
+            ));
+        }
+
+        also.push(Rendering {
+            name: suffix.clone(),
+            path: path.to_owned(),
+            section: get(&format!("also-section.{suffix}")).map(str::to_owned),
+        });
     }
 
     let resolved = |name: &str| {
@@ -1901,8 +2857,29 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
         run_as_user,
         run_as_group,
         env_inject,
+        inject_containers,
+        revoke_grace,
+        init_first,
+        extra_secret,
+        notify_http,
+        on_drift,
+        tls_reload,
+        history,
+        require_ack,
+        events,
+        canary,
+        agent_image,
+        timeout,
+        tls_server_name,
+        tls_skip_verify,
         env_restart,
         metrics_port,
+        readiness,
+        meta,
+        schema,
+        also,
+        dynamic,
+        revoke_on_shutdown,
         aws_secret,
         agent_env,
         fleet_env,
@@ -1943,6 +2920,8 @@ fn extra_render<'a>(
     let supplied_strings = install.store_strings(Some(&source));
 
     let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        let (pod, tier) = (without_userinfo(pod), without_userinfo(tier));
+
         format!(
             "{} is {pod:?}, but the installation pins it to {tier:?} — \
              match it or drop the annotation",
@@ -2128,6 +3107,23 @@ fn extra_render<'a>(
         ));
     }
 
+    let metrics_port = match get("metrics-port") {
+        None => None,
+        Some(text) => {
+            let port: u16 = text
+                .parse()
+                .map_err(|_| format!("{} is {text:?}: a port number", label("metrics-port")))?;
+
+            // "0" is the opt-out everywhere else in this contract, and it
+            // means the same here.
+            if port == 0 {
+                None
+            } else {
+                Some(port)
+            }
+        }
+    };
+
     let ssh = object_ref("ssh-secret", "ssh-privatekey");
     let mut arguments = Vec::new();
 
@@ -2171,6 +3167,43 @@ fn extra_render<'a>(
 
     if let Some(ca) = &ca {
         arguments.push(("--ca".to_owned(), format!("{CA_MOUNT}-{suffix}/{}", ca.key)));
+    }
+
+    if let Some(name) = defaulted("tls-server-name") {
+        arguments.push(("--tls-server-name".to_owned(), name.to_owned()));
+    }
+
+    match defaulted("tls-skip-verify") {
+        None | Some("false") => {}
+        Some("true") => {
+            if !install.tls_skip_verify_allowed() {
+                return Err(format!(
+                    "{} is not available in this installation: it turns off \
+                     authentication of the store entirely, so it is a cluster \
+                     decision rather than a workload's. An administrator \
+                     enables it with `webhook.allowTlsSkipVerify: true`",
+                    label("tls-skip-verify")
+                ));
+            }
+
+            if ca.is_some() {
+                return Err(format!(
+                    "{} with {}: naming an authority and then not checking it \
+                     are contradictory. Drop one — the authority is the one \
+                     that keeps working",
+                    label("tls-skip-verify"),
+                    label("ca-configmap")
+                ));
+            }
+
+            arguments.push(("--tls-skip-verify".to_owned(), String::new()));
+        }
+        Some(other) => {
+            return Err(format!(
+                "{} is {other:?}: \"true\" or \"false\"",
+                label("tls-skip-verify")
+            ))
+        }
     }
 
     let file_mode = match get("file-mode") {
@@ -2252,6 +3285,7 @@ fn extra_render<'a>(
         key,
         path,
         watch_seconds,
+        metrics_port,
         arguments,
         secret_env,
         ca,
@@ -2272,6 +3306,89 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned())
         }
+    }
+
+    /// The two lists this table replaced could disagree; one table cannot.
+    #[test]
+    fn every_per_render_key_is_a_known_key() {
+        for spec in REGISTRY {
+            assert!(is_known(spec.name), "{} is not known", spec.name);
+
+            if spec.per_render {
+                assert!(is_per_render(spec.name));
+            }
+        }
+
+        assert!(!is_known("tokne-secret"), "a typo is not a key");
+        assert!(!is_per_render("mode"), "the mode is pod-wide");
+        assert!(is_per_render("key"), "a named render names its own key");
+    }
+
+    /// Nothing is deprecated, and the table says so rather than the reader
+    /// having to check every entry.
+    #[test]
+    fn the_contract_has_retired_nothing_yet() {
+        let retired: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|spec| spec.deprecated_since.is_some())
+            .map(|spec| spec.name)
+            .collect();
+
+        assert!(
+            retired.is_empty(),
+            "these are deprecated and the book's table should say so: {retired:?}"
+        );
+    }
+
+    /// The mechanism, proved while there is nothing real to prove it on —
+    /// which is the only moment it can be.
+    #[test]
+    fn a_deprecated_key_warns_and_names_its_replacement() {
+        const TABLE: &[AnnotationSpec] = &[
+            known("watch-seconds").deprecated("0.4.0", Some("refresh-interval")),
+            known("source").per_render(),
+            known("gone-for-good").deprecated("0.4.0", None),
+        ];
+
+        let warnings = deprecation_warnings(
+            TABLE,
+            [
+                "dynamic-config.rs/watch-seconds",
+                "dynamic-config.rs/source",
+                "dynamic-config.rs/gone-for-good",
+                "unrelated.example.com/thing",
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("deprecated since 0.4.0"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("dynamic-config.rs/refresh-interval"),
+            "the replacement is named: {warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("no replacement"),
+            "a key going away with nothing taking its place reads differently: {warnings:?}"
+        );
+    }
+
+    /// A named render's `source.cache` is `source` wearing a suffix, and
+    /// carries its deprecation.
+    #[test]
+    fn a_suffixed_key_inherits_the_deprecation_of_its_base() {
+        const TABLE: &[AnnotationSpec] = &[known("endpoint")
+            .per_render()
+            .deprecated("0.4.0", Some("address"))];
+
+        let warnings =
+            deprecation_warnings(TABLE, ["dynamic-config.rs/endpoint.cache"].into_iter());
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("endpoint.cache"), "{warnings:?}");
     }
 
     #[test]
@@ -2454,5 +3571,38 @@ mod tests {
         assert!(ScopedNames::env_names("*: *")
             .unwrap()
             .allows("x", "ANYTHING"));
+    }
+
+    /// A refusal echoing an endpoint must not carry the credential
+    /// somebody put in the URL. It goes to the API server's audit log and
+    /// to the events of whatever controller was creating the pod, and
+    /// neither of those forgets.
+    #[test]
+    fn a_url_loses_its_credential_and_nothing_else() {
+        assert_eq!(
+            without_userinfo("https://alice:hunter2@vault.internal:8200/v1"),
+            "https://\u{2026}@vault.internal:8200/v1"
+        );
+
+        // The last `@`, because a password may contain one.
+        assert_eq!(
+            without_userinfo("https://alice:a@b@vault.internal"),
+            "https://\u{2026}@vault.internal"
+        );
+
+        // A path may contain an `@` that is not userinfo at all.
+        assert_eq!(
+            without_userinfo("https://consul.infra:8500/kv/team@example"),
+            "https://consul.infra:8500/kv/team@example"
+        );
+
+        for untouched in [
+            "https://consul.infra:8500",
+            "consul.infra:8500",
+            "not a url at all",
+            "",
+        ] {
+            assert_eq!(without_userinfo(untouched), untouched);
+        }
     }
 }

@@ -18,22 +18,33 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Structured logs as before, plus OTLP traces when a collector is
+    // configured. Nothing is exported unless `OTEL_EXPORTER_OTLP_ENDPOINT`
+    // is set, so no existing deployment changes behaviour.
+    let telemetry = dynamic_config_telemetry::install("dynamic-config-operator");
 
     // `--crds` prints the CRD manifests and exits: what `deploy/` embeds,
     // generated from the same types the reconciler compiles against, so
     // the two cannot drift.
     if std::env::args().nth(1).as_deref() == Some("--crds") {
         print!("{}", crds::manifests()?);
+        telemetry.shutdown();
+
         return Ok(());
     }
 
+    let outcome = reconcile_forever().await;
+
+    // Explicitly, before the process goes: a batch exporter holds spans for
+    // up to its scheduled delay, and a controller that has just lost its
+    // lease has the spans somebody will want.
+    telemetry.shutdown();
+
+    outcome
+}
+
+/// The operator proper, so `main` can own the telemetry either side of it.
+async fn reconcile_forever() -> Result<(), Box<dyn std::error::Error>> {
     // One provider, stated: with ring and aws-lc both reachable in the
     // dependency graph, rustls refuses to pick — and panics inside the
     // first TLS handshake instead of here, where the message can say
@@ -52,6 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(dynamic_config_agent::metrics::serve(
             metrics,
             "dynamic_config_operator",
+            // Up is ready, here. An operator with no `Render` resources has
+            // rendered nothing and is working perfectly; keying its
+            // readiness on a render would leave a healthy install
+            // permanently unready.
+            dynamic_config_agent::metrics::always,
         ));
     }
 

@@ -12,9 +12,11 @@ metadata:
 ---
 {{- end }}
 {{- if .Values.operator.rbac.create }}
-# Least privilege for what the reconcilers do: watch the two
-# CRDs, own the ConfigMaps they render, record events. Nothing cluster-
-# shaping — no pods, no secrets beyond reads the classes name.
+# Least privilege for what the reconcilers do: watch the two CRDs, own
+# the ConfigMaps and Secrets they render, record events. Nothing
+# cluster-shaping — no pods, and no node, namespace or RBAC access at
+# all. The Secret verbs are the one grant worth reading rather than
+# skimming; the comment beside them says what they are for.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -121,6 +123,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Not for the Lease — for the resource attributes a trace needs
+            # to be findable. The two above serve both purposes.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             {{- with .Values.operator.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

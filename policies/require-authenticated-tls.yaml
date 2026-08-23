@@ -1,0 +1,36 @@
+# The chart's `webhook.allowTlsSkipVerify` already gates this, and an
+# installation that never turns it on needs nothing here. This is for the
+# cluster that turns it on for one namespace and wants it refused in the
+# rest — and for the auditor who would rather see the rule written down as
+# an object than as a value in a values file.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dynamic-config-require-authenticated-tls
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !('dynamic-config.rs/tls-skip-verify' in object.metadata.annotations) ||
+        object.metadata.annotations['dynamic-config.rs/tls-skip-verify'] != 'true'
+      message: >-
+        dynamic-config.rs/tls-skip-verify is not permitted here: the store
+        would not be authenticated, so anything on the network path could
+        supply this pod's configuration and its credentials. Name the
+        authority with dynamic-config.rs/ca-configmap instead.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dynamic-config-require-authenticated-tls
+spec:
+  policyName: dynamic-config-require-authenticated-tls
+  validationActions: [Deny]
+  matchResources: {}

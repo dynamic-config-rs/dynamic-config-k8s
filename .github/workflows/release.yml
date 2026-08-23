@@ -3,11 +3,14 @@ name: Release
 # Merging a version bump into `main` IS the release — the wheel wave's
 # shape, aimed at registries. The `decide` job checks whether the
 # workspace version is new; a docs merge is a green no-op and a version
-# bump builds the three images multi-arch, pushes them to ghcr.io and
-# Docker Hub with identical digests (one buildx build, both registries in
-# the tag list), signs everything with cosign keyless, attaches SBOM and
-# provenance attestations, pushes the chart as OCI with its ArtifactHub
-# metadata, and mints the tag last — a tag marks what actually shipped.
+# bump builds the four images, each architecture on its own runner
+# rather than under QEMU, pushes them by digest to ghcr.io and Docker Hub,
+# and joins them into one index per registry — so the digest a consumer
+# pulls is the index's. It signs that index with cosign keyless, attaches
+# SBOM and provenance to the per-architecture images beneath it (an index
+# does not carry attestations up), pushes the chart as OCI with its
+# ArtifactHub metadata, and mints the tag last — a tag marks what actually
+# shipped.
 on:
   push:
     branches: [main]
@@ -89,13 +92,91 @@ jobs:
       - run: cargo test --workspace
 
   images:
-    name: ${{ matrix.component }} image, both registries
+    name: ${{ matrix.component }} ${{ matrix.arch }}
     needs: [decide, verify]
     if: needs.decide.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    # Was 210 minutes because the arm64 half compiled a Rust workspace
+    # under QEMU — 1h39m for the agent on 0.2.0. Each half now builds on
+    # its own architecture, so neither emulates anything.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [agent, webhook, operator, node-agent]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            # Free for public repositories, which this is.
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # No `setup-qemu-action`: nothing is emulated any more, and leaving
+      # it installed would quietly re-enable the slow path if a platform
+      # were ever added back to the build below.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushed **by digest**, with no tag: a tag naming one architecture
+      # would be wrong for half the fleet between this job and the join
+      # below. The manifest list that carries both is assembled there.
+      #
+      # `provenance` and `sbom` stay here rather than moving to the join:
+      # they attest what was *built*, and what was built is one
+      # architecture. `SECURITY.md` says which digest carries which.
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.component }}
+          platforms: linux/${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+          # Per component **and** per architecture: one scope shared by two
+          # legs is two legs overwriting each other's entry.
+          cache-from: type=gha,scope=image-${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.component }}-${{ matrix.arch }}
+          outputs: |
+            type=image,name=${{ env.GHCR }}/dynamic-config-${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
+
+      # One file per leg, named for the digest: the join needs both, and a
+      # matrix cannot hand a value back any other way.
+      - name: hand the digest to the join
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.component }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  manifest:
+    name: ${{ matrix.component }} manifest list, both registries
+    needs: [decide, images]
+    if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
-    # Generous on purpose: the arm64 half compiles a Rust workspace
-    # under qemu, and the agent's tree includes the store crates.
-    timeout-minutes: 210
+    timeout-minutes: 20
     permissions:
       contents: read
       packages: write
@@ -103,10 +184,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [agent, webhook, operator]
+        component: [agent, webhook, operator, node-agent]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
@@ -120,60 +199,98 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # ONE build, every tag: both registries receive the same manifest
-      # list, so the digests are identical by construction — `cosign
-      # verify` against either registry proves the same bytes.
-      - name: build, attest, push
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          context: .
-          file: docker/Dockerfile
-          target: ${{ matrix.component }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: mode=max
-          sbom: true
-          # The arm64 half of this runs under QEMU, where a dependency
-          # build is minutes rather than seconds. The cache is scoped per
-          # component so three concurrent matrix legs do not overwrite
-          # each other's entry.
-          cache-from: type=gha,scope=image-${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=image-${{ matrix.component }}
-          tags: |
-            ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:v${{ needs.decide.outputs.version }}
-            ${{ env.GHCR }}/dynamic-config-${{ matrix.component }}:latest
-            ${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }}:v${{ needs.decide.outputs.version }}
-            ${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }}:latest
+          pattern: digest-${{ matrix.component }}-*
+          merge-multiple: true
+          path: /tmp/digests
 
-      # Keyless: no key to rotate or leak — the signature's certificate
-      # binds this repository, this workflow, this run. Signed by digest,
-      # never by tag: a tag can move, the digest cannot.
-      - name: cosign sign, both registries
+      # The manifest list, from the two digests, once per registry. Both
+      # lists are built from the same per-architecture digests, so the two
+      # index digests are equal — which the assertion below still checks,
+      # because "equal by construction" is a claim worth failing on.
+      - name: assemble, per registry
+        id: manifest
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
           VERSION: ${{ needs.decide.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
         run: |
-          cosign sign --yes "${GHCR}/dynamic-config-${{ matrix.component }}@${DIGEST}"
-          cosign sign --yes "${DOCKERHUB}/dynamic-config-${{ matrix.component }}@${DIGEST}"
+          set -euo pipefail
+
+          sources=""
+          for digest in /tmp/digests/*; do
+            sources="$sources ${GHCR}/dynamic-config-${COMPONENT}@sha256:$(basename "$digest")"
+          done
+
+          echo "joining:$sources"
+
+          for registry in "${GHCR}" "${DOCKERHUB}"; do
+            # shellcheck disable=SC2086
+            docker buildx imagetools create \
+              --tag "${registry}/dynamic-config-${COMPONENT}:v${VERSION}" \
+              --tag "${registry}/dynamic-config-${COMPONENT}:latest" \
+              $sources
+          done
+
+          index=$(docker buildx imagetools inspect \
+            "${GHCR}/dynamic-config-${COMPONENT}:v${VERSION}" \
+            --format '{{.Manifest.Digest}}')
+
+          echo "digest=$index" >> "$GITHUB_OUTPUT"
+
+      # The **index**, not the per-architecture digests. `README.md` tells
+      # a user to `cosign verify …:v<version>`, and a tag resolves to the
+      # index — signing what was pushed underneath it would leave that
+      # command failing against images that are perfectly genuine.
+      - name: cosign sign the index, both registries
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          cosign sign --yes "${GHCR}/dynamic-config-${COMPONENT}@${DIGEST}"
+          cosign sign --yes "${DOCKERHUB}/dynamic-config-${COMPONENT}@${DIGEST}"
 
       - name: the digests match across registries
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
           VERSION: ${{ needs.decide.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
         run: |
           on_ghcr=$(docker buildx imagetools inspect \
-            "${GHCR}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
+            "${GHCR}/dynamic-config-${COMPONENT}:v${VERSION}" --format '{{json .Manifest.Digest}}')
           on_hub=$(docker buildx imagetools inspect \
-            "${DOCKERHUB}/dynamic-config-${{ matrix.component }}:v${VERSION}" --format '{{json .Manifest.Digest}}')
+            "${DOCKERHUB}/dynamic-config-${COMPONENT}:v${VERSION}" --format '{{json .Manifest.Digest}}')
 
           echo "ghcr: $on_ghcr"
           echo "hub:  $on_hub"
           [ "$on_ghcr" = "$on_hub" ] && [ "$on_ghcr" = "\"${DIGEST}\"" ]
 
+      # Both architectures, in the list a `docker pull` will read.
+      - name: the list carries both architectures
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          platforms=$(docker buildx imagetools inspect \
+            "${GHCR}/dynamic-config-${COMPONENT}:v${VERSION}" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+
+          echo "platforms: $platforms"
+
+          case "$platforms" in
+            *linux/amd64*) ;;
+            *) echo "no linux/amd64 in the manifest list" >&2; exit 1 ;;
+          esac
+          case "$platforms" in
+            *linux/arm64*) ;;
+            *) echo "no linux/arm64 in the manifest list" >&2; exit 1 ;;
+          esac
+
   chart:
     name: chart to ghcr + ArtifactHub metadata
-    needs: [decide, images]
+    # `manifest`, not `images`: the tags a chart's appVersion points at
+    # do not exist until the manifest lists are assembled.
+    needs: [decide, manifest]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -233,7 +350,9 @@ jobs:
 
   tag-and-release:
     name: tag and GitHub release
-    needs: [decide, images, chart]
+    # Likewise: minting the tag before the manifest lists exist would
+    # publish a release naming images nobody can pull.
+    needs: [decide, manifest, chart]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10

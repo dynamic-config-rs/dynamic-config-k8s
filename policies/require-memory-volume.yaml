@@ -1,0 +1,40 @@
+# A rendered secret on node-backed storage outlives the pod, survives a
+# reboot, and is readable by anything that can read the node's disk. The
+# webhook warns about it; this refuses it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: dynamic-config-require-memory-volume
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        object.metadata.annotations['dynamic-config.rs/inject'] != 'true' ||
+        !('dynamic-config.rs/volume-medium' in object.metadata.annotations) ||
+        object.metadata.annotations['dynamic-config.rs/volume-medium'] == 'memory'
+      message: >-
+        dynamic-config.rs/volume-medium must be "memory" here: a rendered
+        document on node-backed storage outlives the pod that owns it.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: dynamic-config-require-memory-volume
+spec:
+  policyName: dynamic-config-require-memory-volume
+  # Warn first. Swap to [Deny] once the report is empty.
+  validationActions: [Warn]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        # Label the namespaces this applies to, rather than every namespace
+        # in the cluster: a policy that fires everywhere on day one is a
+        # policy somebody removes on day two.
+        dynamic-config.rs/policy: strict

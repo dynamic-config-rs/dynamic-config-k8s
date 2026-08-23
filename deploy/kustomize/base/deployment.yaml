@@ -34,11 +34,11 @@ spec:
               app.kubernetes.io/component: webhook
       containers:
         - name: webhook
-          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.2.0
+          image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.3.0
           imagePullPolicy: IfNotPresent
           env:
             - name: DYNAMIC_CONFIG_AGENT_IMAGE
-              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.2.0
+              value: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.3.0
             - name: DYNAMIC_CONFIG_WEBHOOK_ADDR
               value: "0.0.0.0:8443"
             # Where the plain-HTTP metrics port binds. Empty turns it off,
@@ -56,6 +56,16 @@ spec:
               value: "32Mi"
             - name: DYNAMIC_CONFIG_AGENT_MEMORY_LIMIT
               value: "64Mi"
+            # The port the injected agent serves /metrics and /readyz on,
+            # and with it whether the injected container gets a readiness
+            # probe at all — the probe is attached only where there is a
+            # port to attach it to. The chart defaults this to the same
+            # number; without it here the two supported install paths
+            # would disagree about whether a pod is ready before its
+            # configuration exists, which is not a difference an install
+            # method should make.
+            - name: DYNAMIC_CONFIG_AGENT_METRICS_PORT
+              value: "9110"
             # Optional fleet defaults, per-store defaults and the gates —
             # set via an overlay patch; empty means unset, and the webhook
             # validates every value at startup:
@@ -76,6 +86,10 @@ spec:
             #   DYNAMIC_CONFIG_WEBHOOK_AGENT_ENV_ALLOW  "payments: HTTPS_PROXY; *: RUST_LOG"
             #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_ALLOW     "payments: vault, s3; *: consul"
             #   DYNAMIC_CONFIG_WEBHOOK_SOURCE_DENY      "sandbox: git"
+            #   DYNAMIC_CONFIG_WEBHOOK_CLASSES          "true"   (read DynamicConfigClass objects)
+            #   DYNAMIC_CONFIG_WEBHOOK_AGENT_IMAGE_ALLOW "ghcr.io/dynamic-config-rs/"
+            #   DYNAMIC_CONFIG_WEBHOOK_ALLOW_EVENTS     "true"
+            #   DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY "false"
           ports:
             - containerPort: 8443
               name: https

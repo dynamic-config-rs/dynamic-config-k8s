@@ -11,6 +11,7 @@ description = "Operator: DynamicConfigClass store bundles and DynamicConfigRende
 publish = false   # ships as an image, not a crate
 
 [dependencies]
+dynamic-config-telemetry = { path = "../dynamic-config-telemetry" }
 # kube-rs and the API types. `latest` feature pins the k8s API version
 # the CRDs are generated against; runtime brings the Controller.
 kube = { version = "1", features = ["runtime", "derive", "client"] }

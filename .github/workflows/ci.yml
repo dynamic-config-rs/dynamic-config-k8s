@@ -58,12 +58,51 @@ jobs:
           cargo run -q -p dynamic-config-operator -- --crds > /tmp/crds-now.json
           diff -u deploy/crds.json /tmp/crds-now.json
 
+  images:
+    name: the images, once
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+
+      # Three legs used to run `just images` each, which is nine uncached
+      # builds of the same workspace per pull request. Once, cached, and
+      # shared as an artifact — the same shape `nightly.yml` already uses.
+      - name: build, into the local daemon
+        run: |
+          for component in agent webhook operator; do
+            docker buildx build \
+              --file docker/Dockerfile \
+              --target "$component" \
+              --tag "dynamic-config-$component:dev" \
+              --cache-from "type=gha,scope=e2e-$component" \
+              --cache-to "type=gha,mode=max,scope=e2e-$component" \
+              --load .
+          done
+
+      - run: just images-save images.tar
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-images
+          path: images.tar
+          retention-days: 1
+
   e2e-smoke:
     name: kind smoke
+    needs: images
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
         with:
           install_only: true
@@ -74,14 +113,52 @@ jobs:
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: just
+      # The scripts build the images themselves when they are run by
+      # hand; here they are already loaded, and `just images` would
+      # rebuild what the artifact just delivered.
       - run: e2e/smoke.sh
+        env:
+          IMAGES_PRELOADED: "1"
+
+  e2e-node-agent:
+    name: kind node agent, CSI volumes
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      # The scripts build the images themselves when they are run by
+      # hand; here they are already loaded, and `just images` would
+      # rebuild what the artifact just delivered.
+      - run: e2e/node-agent.sh
+        env:
+          IMAGES_PRELOADED: "1"
 
   e2e-operator:
     name: kind operator, render to ConfigMap
+    needs: images
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
         with:
           install_only: true
@@ -92,14 +169,24 @@ jobs:
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: just
+      # The scripts build the images themselves when they are run by
+      # hand; here they are already loaded, and `just images` would
+      # rebuild what the artifact just delivered.
       - run: e2e/operator-smoke.sh
+        env:
+          IMAGES_PRELOADED: "1"
 
   e2e-stores:
     name: kind stores — etcd both auths, vault, redis, nats, s3
+    needs: images
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
       - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
         with:
           install_only: true
@@ -110,7 +197,37 @@ jobs:
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
         with:
           tool: just
+      # The scripts build the images themselves when they are run by
+      # hand; here they are already loaded, and `just images` would
+      # rebuild what the artifact just delivered.
       - run: e2e/stores-smoke.sh
+        env:
+          IMAGES_PRELOADED: "1"
+
+  e2e-latency:
+    name: kind latency, change to visible
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-images
+      - run: docker load -i images.tar
+      - uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1
+        with:
+          install_only: true
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: just
+      - run: e2e/latency.sh
+        env:
+          IMAGES_PRELOADED: "1"
 
   actionlint:
     name: workflows lint clean
@@ -124,7 +241,23 @@ jobs:
 
   ci-ok:
     name: CI is green
-    needs: [fmt, clippy, test, e2e-smoke, e2e-operator, e2e-stores, actionlint]
+    # `images` is named here as well as by the legs that consume it.
+    # Without it, a failed image build *skips* the three kind legs — and a
+    # skipped job is a pass to the check below, so a broken Dockerfile
+    # would report green.
+    needs:
+      [
+        fmt,
+        clippy,
+        test,
+        images,
+        e2e-smoke,
+        e2e-operator,
+        e2e-stores,
+        e2e-latency,
+        e2e-node-agent,
+        actionlint,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
