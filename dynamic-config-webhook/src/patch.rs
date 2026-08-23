@@ -298,6 +298,24 @@ fn with_class(
         return Ok(None);
     };
 
+    // A pod that already carries the mark produces no patch at all —
+    // `annotations::of_pod_with` returns `Ok(None)` for it a few lines
+    // downstream. Resolving its class here can therefore only *refuse* a
+    // pod that is already running correctly: injection does not remove
+    // the `class` annotation, so a manifest read back out of the cluster
+    // and applied again names a class that may since have been renamed,
+    // deleted, or put behind a `webhook.classes.enabled` an administrator
+    // has since turned off. Idempotence is the invariant here, and it
+    // outranks a diagnosis nobody can act on.
+    let injected = annotations
+        .get(&format!("{}{}", annotations::PREFIX, annotations::STATUS))
+        .and_then(Value::as_str)
+        == Some(annotations::INJECTED);
+
+    if injected {
+        return Ok(None);
+    }
+
     let named = annotations
         .get(&format!("{}class", annotations::PREFIX))
         .and_then(Value::as_str);
@@ -310,7 +328,11 @@ fn with_class(
         return Err((
             POLICY,
             format!(
-                "{}class names {named:?}, and no DynamicConfigClass or                  ClusterDynamicConfigClass of that name is visible here.                  Classes are read only when an administrator sets                  `webhook.classes.enabled`, and a class created seconds ago                  may not have been polled yet",
+                "{}class names {named:?}, and no DynamicConfigClass or \
+                 ClusterDynamicConfigClass of that name is visible here. \
+                 Classes are read only when an administrator sets \
+                 `webhook.classes.enabled`, and a class created seconds \
+                 ago may not have been polled yet",
                 annotations::PREFIX
             ),
         ));
@@ -320,7 +342,10 @@ fn with_class(
         return Err((
             POLICY,
             format!(
-                "{}class names {named:?}, which exists and does not admit                  namespace {namespace:?}. Its `namespaces` list is the                  platform team's, and this is what keeps a cluster-scoped                  class from meaning anyone",
+                "{}class names {named:?}, which exists and does not admit \
+                 namespace {namespace:?}. Its `namespaces` list is the \
+                 platform team's, and this is what keeps a cluster-scoped \
+                 class from meaning anyone",
                 annotations::PREFIX
             ),
         ));
@@ -334,7 +359,10 @@ fn with_class(
             return Err((
                 POLICY,
                 format!(
-                    "{}class names {named:?}, whose credential Secret is in                      namespace {holds:?}. A pod can only mount Secrets from                      its own namespace, so this class is usable by a                      DynamicConfigRender and not by an injected agent",
+                    "{}class names {named:?}, whose credential Secret is \
+                     in namespace {holds:?}. A pod can only mount Secrets \
+                     from its own namespace, so this class is usable by a \
+                     DynamicConfigRender and not by an injected agent",
                     annotations::PREFIX
                 ),
             ));
@@ -1339,6 +1367,24 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
 
             for (name, value) in request.fleet_env.iter().chain(&request.agent_env) {
                 env.push(json!({ "name": name, "value": value }));
+            }
+
+            container["env"] = json!(env);
+        }
+
+        // So is aws-secret, and for the same reason — there is no
+        // per-render form of it, and `aws-secret` is refused outright
+        // unless the pod's own source is s3. A named render reading the
+        // same store as the pod that declared the credential was the one
+        // container not given it, and it could not authenticate.
+        if let Some(secret) = &request.aws_secret {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+                env.push(json!({
+                    "name": key,
+                    "valueFrom": { "secretKeyRef": { "name": secret, "key": key } },
+                }));
             }
 
             container["env"] = json!(env);

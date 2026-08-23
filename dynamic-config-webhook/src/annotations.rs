@@ -34,6 +34,43 @@ use serde_json::Value;
 /// reworded. A test walks every pin path and asserts the phrase survives.
 pub(crate) const PINS: &str = "the installation pins";
 
+/// A value on its way into a refusal, with any URL userinfo taken out.
+///
+/// A refusal echoes what the pod asked for on purpose: a value the author
+/// wrote and did not get is a debugging session, and the whole point of
+/// answering at admission is to end that session before the pod exists.
+///
+/// `endpoint` is the exception that needs handling rather than an
+/// exception to the rule. It is a URL, and a URL can carry
+/// `user:password@` — and a refusal is not only read by the author. It is
+/// the `status.message` of a rejected API call, which lands in the
+/// server's audit log and in the events of whatever controller was
+/// creating the pod. Keeping the credential out of those is not hiding
+/// the value from the person who wrote it.
+fn without_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+
+    let Some(scheme) = value.find("://") else {
+        return Cow::Borrowed(value);
+    };
+
+    let rest = &value[scheme + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+
+    // The last `@`, not the first: a password may contain one.
+    let Some(at) = authority.rfind('@') else {
+        return Cow::Borrowed(value);
+    };
+
+    Cow::Owned(format!(
+        "{}\u{2026}@{}{}",
+        &value[..scheme + 3],
+        &authority[at + 1..],
+        &rest[end..]
+    ))
+}
+
 /// The mark an injection leaves on the pod it patched.
 ///
 /// **An injection has to be idempotent, and a mutating webhook is not
@@ -1616,6 +1653,8 @@ pub fn of_pod_with(pod: &Value, install: &Installation) -> Result<Option<Request
     // because a value the author wrote and did not get is a debugging
     // session; the SAME value restated passes.
     let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        let (pod, tier) = (without_userinfo(pod), without_userinfo(tier));
+
         format!(
             "{PREFIX}{key} is {pod:?}, but the installation pins it to \
              {tier:?} — match it or drop the annotation (the installer \
@@ -2881,6 +2920,8 @@ fn extra_render<'a>(
     let supplied_strings = install.store_strings(Some(&source));
 
     let pinned = |key: &str, pod: &str, tier: &str| -> String {
+        let (pod, tier) = (without_userinfo(pod), without_userinfo(tier));
+
         format!(
             "{} is {pod:?}, but the installation pins it to {tier:?} — \
              match it or drop the annotation",
@@ -3530,5 +3571,38 @@ mod tests {
         assert!(ScopedNames::env_names("*: *")
             .unwrap()
             .allows("x", "ANYTHING"));
+    }
+
+    /// A refusal echoing an endpoint must not carry the credential
+    /// somebody put in the URL. It goes to the API server's audit log and
+    /// to the events of whatever controller was creating the pod, and
+    /// neither of those forgets.
+    #[test]
+    fn a_url_loses_its_credential_and_nothing_else() {
+        assert_eq!(
+            without_userinfo("https://alice:hunter2@vault.internal:8200/v1"),
+            "https://\u{2026}@vault.internal:8200/v1"
+        );
+
+        // The last `@`, because a password may contain one.
+        assert_eq!(
+            without_userinfo("https://alice:a@b@vault.internal"),
+            "https://\u{2026}@vault.internal"
+        );
+
+        // A path may contain an `@` that is not userinfo at all.
+        assert_eq!(
+            without_userinfo("https://consul.infra:8500/kv/team@example"),
+            "https://consul.infra:8500/kv/team@example"
+        );
+
+        for untouched in [
+            "https://consul.infra:8500",
+            "consul.infra:8500",
+            "not a url at all",
+            "",
+        ] {
+            assert_eq!(without_userinfo(untouched), untouched);
+        }
     }
 }

@@ -163,3 +163,37 @@ fn a_pod_without_a_class_is_unaffected() {
 
     assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
 }
+
+/// A pod that was injected once and is applied again — `kubectl get pod -o
+/// yaml | kubectl apply -f -`, or a controller replaying a stored spec —
+/// carries its `class` annotation, because injection does not remove it.
+/// If the class has since been renamed, deleted, or put behind a
+/// `webhook.classes.enabled` an administrator has turned off, resolving it
+/// again can only refuse a pod that is already running correctly.
+///
+/// So the mark is read before the class is: an already-injected pod is a
+/// no-op, and a no-op needs no store.
+#[test]
+fn an_already_injected_pod_is_not_refused_by_a_class_that_stopped_resolving() {
+    let mut pod = classed("team-vault");
+
+    pod["metadata"]["annotations"]["dynamic-config.rs/status"] = json!("injected");
+    pod["spec"]["containers"]
+        .as_array_mut()
+        .expect("containers")
+        .push(json!({ "name": "dynamic-config-agent", "image": "agent:v0.3.0" }));
+
+    // The empty cache is the worst case and the likeliest one: it is what
+    // an installation with `webhook.classes.enabled: false` has.
+    let response = answer(pod, "billing", &Cache::new());
+
+    assert_eq!(
+        response.pointer("/response/allowed"),
+        Some(&json!(true)),
+        "a pod already carrying the injection was refused on re-admission"
+    );
+    assert!(
+        decoded(&response).is_empty(),
+        "an already-injected pod must be patched again by nothing"
+    );
+}

@@ -200,11 +200,16 @@ impl Node for Plugin {
                         }
                     };
 
-                    if let Err(error) = dynamic_config_agent::sidecar::run(
+                    // The document this call already fetched, handed on
+                    // rather than fetched again — one fetch per first
+                    // claim, which is what this file and the book both
+                    // say happens.
+                    if let Err(error) = dynamic_config_agent::sidecar::run_from(
                         &spec,
                         &source,
                         spec.watch.unwrap_or(std::time::Duration::from_secs(15)),
                         ending,
+                        Some(fetched),
                     )
                     .await
                     {

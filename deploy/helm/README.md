@@ -43,7 +43,9 @@ values reference.
 | `agent.defaults.nativeSidecar` | `""` | `"true"` makes native sidecars the fleet default (empty = false) |
 | `agent.defaults.runAsUser` | `""` | fleet-default agent UID (empty = 65532; 0 refused) |
 | `agent.defaults.runAsGroup` | `""` | fleet-default agent GID (same rule) |
-| `agent.defaults.metricsPort` | `""` | serve agent metrics on this port by default; pods opt out with `metrics-port: "0"` |
+| `agent.defaults.metricsPort` | `9110` | serve agent metrics and `/readyz` on this port by default. The injected container gets a readiness probe only where there is a port to attach it to, so this is also what gates pod readiness on a document existing; pods opt out with `metrics-port: "0"` |
+| `agent.events.enabled` | `false` | create the Role and RoleBinding that let an injected agent write Kubernetes Events about its own pod. `webhook.allowEvents` must be true as well — the two are separate so a cluster can create the Roles before letting pods ask |
+| `agent.events.namespaces` | `[]` | which namespaces get that Role; Events are namespaced, so there is no cluster-wide form |
 | `agent.defaults.env` | `""` | fleet-wide agent environment, `NAME=value, …`; a pod's `agent-env` overrides name by name |
 | `agent.defaults.perStore` | `{}` | per-STORE defaults, one tier above the fleet's — every store-shaped annotation (endpoint, auth, ca-configmap, token-secret, key, template, …) plus every knob: `vault: "endpoint=https://vault:8200!, auth=kubernetes"` |
 | `agent.defaults.source` | `""` | fleet default source — a pod may omit `dynamic-config.rs/source` entirely |
@@ -52,8 +54,23 @@ values reference.
 | `webhook.agentEnvAllow` | `""` | which `agent-env` names pods may set, per namespace: `"payments: HTTPS_PROXY, AWS_*; *: RUST_LOG"`; empty = refused everywhere |
 | `webhook.sourceAllow` | `""` | which stores pods may use, per namespace (empty = every store everywhere; non-empty = ONLY the listed) |
 | `webhook.sourceDeny` | `""` | stores turned off, per namespace; outranks `sourceAllow` |
+| `webhook.classes.enabled` | `false` | resolve `dynamic-config.rs/class` against the cluster's DynamicConfigClass objects, so a pod names a store instead of repeating its endpoint and auth. The lookup is a background poll, never on the admission path |
+| `webhook.allowEvents` | `false` | whether a pod may set `dynamic-config.rs/events`. Mirrors `agent.events.enabled`, so a pod cannot ask for a permission nobody granted and then fail at runtime with a 403 |
+| `webhook.allowTlsSkipVerify` | `false` | whether a pod may turn certificate verification off for its store. Off, and worth leaving off: it is the one annotation that trades away the guarantee the rest of this chart is arranged around |
+| `webhook.agentImageAllow` | `""` | image prefixes a pod may name in `dynamic-config.rs/agent-image` for its own injected agent, comma-separated. Empty means no pod may |
 
 Per-pod `dynamic-config.rs/agent-*` annotations override these.
+
+### Node agent (the CSI driver, off by default)
+
+| value | default | what it is |
+|---|---|---|
+| `nodeAgent.enabled` | `false` | install the DaemonSet and the `CSIDriver` object. A pod then asks for its configuration as a **volume** rather than a sidecar, and the kubelet does not start its containers until the file is there |
+| `nodeAgent.image` / `.tag` | ghcr | the node plugin's image; empty tag = the chart appVersion, v-prefixed |
+| `nodeAgent.kubeletPath` | `/var/lib/kubelet` | where the kubelet keeps its plugin and pod directories. k0s and some managed offerings move it, and a wrong value is a driver the kubelet never registers |
+| `nodeAgent.metricsPort` | `9111` | the plugin's own metrics port, distinct from the injected agent's |
+| `nodeAgent.registrar.image` / `.tag` | sig-storage | the `node-driver-registrar` sidecar, which is what tells the kubelet this driver exists |
+| `nodeAgent.resources` | small | requests/limits for the plugin |
 
 ### Webhook
 

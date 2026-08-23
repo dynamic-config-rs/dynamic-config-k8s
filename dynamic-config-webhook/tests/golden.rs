@@ -3238,3 +3238,48 @@ fn the_rendered_volume_has_a_size_limit() {
         );
     }
 }
+
+/// `aws-secret` has no per-render form, and is refused outright unless the
+/// pod's own source is s3 — so a pod that declares it and then adds a
+/// named render reading the same bucket is the only shape this can take.
+/// The named render's agent was the one container not given the
+/// credential, which left it unable to authenticate to the store its own
+/// arguments named.
+#[test]
+fn a_named_render_gets_the_pods_aws_credential_too() {
+    let pod = json!({
+        "metadata": {
+            "annotations": {
+                "dynamic-config.rs/inject": "true",
+                "dynamic-config.rs/source": "s3",
+                "dynamic-config.rs/endpoint": "https://s3.example:9000",
+                "dynamic-config.rs/key": "bucket/config.json",
+                "dynamic-config.rs/path": "/config/rendered.toml",
+                "dynamic-config.rs/aws-secret": "object-store",
+                "dynamic-config.rs/source.db": "s3",
+                "dynamic-config.rs/endpoint.db": "https://s3.example:9000",
+                "dynamic-config.rs/key.db": "bucket/db.json",
+                "dynamic-config.rs/path.db": "/config/db.toml",
+            },
+        },
+        "spec": { "containers": [ { "name": "app", "image": "app:1" } ] },
+    });
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    let named = container_named(&patches, "dynamic-config-agent-db")
+        .expect("the named render's agent was injected");
+
+    let env = named["env"].as_array().cloned().unwrap_or_default();
+
+    for key in ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] {
+        let held = env.iter().find(|entry| entry["name"] == json!(key));
+
+        assert_eq!(
+            held.map(|entry| entry.pointer("/valueFrom/secretKeyRef/name").cloned()),
+            Some(Some(json!("object-store"))),
+            "{key} did not reach the named render's agent"
+        );
+    }
+}

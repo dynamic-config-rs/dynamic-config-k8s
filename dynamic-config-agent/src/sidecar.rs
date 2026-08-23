@@ -56,6 +56,31 @@ pub async fn run(
     interval: Duration,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<Ended, Box<dyn std::error::Error>> {
+    run_from(spec, source, interval, stop, None).await
+}
+
+/// [`run`], for a caller that has already fetched the first document.
+///
+/// The CSI node plugin is the one: it must render before it returns to
+/// the kubelet — that is the property a volume buys over a sidecar — and
+/// then hands the watch over here. Without this it fetched twice for
+/// every first claim of a document on a node.
+///
+/// The second reason is the one that keeps this from being an
+/// optimisation. A fetch of a dynamic secret **mints a lease**, and only
+/// the lease this loop keeps is renewed and handed back; a discarded one
+/// sits out its TTL with nobody to revoke it. A CSI volume cannot ask for
+/// a dynamic secret today — `dynamic` is not among the attributes
+/// `publish.rs` maps to flags — so that is a door held shut rather than a
+/// leak repaired, and this is what keeps it shut if the attribute is ever
+/// added.
+pub async fn run_from(
+    spec: &Spec,
+    source: &Arc<Built>,
+    interval: Duration,
+    stop: impl std::future::Future<Output = ()>,
+    first: Option<dynamic_config::Fetched>,
+) -> Result<Ended, Box<dyn std::error::Error>> {
     let capability = source.capability();
     // One document in flight, and *latest wins* — which is what the
     // comment here always claimed. It was an `mpsc` of capacity one, which
@@ -97,7 +122,13 @@ pub async fn run(
     // pod stays down", when the file it needed was already on disk.
     // `--startup-policy` is which of the two a deployment wants.
     let mut first_lease = None;
-    let mut rendered: Option<Vec<crate::render::Published>> = match source.fetch().await {
+    // Already in hand for the CSI plugin; fetched here for everyone else.
+    let initial = match first {
+        Some(fetched) => Ok(fetched),
+        None => source.fetch().await,
+    };
+
+    let mut rendered: Option<Vec<crate::render::Published>> = match initial {
         Ok(first) => {
             let fresh = crate::render::render_all(&first, spec)?;
 

@@ -408,6 +408,20 @@ version — the contract is the API here.
 
 ### Fixed
 
+- **A named render reading S3 gets the pod's AWS credential.** `aws-secret`
+  has no per-render form and is refused outright unless the pod's own
+  source is s3 — so a pod declaring it and then adding a named render on
+  the same bucket was the only shape this could take, and the named
+  render's agent was the one container never given the credential. It
+  could not authenticate to the store its own arguments named. Shipped in
+  0.2.0, when named renders and `aws-secret` arrived together.
+- **A refusal that echoes an endpoint no longer echoes the credential in
+  it.** A pinned-value refusal quotes what the pod asked for, on purpose —
+  a value the author wrote and did not get is a debugging session. But an
+  endpoint is a URL, a URL can carry `user:password@`, and a refusal is
+  the `status.message` of a rejected API call: it reaches the server's
+  audit log and the events of whatever controller was creating the pod.
+  The userinfo is replaced; the rest of the value is untouched.
 - **A `THREAT_MODEL.md`**, a Grafana dashboard with recording and alert
   rules under `deploy/observability/`, four `ValidatingAdmissionPolicy`
   samples under `policies/`, and `scripts/airgap-bundle.sh` — which carries
