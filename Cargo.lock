@@ -1529,7 +1529,7 @@ version = "0.3.0"
 dependencies = [
  "arc-swap",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "dynamic-config",
  "dynamic-config-telemetry",
