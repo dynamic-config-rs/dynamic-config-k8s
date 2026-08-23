@@ -79,9 +79,22 @@ fn refusal_reason(reason: &str) -> &'static AtomicU64 {
     }
 }
 
+/// The classes as of the last poll, or empty when the feature is off.
+///
+/// A process-wide static rather than router state: `mutate` is the only
+/// reader, the poller is the only writer, and threading one map through
+/// axum's extractors would be ceremony around a `RwLock` that is already
+/// one.
+static CLASSES: std::sync::LazyLock<dynamic_config_webhook::classes::Cache> =
+    std::sync::LazyLock::new(dynamic_config_webhook::classes::Cache::new);
+
 async fn mutate(Json(review): Json<Value>) -> Json<Value> {
     let started = std::time::Instant::now();
-    let response = dynamic_config_webhook::admission_response(&review);
+    let response = dynamic_config_webhook::admission_response_with_classes(
+        &review,
+        dynamic_config_webhook::installation(),
+        &CLASSES,
+    );
 
     record(started.elapsed(), &response);
 
@@ -252,16 +265,114 @@ async fn shutdown_signal() {
     info!("shutting down");
 }
 
+/// `validate <file>` — the admission decision, without a cluster.
+///
+/// The webhook is already a pure function of a pod and an installation, and
+/// the golden tests already drive it that way. This is that same call with
+/// a front door on it: a platform team can put it in CI and find out that
+/// `auth-role` is missing before the pod reaches an API server, rather than
+/// from a rollout that will not start.
+///
+/// Reads a pod manifest as JSON or YAML, uses the installation defaults
+/// from this process's own environment, and prints what the webhook would
+/// have answered.
+fn validate(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let text = std::fs::read_to_string(path)?;
+
+    // YAML is a superset of JSON, so one parser reads both — and a pod
+    // spec is far more often written as YAML.
+    let pod: serde_json::Value = serde_yaml::from_str(&text)?;
+
+    let review = serde_json::json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": { "uid": "validate", "object": pod },
+    });
+
+    let response = dynamic_config_webhook::admission_response(&review);
+
+    let allowed = response
+        .pointer("/response/allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    if !allowed {
+        let reason = response
+            .pointer("/response/status/reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Refused");
+        let message = response
+            .pointer("/response/status/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason given");
+
+        eprintln!("{path}: refused ({reason})\n  {message}");
+
+        return Err("the pod would be refused".into());
+    }
+
+    let patched = response.pointer("/response/patch").is_some();
+
+    println!(
+        "{path}: allowed{}",
+        if patched {
+            ", and an agent would be injected"
+        } else {
+            " — nothing to inject"
+        }
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Before the subscriber: `validate` writes to stdout for a person, and
+    // a JSON log line either side of its answer helps nobody.
+    let mut arguments = std::env::args().skip(1);
 
+    if arguments.next().as_deref() == Some("validate") {
+        let mut failures = 0;
+        let mut seen = 0;
+
+        for path in arguments {
+            seen += 1;
+
+            if validate(&path).is_err() {
+                failures += 1;
+            }
+        }
+
+        if seen == 0 {
+            eprintln!("usage: dynamic-config-webhook validate <pod.yaml>...");
+
+            return Err("no manifest to validate".into());
+        }
+
+        return if failures == 0 {
+            Ok(())
+        } else {
+            Err(format!("{failures} of {seen} manifests would be refused").into())
+        };
+    }
+
+    // Structured logs as before, plus OTLP traces when a collector is
+    // configured. Nothing is exported unless `OTEL_EXPORTER_OTLP_ENDPOINT`
+    // is set, so no existing deployment changes behaviour.
+    let telemetry = dynamic_config_telemetry::install("dynamic-config-webhook");
+
+    let outcome = serve_forever().await;
+
+    // Explicitly, before the process goes: a batch exporter holds spans for
+    // up to its scheduled delay, and the admissions a webhook refused on
+    // its way out are the ones somebody will come looking for.
+    telemetry.shutdown();
+
+    outcome
+}
+
+/// The webhook proper, so `main` can own the telemetry either side of it.
+async fn serve_forever() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A mistyped fleet default (a file mode of "888", an allowlist
     // entry that is not a variable name) stops the process here, at
     // install time — never at the first admission.
@@ -273,6 +384,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| "a rustls CryptoProvider was already installed")?;
+
+    // The one thing in this binary that talks to the API server, and it
+    // talks to it on a timer rather than on the path a pod creation waits
+    // on. Off unless the deployment asked, because reading classes needs
+    // RBAC this webhook otherwise does not have.
+    if std::env::var("DYNAMIC_CONFIG_WEBHOOK_CLASSES").as_deref() == Ok("true") {
+        let cache = CLASSES.clone();
+
+        tokio::spawn(async move {
+            match dynamic_config_webhook::classes::poll(cache).await {
+                Ok(never) => match never {},
+                // Once, not every thirty seconds: this is a deployment
+                // that asked for classes without granting them, and the
+                // fix is a chart value rather than anything at runtime.
+                Err(error) => tracing::error!(
+                    %error,
+                    "classes were asked for and cannot be read; pods naming one will be refused"
+                ),
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/mutate", post(mutate))

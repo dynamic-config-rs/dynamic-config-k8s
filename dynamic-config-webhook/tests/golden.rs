@@ -451,7 +451,11 @@ fn the_volume_is_memory_backed_unless_asked_otherwise() {
         .filter(|p| p["path"] == "/spec/volumes/-")
         .find(|p| p["value"]["name"] == "dynamic-config")
         .unwrap();
-    assert_eq!(volume["value"]["emptyDir"], json!({}));
+    // `medium` absent is the node's disk; the size limit rides both media,
+    // because an unbounded volume on disk fills the node instead of the
+    // pod and is no better for it.
+    assert!(volume["value"]["emptyDir"]["medium"].is_null());
+    assert_eq!(volume["value"]["emptyDir"]["sizeLimit"], json!("16Mi"));
 }
 
 #[test]
@@ -766,6 +770,692 @@ fn env_inject_refusals_name_the_fix() {
     let response = dynamic_config_webhook::admission_response(&review(pod));
 
     assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// A pod with a sidecar beside its application: the log shipper has no
+/// business holding a rendered credential, and `file-mode` cannot draw
+/// that line — it runs as the same UID.
+#[test]
+fn only_the_named_containers_receive_the_rendered_volume() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["containers"] = json!([
+        { "name": "app", "image": "app:1" },
+        { "name": "logs", "image": "fluent-bit:3" },
+    ]);
+    pod["metadata"]["annotations"]["dynamic-config.rs/inject-containers"] = json!("app");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let patches = decoded_patches(&response);
+    let mounted: Vec<&str> = patches
+        .iter()
+        .filter(|patch| {
+            patch["value"]["name"] == json!("dynamic-config")
+                && patch["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/volumeMounts/-"))
+        })
+        .filter_map(|patch| patch["path"].as_str())
+        .collect();
+
+    assert_eq!(
+        mounted,
+        vec!["/spec/containers/0/volumeMounts/-"],
+        "only the application was named, so only the application is mounted"
+    );
+}
+
+/// The default is unchanged, and stays unchanged: every container, which
+/// is what the reference implementation defaults to as well. The option
+/// exists to narrow it, never to be the thing somebody has to remember.
+#[test]
+fn without_the_annotation_every_container_receives_it() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["containers"] = json!([
+        { "name": "app", "image": "app:1" },
+        { "name": "logs", "image": "fluent-bit:3" },
+    ]);
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+    let mounted = patches
+        .iter()
+        .filter(|patch| {
+            patch["value"]["name"] == json!("dynamic-config")
+                && patch["path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("/volumeMounts/-"))
+        })
+        .count();
+
+    assert_eq!(mounted, 2);
+}
+
+/// A typo fails in the worst direction available — the application never
+/// sees its configuration and no other container does either — so it is
+/// refused, like every other name in this contract.
+#[test]
+fn inject_containers_naming_nothing_is_refused() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/inject-containers"] = json!("ap");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("no such container"));
+}
+
+/// The env wrapper sources the rendered file, so leaving its container out
+/// is two annotations disagreeing rather than a configuration.
+#[test]
+fn env_inject_into_a_container_left_out_is_refused() {
+    let mut pod = annotated("both");
+    pod["spec"]["containers"] = json!([
+        { "name": "app", "image": "app:1", "command": ["/bin/app"] },
+        { "name": "logs", "image": "fluent-bit:3" },
+    ]);
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/env-inject".to_owned(), json!("app"));
+    notes.insert(
+        "dynamic-config.rs/inject-containers".to_owned(),
+        json!("logs"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("inject-containers"));
+}
+
+/// The injected agent's `args`, flattened.
+fn agent_arguments(response: &Value) -> Vec<String> {
+    decoded_patches(response)
+        .iter()
+        .find(|patch| {
+            patch["path"] == "/spec/containers/-" || patch["path"] == "/spec/initContainers/-"
+        })
+        .and_then(|patch| patch["value"]["args"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The name to check, when the address is not it. No installation opt-in:
+/// this one keeps the server authenticated, it only moves which name is
+/// checked.
+#[test]
+fn a_server_name_reaches_the_agent() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/endpoint"] = json!("https://10.0.0.5:8500");
+    pod["metadata"]["annotations"]["dynamic-config.rs/tls-server-name"] = json!("consul.internal");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+    assert!(agent_arguments(&response).contains(&"consul.internal".to_owned()));
+}
+
+/// The one annotation a workload cannot reach on its own. Without the
+/// installation saying so, it is refused — and the refusal names the value
+/// an administrator sets, because the person reading it cannot set it.
+#[test]
+fn skipping_verification_is_refused_unless_the_installation_offers_it() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/tls-skip-verify"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    assert!(message.contains("allowTlsSkipVerify"), "{message}");
+}
+
+/// With the installation's blessing it passes, reaches the agent as a bare
+/// flag, and still earns a warning — the pod's author and the person
+/// reading `kubectl apply` are often not the same person.
+#[test]
+fn an_offered_skip_verify_passes_with_a_warning() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/tls-skip-verify"] = json!("true");
+
+    let install = dynamic_config_webhook::Installation::from_lookup(&|name: &str| {
+        (name == "DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY").then(|| "true".to_owned())
+    })
+    .expect("a well-formed installation");
+
+    let response = dynamic_config_webhook::admission_response_with(&review(pod), &install);
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let arguments = agent_arguments(&response);
+
+    assert!(arguments.contains(&"--tls-skip-verify".to_owned()));
+
+    // A bare flag: an empty string after it would reach the agent as an
+    // argument it does not recognise.
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--tls-skip-verify")
+        .unwrap();
+
+    assert_ne!(arguments.get(at + 1).map(String::as_str), Some(""));
+
+    let warnings = response
+        .pointer("/response/warnings")
+        .and_then(Value::as_array)
+        .expect("a warning");
+
+    assert!(warnings
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|warning| warning.contains("not authenticated")));
+}
+
+/// Naming an authority and then not checking it are two answers to one
+/// question, pointing opposite ways.
+#[test]
+fn skip_verify_alongside_a_certificate_authority_is_refused() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert(
+        "dynamic-config.rs/tls-skip-verify".to_owned(),
+        json!("true"),
+    );
+    notes.insert(
+        "dynamic-config.rs/ca-configmap".to_owned(),
+        json!("consul-ca"),
+    );
+
+    let install = dynamic_config_webhook::Installation::from_lookup(&|name: &str| {
+        (name == "DYNAMIC_CONFIG_WEBHOOK_ALLOW_TLS_SKIP_VERIFY").then(|| "true".to_owned())
+    })
+    .expect("a well-formed installation");
+
+    let response = dynamic_config_webhook::admission_response_with(&review(pod), &install);
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("contradictory"));
+}
+
+/// A pod that must run something before the configuration exists gets
+/// nothing from this; a pod whose own init container reads the rendered
+/// file needs it. Appending stays the default for the first case.
+#[test]
+fn init_first_puts_the_agent_ahead_of_the_pods_own() {
+    let mut pod = annotated("init");
+    pod["spec"]["initContainers"] = json!([{ "name": "migrate", "image": "migrate:1" }]);
+    pod["metadata"]["annotations"]["dynamic-config.rs/init-first"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    assert!(
+        patches
+            .iter()
+            .any(|patch| patch["path"] == "/spec/initContainers/0"),
+        "the agent goes in at index 0, ahead of `migrate`"
+    );
+
+    // And without it, nothing moves.
+    let mut pod = annotated("init");
+    pod["spec"]["initContainers"] = json!([{ "name": "migrate", "image": "migrate:1" }]);
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    assert!(patches
+        .iter()
+        .any(|patch| patch["path"] == "/spec/initContainers/-"));
+}
+
+/// `sidecar` mode has no init container, so asking for one to be first is
+/// asking about something that is not there.
+#[test]
+fn init_first_without_an_init_container_is_refused() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/init-first"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// The UID comes from the application rather than from a number somebody
+/// has to keep in step with it.
+#[test]
+fn run_as_same_user_takes_the_applications_uid() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["containers"] = json!([{
+        "name": "app",
+        "image": "app:1",
+        "securityContext": { "runAsUser": 1234 },
+    }]);
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-run-as-same-user"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let agent = decoded_patches(&response)
+        .into_iter()
+        .find(|patch| patch["path"] == "/spec/containers/-")
+        .unwrap();
+
+    assert_eq!(agent["value"]["securityContext"]["runAsUser"], json!(1234));
+}
+
+/// Absent is refused rather than guessed: inheriting whatever the image
+/// happens to run as is a UID that moves when the image does, silently.
+#[test]
+fn run_as_same_user_with_nothing_to_inherit_is_refused() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-run-as-same-user"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("no runAsUser to inherit"));
+}
+
+/// The agent stays nonroot in every configuration, including this one.
+#[test]
+fn run_as_same_user_will_not_inherit_root() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["containers"] = json!([{
+        "name": "app",
+        "image": "app:1",
+        "securityContext": { "runAsUser": 0 },
+    }]);
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-run-as-same-user"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// Read-only, into the agent alone, at a path the pod does not choose.
+#[test]
+fn an_extra_secret_reaches_the_agent_and_nothing_else() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/extra-secret"] = json!("nats-creds");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let patches = decoded_patches(&response);
+
+    assert!(patches.iter().any(|patch| {
+        patch["path"] == "/spec/volumes/-"
+            && patch["value"]["secret"]["secretName"] == json!("nats-creds")
+    }));
+
+    let agent = patches
+        .iter()
+        .find(|patch| patch["path"] == "/spec/containers/-")
+        .unwrap();
+    let mounts = agent["value"]["volumeMounts"].as_array().unwrap();
+    let extra = mounts
+        .iter()
+        .find(|mount| mount["name"] == json!("dynamic-config-extra"))
+        .expect("the agent mounts it");
+
+    assert_eq!(extra["readOnly"], json!(true));
+    assert_eq!(extra["mountPath"], json!("/etc/dynamic-config/extra"));
+
+    // The application containers get the rendered volume and nothing else.
+    let app_mounts: Vec<&Value> = patches
+        .iter()
+        .filter(|patch| patch["path"] == "/spec/containers/0/volumeMounts/-")
+        .collect();
+
+    assert!(app_mounts
+        .iter()
+        .all(|mount| mount["value"]["name"] == json!("dynamic-config")));
+}
+
+/// Past the pod's grace period the kubelet sends SIGKILL first, the
+/// revocation is cut off mid-request, and the lease stays out anyway —
+/// which is the outcome the annotation was set to avoid.
+#[test]
+fn a_revoke_grace_past_the_termination_grace_is_refused() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["terminationGracePeriodSeconds"] = json!(10);
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source".to_owned(), json!("vault"));
+    notes.insert("dynamic-config.rs/dynamic".to_owned(), json!("true"));
+    notes.insert("dynamic-config.rs/revoke-grace".to_owned(), json!("30s"));
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    let message = response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap();
+
+    assert!(message.contains("SIGKILL"), "{message}");
+}
+
+/// Inside it, it reaches the agent.
+#[test]
+fn a_revoke_grace_within_the_termination_grace_reaches_the_agent() {
+    let mut pod = annotated("sidecar");
+    pod["spec"]["terminationGracePeriodSeconds"] = json!(60);
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/source".to_owned(), json!("vault"));
+    notes.insert("dynamic-config.rs/dynamic".to_owned(), json!("true"));
+    notes.insert("dynamic-config.rs/revoke-grace".to_owned(), json!("20s"));
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let arguments = agent_arguments(&response);
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--revoke-grace")
+        .expect("the flag reaches the agent");
+
+    assert_eq!(arguments[at + 1], "20");
+}
+
+/// The endpoint reaches the watching agent, and a non-localhost one is
+/// refused where an operator sees it rather than in a CrashLoopBackOff.
+#[test]
+fn a_localhost_reload_endpoint_reaches_the_agent() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/notify-http"] =
+        json!("http://127.0.0.1:8080/-/reload");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+    assert!(agent_arguments(&response).contains(&"http://127.0.0.1:8080/-/reload".to_owned()));
+}
+
+/// An init container writes once and exits, before the application it
+/// would notify has started.
+#[test]
+fn a_reload_endpoint_on_an_init_only_agent_is_refused() {
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/notify-http"] =
+        json!("http://127.0.0.1:8080/-/reload");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+#[test]
+fn a_drift_policy_reaches_the_agent_and_a_wrong_one_does_not() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/on-drift"] = json!("repair");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+    assert!(agent_arguments(&response).contains(&"repair".to_owned()));
+
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/on-drift"] = json!("fix-it");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+#[test]
+fn a_history_depth_reaches_the_agent_and_disk_refuses_it() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/history"] = json!("3");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let arguments = agent_arguments(&response);
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--history")
+        .expect("the flag reaches the agent");
+
+    assert_eq!(arguments[at + 1], "3");
+
+    // On node-backed storage a replaced *secret* would outlive the pod
+    // that held it and survive a reboot, so the two together are refused.
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/history".to_owned(), json!("3"));
+    notes.insert("dynamic-config.rs/volume-medium".to_owned(), json!("disk"));
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("outlives the pod"));
+}
+
+/// The strongest readiness this integration can offer, and the one that
+/// needs the application's cooperation — so it is asked for rather than
+/// assumed.
+#[test]
+fn require_ack_reaches_the_agent_and_needs_a_probe_to_read_it() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/require-ack"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+    assert!(agent_arguments(&response).contains(&"--require-ack".to_owned()));
+
+    // The acknowledgement is only ever read by the readiness probe, so
+    // asking for one without a probe asks for nothing.
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert("dynamic-config.rs/require-ack".to_owned(), json!("true"));
+    notes.insert("dynamic-config.rs/readiness".to_owned(), json!("false"));
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+
+    // And an init container exits before the application starts.
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/require-ack"] = json!("true");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// A ConfigMap rather than an annotation, because widening the cohort must
+/// not be a new pod spec — a rolling restart discards the very state the
+/// canary is watching.
+#[test]
+fn a_canary_configmap_is_mounted_and_named_to_the_agent() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/canary-configmap"] = json!("rollout");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let patches = decoded_patches(&response);
+
+    assert!(patches.iter().any(|patch| {
+        patch["path"] == "/spec/volumes/-"
+            && patch["value"]["configMap"]["name"] == json!("rollout")
+    }));
+
+    let arguments = agent_arguments(&response);
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--canary")
+        .expect("the flag reaches the agent");
+
+    assert_eq!(arguments[at + 1], "/etc/dynamic-config/canary/percent");
+
+    // The cohort is the pod's own name hashed, so the agent has to know it.
+    let agent = patches
+        .iter()
+        .find(|patch| patch["path"] == "/spec/containers/-")
+        .unwrap();
+
+    assert!(agent["value"]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == json!("DYNAMIC_CONFIG_POD_NAME")));
+}
+
+/// An init container publishes once and exits, so there is no later
+/// document for a cohort to hold back.
+#[test]
+fn a_canary_on_an_init_only_agent_is_refused() {
+    let mut pod = annotated("init");
+    pod["metadata"]["annotations"]["dynamic-config.rs/canary-configmap"] = json!("rollout");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+/// The one configuration where the rendered volume is charged to a
+/// resource nothing here declares: on disk, with a history depth, a pod
+/// could fill a node without exceeding any limit it had declared.
+#[test]
+fn ephemeral_storage_reaches_the_container() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert(
+        "dynamic-config.rs/agent-ephemeral-request".to_owned(),
+        json!("64Mi"),
+    );
+    notes.insert(
+        "dynamic-config.rs/agent-ephemeral-limit".to_owned(),
+        json!("256Mi"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let agent = decoded_patches(&response)
+        .into_iter()
+        .find(|patch| patch["path"] == "/spec/containers/-")
+        .unwrap();
+
+    assert_eq!(
+        agent["value"]["resources"]["requests"]["ephemeral-storage"],
+        json!("64Mi")
+    );
+    assert_eq!(
+        agent["value"]["resources"]["limits"]["ephemeral-storage"],
+        json!("256Mi")
+    );
+
+    // And the cpu/memory that were always there are still there.
+    assert_eq!(
+        agent["value"]["resources"]["requests"]["memory"],
+        json!("32Mi")
+    );
+}
+
+/// A request above its own limit is a pod the scheduler refuses, with a
+/// message about the pod rather than the annotation that caused it.
+#[test]
+fn an_ephemeral_request_above_its_limit_is_refused() {
+    let mut pod = annotated("sidecar");
+    let notes = pod["metadata"]["annotations"].as_object_mut().unwrap();
+    notes.insert(
+        "dynamic-config.rs/agent-ephemeral-request".to_owned(),
+        json!("1Gi"),
+    );
+    notes.insert(
+        "dynamic-config.rs/agent-ephemeral-limit".to_owned(),
+        json!("512Mi"),
+    );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+}
+
+#[test]
+fn a_fetch_timeout_reaches_the_agent() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/timeout"] = json!("45");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+    let arguments = agent_arguments(&response);
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--timeout")
+        .expect("the flag reaches the agent");
+
+    assert_eq!(arguments[at + 1], "45");
+}
+
+/// An arbitrary image on the injected container runs chosen code beside
+/// every application that asks, so an installation lists what is allowed.
+#[test]
+fn a_pod_named_agent_image_needs_the_installation_to_allow_it() {
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-image"] =
+        json!("ghcr.io/acme/agent:next");
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(false)));
+    assert!(response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap()
+        .contains("agentImageAllow"));
+
+    // With a prefix that admits it, it reaches the container.
+    let install = dynamic_config_webhook::Installation::from_lookup(&|name: &str| {
+        (name == "DYNAMIC_CONFIG_WEBHOOK_AGENT_IMAGE_ALLOW").then(|| "ghcr.io/acme/".to_owned())
+    })
+    .expect("a well-formed installation");
+
+    let mut pod = annotated("sidecar");
+    pod["metadata"]["annotations"]["dynamic-config.rs/agent-image"] =
+        json!("ghcr.io/acme/agent:next");
+
+    let response = dynamic_config_webhook::admission_response_with(&review(pod), &install);
+
+    assert_eq!(response.pointer("/response/allowed"), Some(&json!(true)));
+
+    let agent = decoded_patches(&response)
+        .into_iter()
+        .find(|patch| patch["path"] == "/spec/containers/-")
+        .unwrap();
+
+    assert_eq!(agent["value"]["image"], json!("ghcr.io/acme/agent:next"));
 }
 
 #[test]
@@ -1793,5 +2483,758 @@ fn a_container_name_the_injection_needs_is_refused_rather_than_duplicated() {
 
         assert!(message.contains("dynamic-config-agent"), "{message}");
         assert!(message.contains("rename"), "{message}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The readiness probe on the injected container
+// ---------------------------------------------------------------------------
+
+/// A pod with a metrics port, which is what the chart now gives every
+/// installation by default.
+fn probed(extra: &[(&str, &str)]) -> Value {
+    let mut pod = annotated("sidecar");
+
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("the fixture has annotations");
+
+    annotations.insert("dynamic-config.rs/metrics-port".to_owned(), json!("9110"));
+
+    for (key, value) in extra {
+        annotations.insert(format!("dynamic-config.rs/{key}"), json!(value));
+    }
+
+    pod
+}
+
+/// The probe is what makes `/readyz` worth answering: pod readiness is
+/// AND-ed across containers, so a Service sends no traffic to a pod whose
+/// configuration does not exist yet.
+#[test]
+fn a_watching_agent_with_a_metrics_port_is_probed() {
+    let response = dynamic_config_webhook::admission_response(&review(probed(&[])));
+    let patches = decoded_patches(&response);
+
+    let container = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| {
+            value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-agent")
+        })
+        .expect("the agent container is injected");
+
+    let probe = container
+        .pointer("/readinessProbe")
+        .expect("a watching agent with a port answers a probe on it");
+
+    assert_eq!(
+        probe.pointer("/httpGet/path").and_then(Value::as_str),
+        Some("/readyz")
+    );
+    // By name, so the probe cannot drift from the port the args opened.
+    assert_eq!(
+        probe.pointer("/httpGet/port").and_then(Value::as_str),
+        Some("metrics")
+    );
+    assert!(
+        probe
+            .pointer("/failureThreshold")
+            .and_then(Value::as_u64)
+            .is_some_and(|threshold| threshold >= 10),
+        "a slow first fetch is not a failure: {probe}"
+    );
+}
+
+/// The escape hatch for a deployment that would rather start than wait for
+/// a store that is down.
+#[test]
+fn readiness_false_leaves_the_container_unprobed() {
+    let response =
+        dynamic_config_webhook::admission_response(&review(probed(&[("readiness", "false")])));
+
+    let patches = decoded_patches(&response);
+    let container = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| {
+            value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-agent")
+        })
+        .expect("the agent container is injected");
+
+    assert!(container.pointer("/readinessProbe").is_none());
+
+    // And the port is still there: opting out of the probe is not opting
+    // out of metrics.
+    assert!(container.pointer("/ports").is_some());
+}
+
+/// A one-shot init container has nothing long-lived to probe, and a probe
+/// on a container that exits is a pod that never starts.
+#[test]
+fn an_init_agent_is_never_probed() {
+    let mut pod = probed(&[]);
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert("dynamic-config.rs/mode".to_owned(), json!("init"));
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let container = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-init"))
+        .expect("the init container is injected");
+
+    assert!(container.pointer("/readinessProbe").is_none());
+}
+
+#[test]
+fn readiness_is_true_or_false_and_nothing_else() {
+    let response =
+        dynamic_config_webhook::admission_response(&review(probed(&[("readiness", "yes")])));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+/// The policy reaches the agent, which is the only place it is validated —
+/// so the two cannot disagree about which policies exist.
+#[test]
+fn a_startup_policy_reaches_the_agent_as_a_flag() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert(
+            "dynamic-config.rs/startup-policy".to_owned(),
+            json!("require-fresh"),
+        );
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let args = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/args"))
+        .find_map(Value::as_array)
+        .expect("the agent's arguments");
+
+    let rendered: Vec<&str> = args.iter().filter_map(Value::as_str).collect();
+
+    assert!(
+        rendered
+            .windows(2)
+            .any(|pair| pair == ["--startup-policy", "require-fresh"]),
+        "{rendered:?}"
+    );
+}
+
+/// A dynamic-secret source reaches the agent as `--dynamic`, and revoking
+/// is the default — so the opt-out is what appears on the command line, not
+/// the opt-in.
+#[test]
+fn a_dynamic_source_asks_for_a_lease_and_revokes_by_default() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert("dynamic-config.rs/dynamic".to_owned(), json!("true"));
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+    let args: Vec<String> = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/args"))
+        .find_map(Value::as_array)
+        .expect("the agent's arguments")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+
+    assert!(args.iter().any(|arg| arg == "--dynamic"), "{args:?}");
+    assert!(
+        !args.iter().any(|arg| arg == "--no-revoke-on-shutdown"),
+        "revoking is the default, so nothing should say so: {args:?}"
+    );
+}
+
+#[test]
+fn declining_revocation_says_so_on_the_command_line() {
+    let mut pod = annotated("sidecar");
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations");
+
+    annotations.insert("dynamic-config.rs/dynamic".to_owned(), json!("true"));
+    annotations.insert(
+        "dynamic-config.rs/revoke-on-shutdown".to_owned(),
+        json!("false"),
+    );
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+    let args: Vec<String> = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/args"))
+        .find_map(Value::as_array)
+        .expect("the agent's arguments")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+
+    assert!(
+        args.iter().any(|arg| arg == "--no-revoke-on-shutdown"),
+        "{args:?}"
+    );
+}
+
+/// Declining to revoke a lease nobody holds is a configuration mistake, not
+/// a no-op — and an unknown-annotation contract that catches typos should
+/// catch this too.
+#[test]
+fn revoke_on_shutdown_without_a_dynamic_source_is_refused() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert(
+            "dynamic-config.rs/revoke-on-shutdown".to_owned(),
+            json!("false"),
+        );
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Warnings: everything worth saying that is not worth refusing over
+// ---------------------------------------------------------------------------
+
+fn warnings_for(extra: &[(&str, &str)]) -> Vec<String> {
+    let mut pod = annotated("sidecar");
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations");
+
+    for (key, value) in extra {
+        annotations.insert(format!("dynamic-config.rs/{key}"), json!(value));
+    }
+
+    dynamic_config_webhook::admission_response(&review(pod))
+        .pointer("/response/warnings")
+        .and_then(Value::as_array)
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bar is deliberately high: a warning on every admission is a warning
+/// nobody reads. The canonical pod earns none.
+#[test]
+fn an_ordinary_pod_is_admitted_without_comment() {
+    assert!(warnings_for(&[]).is_empty());
+}
+
+/// A rendered secret on node-backed storage outlives the pod and survives a
+/// reboot. Legal, occasionally necessary, and worth saying out loud.
+#[test]
+fn disk_backed_storage_is_worth_a_word() {
+    let warnings = warnings_for(&[("volume-medium", "disk")]);
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("outlives the pod"), "{warnings:?}");
+}
+
+#[test]
+fn a_world_readable_file_mode_is_worth_a_word() {
+    let warnings = warnings_for(&[("file-mode", "0644")]);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("world-readable")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn an_aggressive_poll_is_worth_a_word() {
+    let warnings = warnings_for(&[("watch-seconds", "1")]);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("watch-seconds")),
+        "{warnings:?}"
+    );
+}
+
+/// A lease nobody hands back stays valid, held by a pod that no longer
+/// exists. The pod is still admitted — somebody may have a reason — and the
+/// reason had better be a good one.
+#[test]
+fn declining_to_revoke_a_lease_is_worth_a_word() {
+    let warnings = warnings_for(&[("dynamic", "true"), ("revoke-on-shutdown", "false")]);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("after \nthis pod is gone")
+                || warning.contains("after this pod is gone")),
+        "{warnings:?}"
+    );
+}
+
+/// A warning is not a refusal: the pod is admitted, and the patch is still
+/// there.
+#[test]
+fn a_warned_pod_is_still_injected() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert("dynamic-config.rs/volume-medium".to_owned(), json!("disk"));
+
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert!(response.pointer("/response/patch").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Named renders, and their own metrics port
+// ---------------------------------------------------------------------------
+
+/// A pod with a second render called `db`.
+fn with_named_render(extra: &[(&str, &str)]) -> Value {
+    let mut pod = annotated("sidecar");
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations");
+
+    annotations.insert("dynamic-config.rs/source.db".to_owned(), json!("consul"));
+    annotations.insert(
+        "dynamic-config.rs/endpoint.db".to_owned(),
+        json!("http://consul:8500"),
+    );
+    annotations.insert(
+        "dynamic-config.rs/key.db".to_owned(),
+        json!("myapp/db.json"),
+    );
+    annotations.insert(
+        "dynamic-config.rs/path.db".to_owned(),
+        json!("/config/db.toml"),
+    );
+
+    for (key, value) in extra {
+        annotations.insert(format!("dynamic-config.rs/{key}"), json!(value));
+    }
+
+    pod
+}
+
+fn container_named(patches: &[Value], name: &str) -> Option<Value> {
+    patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| value.pointer("/name").and_then(Value::as_str) == Some(name))
+        .cloned()
+}
+
+/// Named renders were unobservable: the container had no metrics block at
+/// all, so `dynamic-config-agent-db` reported nothing whatever went wrong
+/// in it.
+#[test]
+fn a_named_render_can_have_its_own_metrics_port() {
+    let pod = with_named_render(&[("metrics-port.db", "9111")]);
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let container =
+        container_named(&patches, "dynamic-config-agent-db").expect("the named render's container");
+
+    let args: Vec<&str> = container
+        .pointer("/args")
+        .and_then(Value::as_array)
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--metrics-addr", "0.0.0.0:9111"]),
+        "{args:?}"
+    );
+
+    // Unnamed, and the probe uses the number: a Kubernetes port name is
+    // at most fifteen characters and a render suffix may be thirty-two, so
+    // naming it would refuse a pod for the longer half of the suffixes this
+    // contract allows.
+    assert!(container.pointer("/ports/0/name").is_none());
+    assert_eq!(
+        container
+            .pointer("/readinessProbe/httpGet/port")
+            .and_then(Value::as_u64),
+        Some(9111)
+    );
+}
+
+/// No allocation scheme: `port + n` reads as tidy right up to the afternoon
+/// it lands on whatever the application is listening on. A named render is
+/// observable when somebody names its port and not before.
+#[test]
+fn a_named_render_gets_no_port_unless_one_is_named() {
+    let pod = with_named_render(&[("metrics-port", "9110")]);
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let default =
+        container_named(&patches, "dynamic-config-agent").expect("the default render's container");
+    let named =
+        container_named(&patches, "dynamic-config-agent-db").expect("the named render's container");
+
+    assert!(
+        default.pointer("/ports").is_some(),
+        "the default one has it"
+    );
+    assert!(
+        named.pointer("/ports").is_none(),
+        "the named one did not ask for a port and must not inherit one"
+    );
+}
+
+#[test]
+fn a_named_renders_port_must_be_a_port() {
+    let pod = with_named_render(&[("metrics-port.db", "not-a-port")]);
+    let response = dynamic_config_webhook::admission_response(&review(pod));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+/// A schema arrives as a mounted ConfigMap, and the agent checks the
+/// resolved document against it before the write — so a document that does
+/// not satisfy it never reaches the application.
+#[test]
+fn a_schema_configmap_is_mounted_and_named_on_the_command_line() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert(
+            "dynamic-config.rs/schema-configmap".to_owned(),
+            json!("billing-schema"),
+        );
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    // The volume.
+    assert!(
+        patches.iter().any(|patch| {
+            patch.pointer("/value/name").and_then(Value::as_str) == Some("dynamic-config-schema")
+                && patch
+                    .pointer("/value/configMap/name")
+                    .and_then(Value::as_str)
+                    == Some("billing-schema")
+        }),
+        "the ConfigMap is not mounted as a volume"
+    );
+
+    let container = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| {
+            value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-agent")
+        })
+        .expect("the agent container");
+
+    // Read-only, like every other mounted reference here.
+    let mount = container
+        .pointer("/volumeMounts")
+        .and_then(Value::as_array)
+        .expect("mounts")
+        .iter()
+        .find(|mount| {
+            mount.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-schema")
+        })
+        .expect("the schema is mounted into the agent");
+
+    assert_eq!(
+        mount.pointer("/readOnly").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // And the flag, pointing at the default key.
+    let args: Vec<&str> = container
+        .pointer("/args")
+        .and_then(Value::as_array)
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert!(
+        args.windows(2)
+            .any(|pair| { pair == ["--schema", "/etc/dynamic-config/schema/schema.json"] }),
+        "{args:?}"
+    );
+}
+
+/// `name/key`, for a ConfigMap whose key somebody else named.
+#[test]
+fn a_schema_configmap_can_name_its_key() {
+    let mut pod = annotated("sidecar");
+    pod.pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations")
+        .insert(
+            "dynamic-config.rs/schema-configmap".to_owned(),
+            json!("schemas/billing.v2.json"),
+        );
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let args: Vec<String> = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/args"))
+        .find_map(Value::as_array)
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+
+    assert!(
+        args.iter()
+            .any(|arg| arg == "/etc/dynamic-config/schema/billing.v2.json"),
+        "{args:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Several files, one generation
+// ---------------------------------------------------------------------------
+
+fn with_also(extra: &[(&str, &str)]) -> Value {
+    let mut pod = annotated("sidecar");
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations");
+
+    for (key, value) in extra {
+        annotations.insert(format!("dynamic-config.rs/{key}"), json!(value));
+    }
+
+    pod
+}
+
+fn agent_args(pod: Value) -> Vec<String> {
+    decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)))
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/args"))
+        .find_map(Value::as_array)
+        .expect("the agent's arguments")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One document, several files, published together — so an application
+/// reading two of them never sees one from before a change and one from
+/// after it.
+#[test]
+fn a_rendering_reaches_the_agent_with_its_section() {
+    let args = agent_args(with_also(&[
+        ("also.cache", "/config/cache.json"),
+        ("also-section.cache", "cache"),
+    ]));
+
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--also", "out=/config/cache.json,section=cache"]),
+        "{args:?}"
+    );
+}
+
+/// A section is optional: the whole document, in another format, is a
+/// perfectly ordinary thing to want.
+#[test]
+fn a_rendering_without_a_section_is_the_whole_document() {
+    let args = agent_args(with_also(&[("also.env", "/config/app.json")]));
+
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--also", "out=/config/app.json"]),
+        "{args:?}"
+    );
+}
+
+/// Every rendering lands in the volume the injection mounts. A path
+/// outside it would be written into the container's read-only root and
+/// fail at the first render — which is a refusal worth making at admission,
+/// where the message reaches whoever wrote the annotation.
+#[test]
+fn a_rendering_outside_the_mounted_directory_is_refused() {
+    let response = dynamic_config_webhook::admission_response(&review(with_also(&[(
+        "also.elsewhere",
+        "/etc/app/other.json",
+    )])));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let message = response
+        .pointer("/response/status/message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    assert!(message.contains("same directory"), "{message}");
+}
+
+/// A section without a path is a rendering with nowhere to go.
+#[test]
+fn a_section_without_a_path_is_refused() {
+    let response = dynamic_config_webhook::admission_response(&review(with_also(&[(
+        "also-section.cache",
+        "cache",
+    )])));
+
+    assert_eq!(
+        response
+            .pointer("/response/allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+/// `also.<name>` and a *named render* are different shapes and must not be
+/// confused: `section` is already a per-render key, so the two namespaces
+/// had to be kept apart. This is the test that says they are.
+#[test]
+fn a_rendering_and_a_named_render_can_coexist() {
+    let mut pod = with_also(&[
+        ("also.cache", "/config/cache.json"),
+        ("also-section.cache", "cache"),
+    ]);
+
+    let annotations = pod
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+        .expect("annotations");
+
+    // A genuinely separate render: its own source, its own container, its
+    // own generation — which is the truth about a second store.
+    annotations.insert("dynamic-config.rs/source.db".to_owned(), json!("consul"));
+    annotations.insert(
+        "dynamic-config.rs/endpoint.db".to_owned(),
+        json!("http://consul:8500"),
+    );
+    annotations.insert(
+        "dynamic-config.rs/key.db".to_owned(),
+        json!("myapp/db.json"),
+    );
+    annotations.insert(
+        "dynamic-config.rs/path.db".to_owned(),
+        json!("/config/db.toml"),
+    );
+
+    let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+    let names: Vec<&str> = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value/name"))
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert!(names.contains(&"dynamic-config-agent"), "{names:?}");
+    assert!(names.contains(&"dynamic-config-agent-db"), "{names:?}");
+
+    // The rendering rides on the *main* agent, because it is a rendering
+    // of the main agent's document.
+    let main = patches
+        .iter()
+        .filter_map(|patch| patch.pointer("/value"))
+        .find(|value| {
+            value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config-agent")
+        })
+        .expect("the main container");
+
+    let args: Vec<&str> = main
+        .pointer("/args")
+        .and_then(Value::as_array)
+        .expect("args")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert!(
+        args.iter()
+            .any(|arg| arg.starts_with("out=/config/cache.json")),
+        "{args:?}"
+    );
+}
+
+/// A memory-backed `emptyDir` is charged to the **pod's** memory, so a
+/// document larger than anybody expected does not fail the agent — it gets
+/// the whole pod OOM-killed, application included.
+///
+/// With a `sizeLimit` the tmpfs is sized to it and the write fails with
+/// `ENOSPC` instead, which the agent has warned about rather than died on
+/// since this release: the last good file keeps serving.
+#[test]
+fn the_rendered_volume_has_a_size_limit() {
+    for medium in ["memory", "disk"] {
+        let mut pod = annotated("sidecar");
+        pod.pointer_mut("/metadata/annotations")
+            .and_then(Value::as_object_mut)
+            .expect("annotations")
+            .insert("dynamic-config.rs/volume-medium".to_owned(), json!(medium));
+
+        let patches = decoded_patches(&dynamic_config_webhook::admission_response(&review(pod)));
+
+        let volume = patches
+            .iter()
+            .filter_map(|patch| patch.pointer("/value"))
+            .find(|value| value.pointer("/name").and_then(Value::as_str) == Some("dynamic-config"))
+            .expect("the rendered volume");
+
+        assert!(
+            volume.pointer("/emptyDir/sizeLimit").is_some(),
+            "{medium}: an unbounded volume is a pod eviction waiting to happen: {volume}"
+        );
     }
 }

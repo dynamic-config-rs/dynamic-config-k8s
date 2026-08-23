@@ -1,7 +1,12 @@
 # Stability & Versioning
 
 Experimental, stated plainly: this is the youngest repository in the
-organisation and the annotation contract is v1. The operator's
+organisation and the annotation contract is v1 — and since 0.3.0 that
+contract is a **registry** rather than a list somebody keeps in step: every
+key is one row carrying whether it takes a `.name` suffix and whether it has
+been retired, a test checks this book against it, and a retired key will be
+admitted with a warning naming its replacement rather than refused. Nothing
+is retired yet. The operator's
 reconcilers shipped in 0.1.1 and it stays 0.x until they have soak
 history, whatever the rest of the family does.
 

@@ -199,6 +199,86 @@ Worth knowing before the first incident, whatever the method:
   than the lease, and the error says so instead of hanging in a retry
   loop.
 
+## Dynamic secrets
+
+A path under `database/`, `pki/` or `aws/` does not *hold* a secret; it
+**mints** one, with a lease. One annotation says to read it that way:
+
+```yaml
+    dynamic-config.rs/source: "vault"
+    dynamic-config.rs/dynamic: "true"
+    dynamic-config.rs/key: "database/creds/billing"
+    dynamic-config.rs/path: "/config/db.env"
+    dynamic-config.rs/auth: "kubernetes"
+    dynamic-config.rs/auth-role: "billing"
+```
+
+The pod now holds a database credential nobody else has, for as long as it
+needs it. What changes:
+
+- **The path is read as it is.** KV v2's `data/` nesting is not inserted
+  and `data.data` is not unwrapped, because a dynamic engine has neither.
+- **The lease is kept.** `lease_id`, `lease_duration` and `renewable` come
+  back with the document.
+- **A lease that says it cannot be renewed is never sent a renewal.**
+  Vault answers `renewable: false` for every `pki/issue`, and for a
+  database credential that has reached its role's maximum. Such a lease is
+  **re-issued at 90% of its life** instead. Asking it to renew first would
+  be a request that can only be refused — a round trip per cycle per pod,
+  and a `lease_renewal_failures_total` that climbs steadily on a fleet
+  where nothing is wrong.
+- **A renewable lease is renewed at 65% of its TTL**, spread, and what
+  Vault *grants* is what the next renewal is scheduled from — a role's
+  `max_ttl` is a ceiling the pod cannot see, so asking for an hour and
+  being given ten minutes has to be believed rather than assumed.
+- **The two fractions are not the same number by accident.** A renewal is
+  cheap and reversible: it fails, and a third of the lease is still there
+  to get a new credential in. A re-issue *is* the new credential, so doing
+  it early only shortens the one in use and wakes every application
+  watching the file for it.
+- **A renewal does not re-render.** It extends the same credential; the
+  file is already correct. A re-issue mints new credentials and does
+  re-render, and that is what happens both when a renewal stops working
+  and when the lease was never renewable.
+- **A backoff never sleeps past the lease.** This is the one place the
+  usual ceiling is wrong: waiting five minutes to retry a credential that
+  expires in twenty seconds is a pod that comes back to an expired secret.
+- **SIGTERM revokes.** Best-effort, with a short deadline —
+  `revoke-on-shutdown: "false"` opts out, for a lease something else is
+  still using. Vault expires the lease on its own eventually; revoking on
+  the way out is what turns *eventually* into *now*.
+
+### Certificates are on their own clock
+
+`pki/issue` is the one dynamic engine where the lease is not the whole
+truth. A PKI role can hand back a lease longer than the certificate it
+issued — the lease is Vault's accounting record, `notAfter` is what a TLS
+peer enforces — so the agent takes **whichever runs out first**.
+
+Vault reports the certificate's `notAfter` as `data.expiration`, seconds
+since the epoch, which is why this needs no X.509 parsing: the number is
+already in the response.
+
+One guard comes with it. That timestamp is Vault's wall clock compared
+against the pod's, and the two are not the same clock. A certificate that
+looks *already* expired from inside the pod is far more likely to be skew
+than an expired certificate — Vault would not have issued one — so the
+lease's own number wins there, rather than the agent re-issuing in a tight
+loop against a server that thinks everything is fine.
+
+The watch capability drops to `Interval`: a dynamic engine has no version
+to poll, and asking whether it changed is not separable from asking for a
+new credential.
+
+**One path per render.** Every read mints its own lease, so merging
+several paths into one document would leave every lease but one unrenewed
+and unrevoked. A second dynamic path is a second named render.
+
+The four `lease_*` series in
+[the agent's metrics](observability.md#the-agents-metrics) are what to
+watch: `lease_ttl_seconds` is what Vault last granted, and a rising
+`lease_renewal_failures_total` is the signal that a re-fetch is coming.
+
 ## When it fails
 
 | symptom | look at | usual cause |

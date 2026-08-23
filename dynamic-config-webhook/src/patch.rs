@@ -11,7 +11,7 @@ use crate::annotations::{self, Mode};
 /// and this constant is only the fallback a bare binary gets. Read once:
 /// an admission decision must not change between two requests because
 /// somebody edited the environment.
-const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.2.0";
+const AGENT_IMAGE: &str = "ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.3.0";
 
 fn agent_image() -> &'static str {
     static IMAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -37,6 +37,15 @@ fn agent_pull_secret() -> Option<&'static str> {
 }
 
 /// The whole webhook: a review's response, allowed or patched or refused.
+/// How large the rendered volume may grow.
+///
+/// Twice the agent's document ceiling: the fetched document and what it
+/// renders to both land here, and a template can reasonably produce more
+/// than it consumed. A number rather than a value, because a knob here
+/// would be a knob whose only correct setting is "larger than the other
+/// knob".
+const VOLUME_LIMIT: &str = "16Mi";
+
 /// The `status.reason` slugs a refusal carries.
 ///
 /// Stable: a scrape aggregates on them, so they are part of what this
@@ -55,6 +64,24 @@ pub fn admission_response(review: &Value) -> Value {
 /// server feeds its own; tests construct theirs through
 /// [`Installation::from_lookup`](annotations::Installation::from_lookup).
 pub fn admission_response_with(review: &Value, install: &annotations::Installation) -> Value {
+    admission_response_with_classes(review, install, &crate::classes::Cache::new())
+}
+
+/// [`admission_response_with`], able to resolve `dynamic-config.rs/class`.
+///
+/// The cache is a map in memory that a background task replaces; **nothing
+/// here calls the API server**, which is the property that makes reading
+/// Classes safe on a path every pod creation waits on.
+///
+/// An empty cache — the default, and what the two functions above pass —
+/// resolves nothing, so a pod naming a class is refused with a message
+/// saying classes are not enabled rather than silently admitted without
+/// the store the class was supposed to supply.
+pub fn admission_response_with_classes(
+    review: &Value,
+    install: &annotations::Installation,
+    classes: &crate::classes::Cache,
+) -> Value {
     let uid = review
         .pointer("/request/uid")
         .and_then(Value::as_str)
@@ -62,6 +89,34 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
 
     let Some(pod) = review.pointer("/request/object") else {
         return respond(uid, json!({ "allowed": true }));
+    };
+
+    let namespace = review
+        .pointer("/request/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    // Resolved *before* parsing, by writing the class's values into the
+    // annotations the pod did not set. Everything downstream — the format
+    // checks, the installation's pins, the source gates — then works on a
+    // pod that spells its store out, unchanged and unaware that a class
+    // was involved.
+    let resolved;
+    let pod = match with_class(pod, namespace, classes) {
+        Ok(None) => pod,
+        Ok(Some(filled)) => {
+            resolved = filled;
+            &resolved
+        }
+        Err((reason, message)) => {
+            return respond(
+                uid,
+                json!({
+                    "allowed": false,
+                    "status": { "code": 403, "reason": reason, "message": message },
+                }),
+            )
+        }
     };
 
     match annotations::of_pod_with(pod, install) {
@@ -174,14 +229,32 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
             let patches = patches_for(pod, &request);
             let encoded = base64(&serde_json::to_vec(&patches).expect("patches serialise"));
 
-            respond(
-                uid,
-                json!({
-                    "allowed": true,
-                    "patchType": "JSONPatch",
-                    "patch": encoded,
-                }),
-            )
+            let mut response = json!({
+                "allowed": true,
+                "patchType": "JSONPatch",
+                "patch": encoded,
+            });
+
+            // Everything worth saying that is not worth refusing over.
+            // Without this channel the only two things an admission could
+            // do were allow in silence and refuse — so a configuration that
+            // was legal and unwise arrived with nothing said about it.
+            let mut warnings = warnings(&request);
+
+            // From the annotation registry rather than from this function:
+            // a deprecation is a property of the key, and the list of keys
+            // has one home.
+            warnings.extend(annotations::deprecations(
+                pod.pointer("/metadata/annotations")
+                    .and_then(Value::as_object)
+                    .unwrap_or(&serde_json::Map::new()),
+            ));
+
+            if !warnings.is_empty() {
+                response["warnings"] = json!(warnings);
+            }
+
+            respond(uid, response)
         }
         // Everything the annotation parser refuses: a value that is not
         // the shape it has to be, or one the installation pinned. Both are
@@ -204,6 +277,163 @@ pub fn admission_response_with(review: &Value, install: &annotations::Installati
             )
         }
     }
+}
+
+/// The pod with its class's values filled in, or `None` if it names none.
+///
+/// The class is a **default**, not a pin: a pod that names both a class and
+/// its own endpoint keeps its own. That is the same rule the installation
+/// document follows for the same reason — a value an author wrote and did
+/// not get is a debugging session.
+fn with_class(
+    pod: &Value,
+    namespace: &str,
+    classes: &crate::classes::Cache,
+) -> Result<Option<Value>, (&'static str, String)> {
+    let annotations = pod
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object);
+
+    let Some(annotations) = annotations else {
+        return Ok(None);
+    };
+
+    let named = annotations
+        .get(&format!("{}class", annotations::PREFIX))
+        .and_then(Value::as_str);
+
+    let Some(named) = named else {
+        return Ok(None);
+    };
+
+    let Some(class) = classes.resolve(namespace, named) else {
+        return Err((
+            POLICY,
+            format!(
+                "{}class names {named:?}, and no DynamicConfigClass or                  ClusterDynamicConfigClass of that name is visible here.                  Classes are read only when an administrator sets                  `webhook.classes.enabled`, and a class created seconds ago                  may not have been polled yet",
+                annotations::PREFIX
+            ),
+        ));
+    };
+
+    if !class.admits(namespace) {
+        return Err((
+            POLICY,
+            format!(
+                "{}class names {named:?}, which exists and does not admit                  namespace {namespace:?}. Its `namespaces` list is the                  platform team's, and this is what keeps a cluster-scoped                  class from meaning anyone",
+                annotations::PREFIX
+            ),
+        ));
+    }
+
+    // A pod mounts Secrets from its own namespace and from nowhere else,
+    // so a cluster class whose credential lives elsewhere works for the
+    // operator — which reads the Secret itself — and cannot work here.
+    if let Some(holds) = &class.credential_elsewhere {
+        if holds != namespace {
+            return Err((
+                POLICY,
+                format!(
+                    "{}class names {named:?}, whose credential Secret is in                      namespace {holds:?}. A pod can only mount Secrets from                      its own namespace, so this class is usable by a                      DynamicConfigRender and not by an injected agent",
+                    annotations::PREFIX
+                ),
+            ));
+        }
+    }
+
+    let mut filled = pod.clone();
+    let Some(notes) = filled
+        .pointer_mut("/metadata/annotations")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+
+    let mut fill = |name: &str, value: &str| {
+        notes
+            .entry(format!("{}{name}", annotations::PREFIX))
+            .or_insert_with(|| json!(value));
+    };
+
+    fill("source", &class.source);
+    fill("endpoint", &class.endpoint);
+
+    if let Some(secret) = &class.token_secret {
+        fill("token-secret", secret);
+    }
+
+    Ok(Some(filled))
+}
+
+/// What `kubectl` prints beside a pod it created anyway.
+///
+/// The bar is deliberately high: a warning on every admission is a warning
+/// nobody reads, so each of these is a configuration that works and that
+/// somebody would want to know about. None of them names a value.
+fn warnings(request: &annotations::Request) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // A rendered secret on node-backed storage outlives the pod, survives a
+    // reboot, and is readable by anything that can read the node's disk.
+    if !request.volume_memory {
+        warnings.push(format!(
+            "{}volume-medium=disk keeps the rendered document on node-backed \
+             storage, where it outlives the pod",
+            annotations::PREFIX
+        ));
+    }
+
+    // The default is 0640. Anything world-readable in a shared pod is
+    // readable by every sidecar in it, including ones added later.
+    if let Some(mode) = request
+        .file_mode
+        .as_deref()
+        .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+    {
+        if mode & 0o007 != 0 {
+            warnings.push(format!(
+                "{}file-mode is world-readable, and every container in this \
+                 pod can read the rendered document",
+                annotations::PREFIX
+            ));
+        }
+    }
+
+    // Below a second is a store being polled sixty times a minute by every
+    // pod that does this.
+    if request.watch_seconds < 5 {
+        warnings.push(format!(
+            "{}watch-seconds is {} — every replica polls the store at that \
+             rate, and a native watch delivers changes without one",
+            annotations::PREFIX,
+            request.watch_seconds
+        ));
+    }
+
+    // The loudest one here, and the only one an installer had to enable
+    // before it could be reached at all. It still earns a warning: the pod
+    // that carries it and the person reading `kubectl apply` output are
+    // often not the same person.
+    if request.tls_skip_verify {
+        warnings.push(format!(
+            "{}tls-skip-verify is on: this store is not authenticated, so \
+             anything on the network path can supply this pod's \
+             configuration and its credentials",
+            annotations::PREFIX
+        ));
+    }
+
+    // A lease nobody hands back stays valid until it expires, held by a pod
+    // that no longer exists.
+    if request.dynamic && !request.revoke_on_shutdown {
+        warnings.push(format!(
+            "{}revoke-on-shutdown is off: the credential stays valid after \
+             this pod is gone, until its lease expires",
+            annotations::PREFIX
+        ));
+    }
+
+    warnings
 }
 
 fn respond(uid: &str, mut response: Value) -> Value {
@@ -316,10 +546,19 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
 
     // tmpfs unless the pod asked for disk: rendered configuration can
     // carry secrets, and memory-backed emptyDir keeps them off the node.
+    // A `sizeLimit` on both media, and it is not a nicety. A
+    // memory-backed `emptyDir` is charged to the **pod's** memory, so a
+    // document larger than anybody expected does not fail the agent — it
+    // gets the whole pod OOM-killed, application included. With a limit
+    // the write fails, the agent says so, and the last good file keeps
+    // serving.
+    //
+    // Sized from the document ceiling with room for the rendering beside
+    // it, since both live here.
     let empty_dir = if request.volume_memory {
-        json!({ "medium": "Memory" })
+        json!({ "medium": "Memory", "sizeLimit": VOLUME_LIMIT })
     } else {
-        json!({})
+        json!({ "sizeLimit": VOLUME_LIMIT })
     };
 
     patches.push(json!({
@@ -354,6 +593,38 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 // this to fix the nonroot-read problem would break the
                 // very client it feeds.
                 "secret": { "secretName": ssh.name, "defaultMode": 0o400 },
+            },
+        }));
+    }
+
+    // Whatever the store's own client wants and this contract does not
+    // model — a `.creds` file, a keytab, a bundle with a name nobody here
+    // guessed. Read-only, into the agent alone, at a path the pod does not
+    // choose.
+    if let Some(extra) = &request.extra_secret {
+        patches.push(json!({
+            "op": "add",
+            "path": "/spec/volumes/-",
+            "value": {
+                "name": "dynamic-config-extra",
+                // 0444 for the same reason as the client TLS pair: the
+                // kubelet writes as root and the agent runs nonroot.
+                "secret": { "secretName": extra, "defaultMode": 0o444 },
+            },
+        }));
+    }
+
+    // The cohort percentage. A ConfigMap rather than an annotation on
+    // purpose: the kubelet rewrites a mount in place, so widening the
+    // cohort is an edit rather than a new pod spec — and a new pod spec is
+    // a rolling restart that discards the state the canary is watching.
+    if let Some(canary) = &request.canary {
+        patches.push(json!({
+            "op": "add",
+            "path": "/spec/volumes/-",
+            "value": {
+                "name": "dynamic-config-canary",
+                "configMap": { "name": canary.name },
             },
         }));
     }
@@ -434,6 +705,17 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
         }));
     }
 
+    if let Some(schema) = &request.schema {
+        patches.push(json!({
+            "op": "add",
+            "path": "/spec/volumes/-",
+            "value": {
+                "name": "dynamic-config-schema",
+                "configMap": { "name": schema.name },
+            },
+        }));
+    }
+
     // 2. Mount it into every application container, at the directory of
     //    the requested path.
     let mount_dir = std::path::Path::new(&request.path)
@@ -442,13 +724,28 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
         .filter(|p| !p.is_empty())
         .unwrap_or("/config");
 
-    let containers = pod
+    // Every container, unless the pod named a subset. The rendered volume
+    // is the whole delivery, so a container that does not get it does not
+    // see the configuration at all — which is the point for a log shipper
+    // or a mesh proxy sitting beside an application whose credentials it
+    // has no business holding. File mode cannot draw that line: a sidecar
+    // running as the same UID reads a `0600` file perfectly well.
+    let containers: Vec<usize> = pod
         .pointer("/spec/containers")
         .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, container)| match &request.inject_containers {
+            None => true,
+            Some(named) => container["name"]
+                .as_str()
+                .is_some_and(|name| named.iter().any(|wanted| wanted == name)),
+        })
+        .map(|(index, _)| index)
+        .collect();
 
-    for index in 0..containers {
+    for index in containers {
         if pod
             .pointer(&format!("/spec/containers/{index}/volumeMounts"))
             .is_none()
@@ -588,12 +885,105 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
 
         for (flag, value) in &request.arguments {
             arguments.push(flag.clone());
-            arguments.push(value.clone());
+
+            // An empty value is a **bare flag**, not a flag with an empty
+            // argument: `--tls-skip-verify` takes nothing, and pushing `""`
+            // after it would reach the agent as an argument it does not
+            // recognise.
+            if !value.is_empty() {
+                arguments.push(value.clone());
+            }
         }
 
         if watch {
             arguments.push("--watch".to_owned());
             arguments.push(request.watch_seconds.to_string());
+        }
+
+        if request.dynamic {
+            arguments.push("--dynamic".to_owned());
+        }
+
+        // Every rendering the main document also becomes. Only on the
+        // watching agent *and* the init one, unlike most of what is here:
+        // an application that reads two files at startup needs both of
+        // them there before it starts, not one.
+        for rendering in &request.also {
+            let mut field = format!("out={}", rendering.path);
+
+            if let Some(section) = &rendering.section {
+                field.push_str(&format!(",section={section}"));
+            }
+
+            arguments.push("--also".to_owned());
+            arguments.push(field);
+        }
+
+        // Only the watching agent: an init container writes once and exits,
+        // so a description of what it wrote would outlive the thing that
+        // could keep it true.
+        if watch && request.meta {
+            arguments.push("--meta".to_owned());
+        }
+
+        // Only the watching agent: an init container exits the moment it
+        // has written the file, and a lease revoked on the way out of an
+        // init container would take the credential the app is about to
+        // read with it.
+        if watch && request.dynamic && !request.revoke_on_shutdown {
+            arguments.push("--no-revoke-on-shutdown".to_owned());
+        }
+
+        // The watching agent only. An init container writes once and
+        // exits, before the application it would notify has started —
+        // which admission already refuses, and this is the half that makes
+        // `mode: both` do the right thing rather than notifying twice.
+        if watch {
+            if let Some(url) = &request.notify_http {
+                arguments.push("--notify-http".to_owned());
+                arguments.push(url.clone());
+            }
+
+            if let Some(policy) = &request.on_drift {
+                arguments.push("--on-drift".to_owned());
+                arguments.push(policy.clone());
+            }
+
+            if !request.tls_reload {
+                arguments.push("--no-tls-reload".to_owned());
+            }
+
+            if let Some(keep) = request.history {
+                arguments.push("--history".to_owned());
+                arguments.push(keep.to_string());
+            }
+
+            if request.require_ack {
+                arguments.push("--require-ack".to_owned());
+            }
+
+            if request.events {
+                arguments.push("--events".to_owned());
+            }
+
+            if let Some(seconds) = request.timeout {
+                arguments.push("--timeout".to_owned());
+                arguments.push(seconds.to_string());
+            }
+
+            if let Some(canary) = &request.canary {
+                arguments.push("--canary".to_owned());
+                arguments.push(format!("{}/{}", annotations::CANARY_MOUNT, canary.key));
+            }
+        }
+
+        // Same gate as the flag above: only the watching agent revokes, so
+        // only the watching agent is told how long it may take.
+        if watch && request.dynamic && request.revoke_on_shutdown {
+            if let Some(seconds) = request.revoke_grace {
+                arguments.push("--revoke-grace".to_owned());
+                arguments.push(seconds.to_string());
+            }
         }
 
         let mut mounts = vec![json!({ "name": "dynamic-config", "mountPath": mount_dir })];
@@ -614,6 +1004,22 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             }));
         }
 
+        if request.canary.is_some() {
+            mounts.push(json!({
+                "name": "dynamic-config-canary",
+                "mountPath": annotations::CANARY_MOUNT,
+                "readOnly": true,
+            }));
+        }
+
+        if request.extra_secret.is_some() {
+            mounts.push(json!({
+                "name": "dynamic-config-extra",
+                "mountPath": annotations::EXTRA_MOUNT,
+                "readOnly": true,
+            }));
+        }
+
         if request.tls.is_some() {
             mounts.push(json!({
                 "name": "dynamic-config-client-tls",
@@ -630,24 +1036,39 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             }));
         }
 
+        if request.schema.is_some() {
+            mounts.push(json!({
+                "name": "dynamic-config-schema",
+                "mountPath": annotations::SCHEMA_MOUNT,
+                "readOnly": true,
+            }));
+        }
+
         let mut limits = json!({ "memory": request.resources.memory_limit });
 
         if let Some(cpu) = &request.resources.cpu_limit {
             limits["cpu"] = json!(cpu);
         }
 
+        if let Some(ephemeral) = &request.resources.ephemeral_limit {
+            limits["ephemeral-storage"] = json!(ephemeral);
+        }
+
+        let mut requests = json!({
+            "cpu": request.resources.cpu_request,
+            "memory": request.resources.memory_request,
+        });
+
+        if let Some(ephemeral) = &request.resources.ephemeral_request {
+            requests["ephemeral-storage"] = json!(ephemeral);
+        }
+
         let mut container = json!({
             "name": if watch { "dynamic-config-agent" } else { "dynamic-config-init" },
-            "image": agent_image(),
+            "image": request.agent_image.clone().unwrap_or_else(|| agent_image().to_owned()),
             "args": arguments,
             "volumeMounts": mounts,
-            "resources": {
-                "requests": {
-                    "cpu": request.resources.cpu_request,
-                    "memory": request.resources.memory_request,
-                },
-                "limits": limits,
-            },
+            "resources": { "requests": requests, "limits": limits },
             // The restricted Pod Security Standard, in full, so injection
             // works in namespaces that enforce it — an injector that
             // relaxes a pod's posture is a finding, not a feature.
@@ -674,6 +1095,31 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 .expect("args is the array built above")
                 .extend([json!("--metrics-addr"), json!(format!("0.0.0.0:{port}"))]);
             container["ports"] = json!([{ "containerPort": port, "name": "metrics" }]);
+
+            // The probe is what makes `/readyz` worth answering. Pod
+            // readiness is already AND-ed across containers, so a Service
+            // sends no traffic to a pod whose configuration does not exist
+            // yet — the behaviour every config sidecar wants and almost
+            // none implement.
+            //
+            // The trade, said out loud: with the store unreachable at start
+            // and no cached file to fall back to, the pod never becomes
+            // ready. That is correct — the application has no configuration
+            // — but it turns a store outage into a visibly stalled rollout
+            // rather than pods that come up and misbehave. `readiness:
+            // "false"` is the escape hatch for a deployment that would
+            // rather start.
+            if request.readiness {
+                container["readinessProbe"] = json!({
+                    "httpGet": { "path": "/readyz", "port": "metrics" },
+                    // Generous: a slow first fetch is not a failure, and a
+                    // threshold tuned for a process that is merely starting
+                    // would kill a pod waiting on a store that is coming
+                    // back.
+                    "periodSeconds": 5,
+                    "failureThreshold": 60,
+                });
+            }
         }
 
         // Secret material reaches the agent as environment, never as
@@ -701,6 +1147,25 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
                 env.push(json!({
                     "name": key,
                     "valueFrom": { "secretKeyRef": { "name": secret, "key": key } },
+                }));
+            }
+
+            container["env"] = json!(env);
+        }
+
+        // The pod's own identity, for an agent that writes Events about
+        // it. Through the downward API rather than the hostname: a
+        // hostname is the pod's name today and is not promised to be.
+        if request.events || request.canary.is_some() {
+            let mut env = container["env"].as_array().cloned().unwrap_or_default();
+
+            for (name, path) in [
+                ("DYNAMIC_CONFIG_POD_NAME", "metadata.name"),
+                ("DYNAMIC_CONFIG_POD_UID", "metadata.uid"),
+            ] {
+                env.push(json!({
+                    "name": name,
+                    "valueFrom": { "fieldRef": { "fieldPath": path } },
                 }));
             }
 
@@ -742,7 +1207,11 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
 
         for (flag, value) in &extra.arguments {
             arguments.push(flag.clone());
-            arguments.push(value.clone());
+
+            // Bare flags, as above.
+            if !value.is_empty() {
+                arguments.push(value.clone());
+            }
         }
 
         if watch {
@@ -817,6 +1286,37 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             },
         });
 
+        // A named render was unobservable: this container had no metrics
+        // block at all, so `dynamic-config-agent-db` and its siblings
+        // reported nothing whatever went wrong in them.
+        //
+        // The port is per render because a port is a pod-wide resource and
+        // N containers cannot share one — and it is named rather than
+        // allocated, because `port + n` reads as tidy right up to the
+        // afternoon it lands on whatever the application is listening on.
+        if let (Some(port), true) = (extra.metrics_port, watch) {
+            container["args"]
+                .as_array_mut()
+                .expect("args is the array built above")
+                .extend([json!("--metrics-addr"), json!(format!("0.0.0.0:{port}"))]);
+            // Unnamed, and the probe uses the number. A Kubernetes port
+            // name is at most fifteen characters and a render's suffix may
+            // be thirty-two, so `metrics-{n}` is a pod the API server
+            // refuses for the longer half of the names this contract
+            // allows — and truncating would collide two suffixes that
+            // share a prefix. The number is already unique: somebody chose
+            // it.
+            container["ports"] = json!([{ "containerPort": port }]);
+
+            if request.readiness {
+                container["readinessProbe"] = json!({
+                    "httpGet": { "path": "/readyz", "port": port },
+                    "periodSeconds": 5,
+                    "failureThreshold": 60,
+                });
+            }
+        }
+
         if !extra.secret_env.is_empty() {
             container["env"] = extra
                 .secret_env
@@ -854,8 +1354,19 @@ pub fn patches_for(pod: &Value, request: &annotations::Request) -> Vec<Value> {
             }));
         }
 
+        // `/-` appends, `/0` prepends. Appending is right by default —
+        // another injector's init container that must run first stays
+        // first — and `init-first` is for the pod whose own init container
+        // needs the configuration this one writes.
+        //
+        // The named renders keep `/-` either way: prepending each of them
+        // would reverse their order, and their order is the annotation's.
+        let position = if request.init_first { "0" } else { "-" };
+
         patches.push(json!({
-            "op": "add", "path": "/spec/initContainers/-", "value": agent(false),
+            "op": "add",
+            "path": format!("/spec/initContainers/{position}"),
+            "value": agent(false),
         }));
 
         for extra in &request.extra {

@@ -11,6 +11,7 @@ description = "Mutating admission webhook: injects the dynamic-config agent into
 publish = false   # ships as an image, not a crate
 
 [dependencies]
+dynamic-config-telemetry = { path = "../dynamic-config-telemetry" }
 # The admission endpoint. Plain axum: the organisation's own adapter
 # hands a snapshot to a handler, and this server has no configuration to
 # hand — its own installation is read once at startup and never reloads,
@@ -21,6 +22,13 @@ axum = { version = "0.8.1", features = ["json", "tokio", "http1"] }
 # configuration through its own engine is the shortest honest path.
 dynamic-config = { workspace = true, features = ["json", "yaml", "watch"] }
 serde_json = { workspace = true }
+# Listing the classes, and nothing else: one GET on a background timer,
+# never on the admission path. `kube` and `k8s-openapi` would be a large
+# dependency for two list calls the webhook makes twice a minute.
+ureq = { version = "3.0.12", default-features = false, features = ["rustls", "json"] }
+# `validate` reads a pod manifest, and a pod manifest is far more often
+# YAML than JSON. YAML is a superset, so one parser reads both.
+serde_yaml = "0.9"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }
 # TLS termination, the same shape and the same reasons as the config

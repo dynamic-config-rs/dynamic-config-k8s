@@ -1,19 +1,20 @@
-# The Three Deliveries: File, Env, Secret
+# The Four Deliveries: File, Env, Secret, Volume
 
-One engine, three ways a document reaches a workload — because real
+One engine, four ways a document reaches a workload — because real
 software disagrees about how it wants to be configured. Grafana re-reads
 files; Airflow reads environment variables at boot and nothing else; a
 Strimzi-shaped operator watches Kubernetes Secrets. Picking the delivery
 is a one-line decision here; what follows is the map.
 
-| | **File** (webhook + agent) | **Env** (`env-inject`) | **Secret** (operator target) |
-|---|---|---|---|
-| The consumer | reads/watches a file | reads environ at start | reads/watches a k8s Secret, or `envFrom` |
-| Freshness | **live** — atomic rename, watcher cadence | frozen at container start (Kubernetes' rule); `env-restart` opts into a kubelet container-restart on change — seconds, no pod recreation | live object; watchers react, `envFrom` at next start |
-| Touches etcd? | **never** — tmpfs emptyDir | never — same tmpfs file, sourced | **yes** — a Secret lives in etcd, stated out loud |
-| Restart to update? | no | yes (next pod start) | no for Secret-watchers; yes for `envFrom` |
-| Set up by | pod annotations | pod annotations (+ explicit `command`) | `DynamicConfigRender` CR |
-| Real example | [Grafana](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/grafana-datasources.yaml) | [Airflow](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/airflow-scheduler.yaml) | [Kafka client](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/kafka-client-properties.yaml) |
+| | **File** (webhook + agent) | **Env** (`env-inject`) | **Secret** (operator target) | **Volume** (CSI, node agent) |
+|---|---|---|---|---|
+| The consumer | reads/watches a file | reads environ at start | reads/watches a k8s Secret, or `envFrom` | reads/watches a file |
+| Freshness | **live** — atomic rename, watcher cadence | frozen at container start (Kubernetes' rule); `env-restart` opts into a kubelet container-restart on change — seconds, no pod recreation | live object; watchers react, `envFrom` at next start | **live**, same renames from a shared watch |
+| Touches etcd? | **never** — tmpfs emptyDir | never — same tmpfs file, sourced | **yes** — a Secret lives in etcd, stated out loud | never |
+| Restart to update? | no | yes (next pod start) | no for Secret-watchers; yes for `envFrom` | no |
+| Containers per render | one | one | none in the workload | **none** — one per node, shared |
+| Set up by | pod annotations | pod annotations (+ explicit `command`) | `DynamicConfigRender` CR | a `csi:` volume, no annotations at all |
+| Real example | [Grafana](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/grafana-datasources.yaml) | [Airflow](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/airflow-scheduler.yaml) | [Kafka client](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/examples/real/kafka-client-properties.yaml) | [the node agent's page](node-agent.md) |
 
 The decision procedure, in order: **can the consumer read a file?**
 File delivery — it is the only fully live one and the only one that
@@ -21,6 +22,14 @@ never touches etcd. **Does something else own the consumer** (an
 operator that only reads Secrets)? The Secret target. **Env-only
 software?** `env-inject`, with the start-freeze stated rather than
 papered over.
+
+**And the fourth is a scale answer rather than a shape answer.** The volume
+delivers the same bytes as the file does, from one process per node instead
+of one beside every render — 10,000 pods at 2.5 renders each is 25,000
+sidecar containers, and that number is the only reason to reach for it. It
+costs the isolation the other three have: one process holds the store
+credentials of every pod on its node. Choose it from a measurement, not a
+preference, and read [its page](node-agent.md) before you do.
 
 ## Against the Vault Agent Injector
 
@@ -37,8 +46,22 @@ center of gravity:
 | File perms / ownership | annotations | annotations (`file-mode`, `agent-run-as-user/group`), root refused at admission |
 | Env variables | you rewrite the command by hand to `source` the file | `env-inject` writes the wrap for you, refuses the impossible cases by name |
 | k8s Secret objects | no | the operator's `secret:` target, when the consumer requires one |
-| Lease renewal | vault-agent renews leases | the agent re-fetches on its interval; Vault reads are versioned-metadata-gated |
+| Lease renewal | renews renewable leases, re-fetches non-renewable ones | **the same**, since 0.3.0: `dynamic: "true"` reads a dynamic engine, renews a renewable lease at 65% of its TTL, never sends a renewal to one the store marked non-renewable, re-issues at 90% instead, and hands the lease back on SIGTERM |
+| PKI certificates | tracks the certificate's own lifetime | the same: whichever expires first binds — the lease, or the certificate's `notAfter` |
+| Failure semantics | last-known-good, retries | last-known-good with a **startup policy**, a deletion policy, a staleness ceiling wired to readiness, and drift detection on the rendered file |
+| Knowing it arrived | the file exists | the file exists **and the application said it applied it** — `require-ack` makes that readiness |
+| Rolling a change | all pods at once | `canary-configmap`: a deterministic cohort takes it first, widened by editing a ConfigMap with no restart |
+| Delivery shapes | file (and env by hand) | file, env, k8s Secret, and a **CSI volume from a per-node agent** |
 | Scope | secrets delivery | configuration delivery that treats secrets as first-class fields |
+
+**What it still does that this does not**, and what this declines on
+purpose, are written down rather than left to a table's silence: seven
+items in `VAULT-PARITY-GAPS.md` and twelve in `VAULT-PARITY-REFUSED.md`,
+both at the root of this repository. The short version is that the
+remaining gaps are ergonomics — a render-spec ConfigMap, two
+exit-on-failure policies, log format — and the refusals are the proxy, the
+cache, arbitrary commands, and anything that would let a pod rewrite the
+container this webhook injects.
 
 ### The injector's template idiom, translated
 

@@ -5,8 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod canary;
+pub mod events;
 pub mod metrics;
+pub mod notify;
 pub mod render;
 pub mod sidecar;
 pub mod sources;
 pub mod spec;
+pub mod trust;

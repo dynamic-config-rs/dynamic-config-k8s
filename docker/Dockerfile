@@ -41,7 +41,8 @@ COPY . .
 RUN cargo build --release \
       -p dynamic-config-agent \
       -p dynamic-config-webhook \
-      -p dynamic-config-operator
+      -p dynamic-config-operator \
+      -p dynamic-config-node-agent
 
 # One stage per binary, all three from the same build layer. `--target`
 # picks which one an image is.
@@ -59,3 +60,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2ee
 COPY --from=build /src/target/release/dynamic-config-operator /usr/local/bin/
 USER nonroot
 ENTRYPOINT ["dynamic-config-operator"]
+
+# The one image here that does NOT set `USER nonroot`, and the reason is
+# worth reading rather than discovering: the kubelet creates a pod's volume
+# directories owned by root, and a CSI node plugin that cannot write into
+# them cannot publish anything. Every other binary in this repository runs
+# nonroot and this one cannot, which is one of the reasons the node agent
+# is off by default and the sidecar remains the shape to reach for.
+FROM gcr.io/distroless/cc-debian12@sha256:c53c9416a1acdbfd6e09abba720442444a3d1a6338b8db850e5e198b59af5570 AS node-agent
+COPY --from=build /src/target/release/dynamic-config-node-agent /usr/local/bin/
+ENTRYPOINT ["dynamic-config-node-agent"]

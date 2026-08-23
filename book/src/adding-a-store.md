@@ -119,7 +119,7 @@ Two honest compositions cover most "we need store X now" cases:
 
 - **External Secrets Operator in front**: ESO syncs GCP SM (or any of
   its many backends) into a Kubernetes Secret, and everything on
-  [The Three Deliveries](injection-shapes.md) consumes that Secret —
+  [The Four Deliveries](injection-shapes.md) consumes that Secret —
   mounted as a live file, `envFrom`, or `secretKeyRef`. You trade the
   document model for breadth, which is exactly the trade the
   [comparison table](injection-shapes.md#against-external-secrets-operator) prices.

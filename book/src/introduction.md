@@ -29,12 +29,13 @@ credentials in-process, and fleets standardising one injection pattern.
 How a document REACHES a workload — a live file, real environment
 variables, or a native Kubernetes Secret — is its own decision, with a
 map and two honest comparison tables (Vault Agent Injector, External
-Secrets Operator) on [The Three Deliveries](injection-shapes.md).
+Secrets Operator) on [The Four Deliveries](injection-shapes.md).
 
-## The three pieces, staged
+## The four pieces, staged
 
 | piece | ships in | today |
 |---|---|---|
-| agent | 0.2.0 | all nine stores — the blocking six since 0.1.0, etcd/nats/s3 on the async path since 0.1.1 — and **watched** rather than polled since 0.2.0 |
-| webhook | 0.2.0 | golden-tested; the annotation contract is v1; three TLS modes incl. selfRotate; admission and rotation are metrics since 0.2.0 |
-| operator | 0.2.0 | Render → ConfigMap reconciler shipped, Class watch wired, e2e-gated, **leader-elected** since 0.2.0 |
+| agent | 0.3.0 | all nine stores — the blocking six since 0.1.0, etcd/nats/s3 on the async path since 0.1.1 — **watched** rather than polled since 0.2.0, and since 0.3.0: last-known-good with a startup policy, dynamic secrets with lease renewal, a readiness probe that means *there is a document*, drift, history, acknowledgement and canary cohorts |
+| webhook | 0.3.0 | golden-tested; the annotation contract is v1 and is now a registry a test checks this book against; three TLS modes incl. selfRotate; admission warnings and a `validate` CLI since 0.3.0 |
+| operator | 0.3.0 | Render → ConfigMap reconciler shipped, Class watch wired, e2e-gated, **leader-elected** since 0.2.0; `deletionPolicy`, `observedGeneration` and three refusal reasons since 0.3.0 |
+| node agent | 0.3.0 | one process per node instead of one beside every render, delivering as a **CSI volume**; pods sharing a document share a watch. **Off by default** — it holds the credentials of every pod on its node, so the sidecar stays the shape to reach for |

@@ -1,0 +1,20 @@
+[package]
+name = "dynamic-config-telemetry"
+description = "OpenTelemetry wiring shared by the three binaries."
+# Internal: the three programs here share one shutdown story, and a
+# published crate would be promising an API to people who did not ask.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }

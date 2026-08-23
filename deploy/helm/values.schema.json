@@ -159,6 +159,28 @@
         "pullSecret": {
           "type": "string",
           "description": "imagePullSecret name appended to injected pods; must exist in each injecting namespace"
+        },
+        "events": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Kubernetes Events written by the injected agent about its own pod. Off: the sidecar carries no API credential otherwise.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "namespaces": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "serviceAccounts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
         }
       },
       "additionalProperties": false
@@ -470,6 +492,14 @@
             }
           ]
         },
+        "allowEvents": {
+          "description": "Whether a pod may set dynamic-config.rs/events. Mirrors agent.events.enabled.",
+          "type": "boolean"
+        },
+        "allowTlsSkipVerify": {
+          "description": "Whether a pod may set dynamic-config.rs/tls-skip-verify, which connects to its store without authenticating it. Off, and a cluster decision rather than a workload's.",
+          "type": "boolean"
+        },
         "metrics": {
           "type": "object",
           "additionalProperties": false,
@@ -498,6 +528,20 @@
               }
             }
           }
+        },
+        "classes": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Whether the webhook resolves dynamic-config.rs/class against the cluster DynamicConfigClass objects. Off: the admission path calls the API server nowhere, and enabling this gives the webhook a cluster-wide read.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "agentImageAllow": {
+          "type": "string",
+          "description": "Comma-separated image prefixes a pod may name in dynamic-config.rs/agent-image. Empty means none."
         }
       },
       "additionalProperties": false
@@ -608,6 +652,46 @@
         }
       },
       "additionalProperties": false
+    },
+    "nodeAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One agent per node, delivering configuration as a CSI volume. Off: it holds every pod on the node credentials and runs as root.",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "kubeletPath": {
+          "type": "string"
+        },
+        "metricsPort": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        },
+        "registrar": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
     }
   },
   "additionalProperties": false,

@@ -82,6 +82,72 @@ read-only mounts into the agent container alone. The webhook enforces
 it — there is no annotation that accepts a token value, and the
 password slot has no flag on the agent at all.
 
+## Which containers see the rendered document
+
+Every container in the pod, unless the pod says otherwise:
+
+```yaml
+    dynamic-config.rs/inject-containers: "app"
+```
+
+The default is the reference implementation's, and it is the right default
+— a pod whose containers all serve the same application should not have to
+enumerate them. But a pod that runs a log shipper, a mesh proxy or a debug
+sidecar beside its application is a pod where one container needs the
+credential and the others do not, and **`file-mode` cannot express that**:
+a sidecar in the same pod usually runs as the same UID, and reads a `0600`
+file exactly as well as the application does.
+
+Naming a subset is the only lever that draws the line, so it exists. A name
+the pod does not have is refused rather than ignored — a typo would leave
+the application without its configuration and every other container without
+it too.
+
+## Policies Kubernetes enforces better than this webhook would
+
+`policies/` carries four `ValidatingAdmissionPolicy` samples in CEL:
+`volume-medium: disk` refused, `tls-skip-verify` refused whatever the
+installation allows, a world-readable `file-mode` refused, and the injected
+agent required to be pinned by digest.
+
+They are examples rather than a feature. Kubernetes has a policy engine and
+this project should not grow a second one; what was missing was worked
+starting points. Each ships as `Warn` so it can be installed and read before
+it is enforced, and the first three select on a namespace label rather than
+the whole cluster — a policy that fires everywhere on day one is a policy
+somebody removes on day two.
+
+They match on the **annotations** rather than on the injected container,
+because admission policies run before this webhook does: what they see is
+what the pod's author wrote.
+
+## What falls with what
+
+[`THREAT_MODEL.md`](https://github.com/dynamic-config-rs/dynamic-config-k8s/blob/main/THREAT_MODEL.md)
+names the assets and the trust boundaries, and walks what an attacker
+reaches from each thing they might compromise — an application container,
+the agent, the webhook, the operator, the network path.
+
+The one it is worth reading this page for: a cluster-scoped
+`DynamicConfigClass` holds one credential and admits many namespaces, and a
+tenant in an admitted namespace chooses the `key`. Scope that credential to
+what its tenants may read, and prefer namespaced Classes where the tenancy
+allows — a key-prefix policy on the Class would make it structural, and that
+is not built.
+
+## Transport credentials are wiped when they go
+
+The Vault token, the AppRole secret-id, the password, the AWS secret key
+and the SSH key are held in a type that zeroes its own memory on drop and
+redacts its own `Debug`. What that buys is narrow, and narrow in a
+specific way: a core dump, a `/proc/<pid>/mem` read or a swapped page taken
+*after* the agent is finished with a credential does not contain it.
+
+**The resolved document is not covered, and cannot be.** It is plaintext
+by necessity — it is about to be written to a file the application reads —
+so the protection that matters for it is the volume being tmpfs and the
+file mode being what the pod asked for, not memory hygiene.
+
 ## The webhook holds nothing
 
 - Its ServiceAccount sets `automountServiceAccountToken: false`, and

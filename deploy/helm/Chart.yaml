@@ -7,8 +7,8 @@ description: >-
   templating — plus the operator's CRDs. Zero dependencies by default:
   the chart mints its own webhook certificate; cert-manager is optional.
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.3.0
+appVersion: "0.3.0"
 kubeVersion: ">=1.25.0-0"
 home: https://dynamic-config-rs.github.io/k8s/
 sources:
@@ -44,11 +44,13 @@ annotations:
       description: A rendered document reconciled into a ConfigMap by the operator, for workloads that must not carry a sidecar.
   artifacthub.io/images: |
     - name: dynamic-config-webhook
-      image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.2.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-webhook:v0.3.0
     - name: dynamic-config-agent
-      image: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.2.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-agent:v0.3.0
     - name: dynamic-config-operator
-      image: ghcr.io/dynamic-config-rs/dynamic-config-operator:v0.2.0
+      image: ghcr.io/dynamic-config-rs/dynamic-config-operator:v0.3.0
+    - name: dynamic-config-node-agent
+      image: ghcr.io/dynamic-config-rs/dynamic-config-node-agent:v0.3.0
   artifacthub.io/links: |
     - name: The book (annotation contract, stores, security posture)
       url: https://dynamic-config-rs.github.io/k8s/

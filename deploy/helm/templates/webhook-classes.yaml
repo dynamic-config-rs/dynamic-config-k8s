@@ -1,0 +1,43 @@
+{{- /*
+The RBAC the webhook needs to read DynamicConfigClass objects — and the
+sentence about why it is off.
+
+The admission path calls the API server **nowhere**, and that is a security
+property rather than an accident: an admission webhook with a read of the
+cluster in its hot path is one that fails when the API server is busy, and
+every pod creation in the cluster fails with it.
+
+Enabling this does not change that. The classes are listed on a background
+timer into a map in memory; admission reads the map. What it does change is
+that the webhook now holds a credential and a cluster-wide read of two
+custom resources — which is worth having only if pods actually name classes.
+
+`list` and `watch` on the two class kinds, cluster-wide, and nothing else.
+Not the Secrets they name: the webhook mounts those into pods by reference
+and never reads them, which is the same property it has always had.
+*/ -}}
+{{- if .Values.webhook.classes.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-classes
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["dynamic-config.rs"]
+    resources: ["dynamicconfigclasses", "clusterdynamicconfigclasses"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dynamic-config.fullname" . }}-classes
+  labels: {{- include "dynamic-config.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "dynamic-config.fullname" . }}-classes
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dynamic-config.fullname" . }}-webhook
+    namespace: {{ .Release.Namespace }}
+{{- end }}

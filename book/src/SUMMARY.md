@@ -11,7 +11,7 @@
 - [The Security Posture](security.md)
 - [Rendering](rendering.md)
 - [The Full Stack, One Deployment](full-stack.md)
-- [The Three Deliveries: File, Env, Secret](injection-shapes.md)
+- [The Four Deliveries: File, Env, Secret, Volume](injection-shapes.md)
 
 # The Stores
 
@@ -31,6 +31,7 @@
 
 - [GitOps: ArgoCD and Flux](gitops.md)
 - [The Operator](operator.md)
+- [One Agent per Node](node-agent.md)
 - [Observability](observability.md)
 - [Troubleshooting](troubleshooting.md)
 

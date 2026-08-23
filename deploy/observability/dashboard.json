@@ -1,0 +1,496 @@
+{
+  "title": "dynamic-config",
+  "uid": "dynamic-config-fleet",
+  "tags": [
+    "dynamic-config"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Data source"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Agents",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "dynamic_config:agents:count",
+          "legendFormat": "agents",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Every injected agent reporting metrics. A number that drops without a rollout is agents that stopped scraping."
+    },
+    {
+      "id": 2,
+      "title": "Stale over 5m",
+      "type": "stat",
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "dynamic_config:agents:stale_over_5m",
+          "legendFormat": "stale",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Agents whose store has not answered in five minutes. They are still serving the last good document."
+    },
+    {
+      "id": 3,
+      "title": "Never rendered",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "dynamic_config:agents:never_rendered",
+          "legendFormat": "never rendered",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Agents that have produced nothing. With the readiness probe on, these pods are not taking traffic."
+    },
+    {
+      "id": 4,
+      "title": "Unauthenticated stores",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "dynamic_config:agents:unauthenticated_stores",
+          "legendFormat": "skip-verify",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Agents running with tls-skip-verify. This should be zero."
+    },
+    {
+      "id": 5,
+      "title": "Drifted files",
+      "type": "stat",
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "count(dynamic_config_agent_drift == 1) or vector(0)",
+          "legendFormat": "drifted",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Rendered files something else in the pod has written to."
+    },
+    {
+      "id": 6,
+      "title": "Documents absent",
+      "type": "stat",
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "count(dynamic_config_agent_absent == 1) or vector(0)",
+          "legendFormat": "absent",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Documents the store says are gone. A deletion, not an outage."
+    },
+    {
+      "id": 10,
+      "title": "Staleness",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "max(dynamic_config_agent_staleness_seconds)",
+          "legendFormat": "worst",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "quantile(0.95, dynamic_config_agent_staleness_seconds)",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "quantile(0.50, dynamic_config_agent_staleness_seconds)",
+          "legendFormat": "p50",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "description": "How long ago each agent last read its store. The gauge to page on: failures recover, staleness accumulates."
+    },
+    {
+      "id": 11,
+      "title": "Renders and failures",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamic_config_agent_renders_total[5m]))",
+          "legendFormat": "renders/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_agent_render_failures_total[5m]))",
+          "legendFormat": "failures/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "A render is a document reaching disk. A failure keeps the last good file."
+    },
+    {
+      "id": 20,
+      "title": "Watch health",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(dynamic_config_agent_watch_connected)",
+          "legendFormat": "connected",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_agent_watch_reconnects_total[5m]))",
+          "legendFormat": "reconnects/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_agent_resyncs_total[5m]))",
+          "legendFormat": "resyncs/s",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "A reconnect rate that rises without a store restart is the reconnect storm the backoff exists to spread."
+    },
+    {
+      "id": 21,
+      "title": "Lease lifecycle",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamic_config_agent_lease_renewals_total[15m]))",
+          "legendFormat": "renewals/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_agent_lease_renewal_failures_total[15m]))",
+          "legendFormat": "failures/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_agent_lease_revocations_total[15m]))",
+          "legendFormat": "revocations/s",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Failures should stay at zero: a lease the store marked non-renewable is never sent a renewal."
+    },
+    {
+      "id": 30,
+      "title": "Admission latency",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dynamic_config_admission_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dynamic_config_admission_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(dynamic_config_admission_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "description": "The webhook is on the path of every pod creation. The API server's budget is ten seconds."
+    },
+    {
+      "id": 31,
+      "title": "Operator reconciles",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(dynamic_config_operator_reconcile_duration_seconds_count[5m]))",
+          "legendFormat": "reconciles/s",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(dynamic_config_operator_reconcile_failures_total[5m]))",
+          "legendFormat": "failures/s",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "description": "Empty unless the operator is installed."
+    }
+  ],
+  "description": "Every series here is documented API: see the k8s book's Observability page. Load the alert and recording rules from deploy/observability/rules.yaml beside it \u2014 the four stat panels read recording rules, so without them they stay empty."
+}
