@@ -1538,7 +1538,7 @@ dependencies = [
  "json-patch",
  "k8s-openapi",
  "kube",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rcgen",
  "rustls",
  "serde_json",
