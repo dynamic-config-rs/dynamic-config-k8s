@@ -56,8 +56,16 @@ pub async fn run(
     interval: Duration,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<Ended, Box<dyn std::error::Error>> {
-    run_from(spec, source, interval, stop, None).await
+    run_from(spec, source, interval, stop, None, None).await
 }
+
+/// What a caller is told when this loop accepts a document.
+///
+/// One caller wants it: the CSI node plugin, where a document is fetched
+/// once for a node and rendered once per pod reading it. This loop
+/// publishes the spec it was given; the rest is the caller's, and this is
+/// how the caller hears about it.
+pub type OnDocument<'a> = &'a (dyn Fn(&dynamic_config::Fetched) + Send + Sync);
 
 /// [`run`], for a caller that has already fetched the first document.
 ///
@@ -80,6 +88,7 @@ pub async fn run_from(
     interval: Duration,
     stop: impl std::future::Future<Output = ()>,
     first: Option<dynamic_config::Fetched>,
+    on_document: Option<OnDocument<'_>>,
 ) -> Result<Ended, Box<dyn std::error::Error>> {
     let capability = source.capability();
     // One document in flight, and *latest wins* — which is what the
@@ -133,6 +142,10 @@ pub async fn run_from(
             let fresh = crate::render::render_all(&first, spec)?;
 
             publish(spec, &fresh, first.revision.as_ref())?;
+
+            if let Some(hear) = on_document {
+                hear(&first);
+            }
 
             first_lease = first.lease.clone();
 
@@ -683,6 +696,18 @@ pub async fn run_from(
                 // so a transient `ENOSPC` on the tmpfs killed a sidecar
                 // that was holding a perfectly good file, while an
                 // unreachable store beside it was merely logged.
+                // Before the write and not after it. On a node plugin
+                // this loop is publishing one pod's file and telling the
+                // others about the same document, and the two must not be
+                // chained: a pod that has been deleted takes its volume
+                // directory with it, so the write below starts failing
+                // while the other pods on this node are still reading
+                // perfectly well. Hanging their delivery on this pod's
+                // success let one departure silence everyone.
+                if let Some(hear) = on_document {
+                    hear(&document);
+                }
+
                 match publish(spec, &fresh, document.revision.as_ref()) {
                     Ok(()) => rendered = Some(fresh),
                     Err(error) => {

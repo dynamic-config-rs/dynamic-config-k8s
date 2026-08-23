@@ -22,6 +22,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use dynamic_config_agent::spec::Spec;
+
 /// What makes two requests the same read.
 ///
 /// Derived from the volume's attributes rather than from the pod: two pods
@@ -44,13 +46,27 @@ pub struct Document {
     pub credential: String,
 }
 
+/// One pod volume reading a document.
+///
+/// The spec travels with the path because the render is **not** shared —
+/// two pods on one Consul key may want different formats, different file
+/// modes and different templates out of the same bytes. The fetch is what
+/// is shared; everything downstream of it is each pod's own.
+#[derive(Clone)]
+pub struct Reader {
+    /// The volume directory the kubelet gave us.
+    pub path: String,
+    /// How this pod wants the document rendered.
+    pub spec: Arc<Spec>,
+}
+
 /// A document being watched, and who wants it.
 struct Watched {
     /// The pod volumes this is currently published into.
     ///
     /// A `Vec` rather than a count: unpublishing names a path, and a count
     /// cannot tell which of two pods went away.
-    targets: Vec<String>,
+    targets: Vec<Reader>,
     /// Ends the watch when the last target goes.
     stop: tokio::sync::watch::Sender<bool>,
 }
@@ -86,15 +102,20 @@ impl Registry {
     /// The same target claiming twice is idempotent: the kubelet retries
     /// `NodePublishVolume` after any failure, and a retry must not leave
     /// two watches or two entries behind.
-    pub fn claim(&self, document: Document, target: &str) -> Claim {
+    pub fn claim(&self, document: Document, target: &str, spec: Arc<Spec>) -> Claim {
         let mut watched = self
             .watched
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+        let reader = Reader {
+            path: target.to_owned(),
+            spec,
+        };
+
         if let Some(held) = watched.get_mut(&document) {
-            if !held.targets.iter().any(|path| path == target) {
-                held.targets.push(target.to_owned());
+            if !held.targets.iter().any(|held| held.path == target) {
+                held.targets.push(reader);
             }
 
             return Claim::Joined;
@@ -105,12 +126,29 @@ impl Registry {
         watched.insert(
             document,
             Watched {
-                targets: vec![target.to_owned()],
+                targets: vec![reader],
                 stop,
             },
         );
 
         Claim::Started(ends)
+    }
+
+    /// Everyone currently reading `document`.
+    ///
+    /// The watch calls this on every document it accepts: one fetch, one
+    /// render each. Without it the pod that happened to start the watch
+    /// was the only one whose file ever moved again — the others got their
+    /// first render from `NodePublishVolume` and then nothing, which is
+    /// the opposite of what a watch is for.
+    #[must_use]
+    pub fn readers(&self, document: &Document) -> Vec<Reader> {
+        self.watched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(document)
+            .map(|held| held.targets.clone())
+            .unwrap_or_default()
     }
 
     /// Records that `target` is gone, and ends the watch if it was the
@@ -127,7 +165,7 @@ impl Registry {
         let mut ended = false;
 
         watched.retain(|_, held| {
-            held.targets.retain(|path| path != target);
+            held.targets.retain(|held| held.path != target);
 
             if held.targets.is_empty() {
                 // The watch's own loop sees this and returns; nothing here
@@ -169,6 +207,28 @@ impl Registry {
 mod tests {
     use super::*;
 
+    /// Any spec at all: these tests are about who is reading what, and
+    /// the spec only travels so the render can be each pod's own.
+    fn spec(out: &str) -> Arc<Spec> {
+        Arc::new(
+            Spec::from_args(
+                [
+                    "--source",
+                    "consul",
+                    "--endpoint",
+                    "http://consul:8500",
+                    "--key",
+                    "myapp/config.json",
+                    "--out",
+                    out,
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("a spec the agent accepts"),
+        )
+    }
+
     fn document(key: &str, credential: &str) -> Document {
         Document {
             source: "consul".to_owned(),
@@ -184,11 +244,19 @@ mod tests {
         let registry = Registry::new();
 
         assert!(matches!(
-            registry.claim(document("myapp/config.json", ""), "/pods/a/vol"),
+            registry.claim(
+                document("myapp/config.json", ""),
+                "/pods/a/vol/rendered.toml",
+                spec("/pods/a/vol/rendered.toml")
+            ),
             Claim::Started(_)
         ));
         assert!(matches!(
-            registry.claim(document("myapp/config.json", ""), "/pods/b/vol"),
+            registry.claim(
+                document("myapp/config.json", ""),
+                "/pods/b/vol/rendered.toml",
+                spec("/pods/b/vol/rendered.toml")
+            ),
             Claim::Joined
         ));
 
@@ -201,10 +269,18 @@ mod tests {
     fn a_different_credential_is_a_different_document() {
         let registry = Registry::new();
 
-        registry.claim(document("shared/key", "token-a"), "/pods/a/vol");
+        registry.claim(
+            document("shared/key", "token-a"),
+            "/pods/a/vol/rendered.toml",
+            spec("/pods/a/vol/rendered.toml"),
+        );
 
         assert!(matches!(
-            registry.claim(document("shared/key", "token-b"), "/pods/b/vol"),
+            registry.claim(
+                document("shared/key", "token-b"),
+                "/pods/b/vol/rendered.toml",
+                spec("/pods/b/vol/rendered.toml")
+            ),
             Claim::Started(_)
         ));
 
@@ -217,8 +293,16 @@ mod tests {
     fn the_same_target_claiming_twice_is_idempotent() {
         let registry = Registry::new();
 
-        registry.claim(document("myapp/config.json", ""), "/pods/a/vol");
-        registry.claim(document("myapp/config.json", ""), "/pods/a/vol");
+        registry.claim(
+            document("myapp/config.json", ""),
+            "/pods/a/vol/rendered.toml",
+            spec("/pods/a/vol/rendered.toml"),
+        );
+        registry.claim(
+            document("myapp/config.json", ""),
+            "/pods/a/vol/rendered.toml",
+            spec("/pods/a/vol/rendered.toml"),
+        );
 
         assert_eq!(registry.counts(), (1, 1));
     }
@@ -227,16 +311,30 @@ mod tests {
     fn the_watch_ends_when_the_last_reader_goes() {
         let registry = Registry::new();
 
-        let Claim::Started(mut ends) = registry.claim(document("k", ""), "/pods/a/vol") else {
+        let Claim::Started(mut ends) = registry.claim(
+            document("k", ""),
+            "/pods/a/vol/rendered.toml",
+            spec("/pods/a/vol/rendered.toml"),
+        ) else {
             panic!("the first claim starts it");
         };
 
-        registry.claim(document("k", ""), "/pods/b/vol");
+        registry.claim(
+            document("k", ""),
+            "/pods/b/vol/rendered.toml",
+            spec("/pods/b/vol/rendered.toml"),
+        );
 
-        assert!(!registry.release("/pods/a/vol"), "one reader is left");
+        assert!(
+            !registry.release("/pods/a/vol/rendered.toml"),
+            "one reader is left"
+        );
         assert!(!*ends.borrow_and_update(), "so the watch runs on");
 
-        assert!(registry.release("/pods/b/vol"), "that was the last");
+        assert!(
+            registry.release("/pods/b/vol/rendered.toml"),
+            "that was the last"
+        );
         assert!(*ends.borrow_and_update(), "and the watch was told to end");
         assert_eq!(registry.counts(), (0, 0));
     }
@@ -248,6 +346,53 @@ mod tests {
     fn releasing_something_unknown_is_quiet() {
         let registry = Registry::new();
 
-        assert!(!registry.release("/pods/never/vol"));
+        assert!(!registry.release("/pods/never/vol/rendered.toml"));
+    }
+
+    /// The fetch is shared; the render is not. Every reader comes back
+    /// with its own spec, because the pod that started the watch is not
+    /// the only one whose file has to move when the store does — that was
+    /// the bug the kind leg caught.
+    #[test]
+    fn every_reader_comes_back_with_its_own_spec() {
+        let registry = Registry::new();
+        let key = document("myapp/config.json", "");
+
+        registry.claim(
+            key.clone(),
+            "/pods/a/vol/rendered.toml",
+            spec("/pods/a/vol/rendered.toml"),
+        );
+        registry.claim(
+            key.clone(),
+            "/pods/b/vol/rendered.yaml",
+            spec("/pods/b/vol/rendered.yaml"),
+        );
+
+        let readers = registry.readers(&key);
+
+        assert_eq!(readers.len(), 2, "both pods are reading it");
+
+        let outs: Vec<_> = readers
+            .iter()
+            .map(|reader| reader.spec.out.display().to_string())
+            .collect();
+
+        assert!(outs.contains(&"/pods/a/vol/rendered.toml".to_owned()));
+        assert!(
+            outs.contains(&"/pods/b/vol/rendered.yaml".to_owned()),
+            "the joined reader kept its own format, not the starter's"
+        );
+
+        registry.release("/pods/a/vol/rendered.toml");
+
+        assert_eq!(
+            registry.readers(&key).len(),
+            1,
+            "a released target stops being written to"
+        );
+
+        // A document nobody holds has no readers rather than a panic.
+        assert!(registry.readers(&document("nobody/wants", "")).is_empty());
     }
 }

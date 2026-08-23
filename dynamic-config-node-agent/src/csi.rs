@@ -179,13 +179,23 @@ impl Node for Plugin {
 
         // Then the watch, shared with every other pod on this node reading
         // the same document from the same store under the same credential.
-        match self.registry.claim(volume.document.clone(), &target) {
+        let spec = Arc::new(volume.spec);
+
+        match self
+            .registry
+            .claim(volume.document.clone(), &target, Arc::clone(&spec))
+        {
             crate::shared::Claim::Joined => {
+                // Nothing to spawn: this pod's first file was written
+                // above, and every later document reaches it through the
+                // watch that is already running — see `fan_out`.
                 tracing::info!(target, "joined a watch this node already had");
             }
             crate::shared::Claim::Started(stop) => {
-                let spec = volume.spec;
                 let source = Arc::new(built);
+                let registry = self.registry.clone();
+                let document = volume.document.clone();
+                let mine = target.clone();
 
                 tokio::spawn(async move {
                     let mut stop = stop;
@@ -200,6 +210,14 @@ impl Node for Plugin {
                         }
                     };
 
+                    // One fetch, one render each. The loop below publishes
+                    // the spec it was started with — this pod's — and this
+                    // is how every other pod holding the same document
+                    // gets the same bytes rendered its own way.
+                    let others = move |fetched: &dynamic_config::Fetched| {
+                        fan_out(&registry, &document, &mine, fetched);
+                    };
+
                     // The document this call already fetched, handed on
                     // rather than fetched again — one fetch per first
                     // claim, which is what this file and the book both
@@ -210,6 +228,7 @@ impl Node for Plugin {
                         spec.watch.unwrap_or(std::time::Duration::from_secs(15)),
                         ending,
                         Some(fetched),
+                        Some(&others),
                     )
                     .await
                     {
@@ -296,5 +315,53 @@ impl Node for Plugin {
         _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
         Err(Status::unimplemented("a document has no size to expand"))
+    }
+}
+
+/// The document, rendered for every pod holding it except the one the
+/// watch already published for.
+///
+/// The fetch is shared and the render is not: two pods on one Consul key
+/// may want different formats, file modes and templates out of the same
+/// bytes, and `shared.rs` says so. Before this existed, only the pod that
+/// happened to start the watch ever saw a second version of its file —
+/// everyone else got their first render from `NodePublishVolume` and then
+/// silence, which is the one thing a watch is for.
+///
+/// A failure here is warned about and not fatal, for the same reason it is
+/// in the sidecar: one pod's full disk is not the other pods' problem, and
+/// the next document is another chance.
+fn fan_out(
+    registry: &crate::shared::Registry,
+    document: &crate::shared::Document,
+    published: &str,
+    fetched: &dynamic_config::Fetched,
+) {
+    for reader in registry.readers(document) {
+        // The watch loop wrote this one itself, through `publish` — which
+        // also moves the meta file and the history. Doing it again here
+        // would be a second write of identical bytes.
+        if reader.path == published {
+            continue;
+        }
+
+        let rendered = match dynamic_config_agent::render::render_all(fetched, &reader.spec) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                tracing::warn!(target = reader.path, %error, "rendering for a joined reader");
+
+                continue;
+            }
+        };
+
+        for file in &rendered {
+            if let Err(error) = dynamic_config_agent::render::write_atomically(
+                &file.out,
+                &file.document,
+                file.file_mode,
+            ) {
+                tracing::warn!(target = reader.path, %error, "writing for a joined reader");
+            }
+        }
     }
 }

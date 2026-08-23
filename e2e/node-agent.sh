@@ -127,27 +127,31 @@ echo "NODE-AGENT OK: both pods had their document before they started"
 # `readers` counts the pod volumes reading them. Equal numbers would mean
 # nothing was shared and a sidecar would have cost the same.
 
+# The plugin's image is distroless, so there is no `wget` inside it to
+# exec — this used to try, get nothing, and skip itself with a `|| true`,
+# which is an assertion that has never once run. The consul pod is alpine
+# and is already here, so it is the probe.
+
 agent=$(kubectl -n dynamic-config get pods -l app.kubernetes.io/component=node-agent \
   -o jsonpath='{.items[0].metadata.name}')
 
-metrics=$(kubectl -n dynamic-config exec "$agent" -c node-agent -- \
-  wget -qO- http://127.0.0.1:9111/metrics 2>/dev/null || true)
+agent_ip=$(kubectl -n dynamic-config get pod "$agent" -o jsonpath='{.status.podIP}')
 
-if [[ -z "$metrics" ]]; then
-  echo "  (the node agent's metrics port did not answer; skipping the sharing check)"
-else
-  echo "$metrics" | sed 's/^/  /'
+metrics=$(kubectl exec deploy/consul -- \
+  wget -qO- "http://${agent_ip}:9111/metrics") \
+  || { echo "the node agent's metrics port did not answer" >&2; exit 1; }
 
-  documents=$(echo "$metrics" | sed -n 's/^dynamic_config_node_agent_documents \(.*\)/\1/p')
-  readers=$(echo "$metrics" | sed -n 's/^dynamic_config_node_agent_readers \(.*\)/\1/p')
+echo "$metrics" | sed 's/^/  /'
 
-  [[ "$documents" == "1" ]] \
-    || { echo "two pods on one key should be one watch, not $documents" >&2; exit 1; }
-  [[ "$readers" == "2" ]] \
-    || { echo "one watch should have two readers, not $readers" >&2; exit 1; }
+documents=$(echo "$metrics" | sed -n 's/^dynamic_config_node_agent_documents \(.*\)/\1/p')
+readers=$(echo "$metrics" | sed -n 's/^dynamic_config_node_agent_readers \(.*\)/\1/p')
 
-  echo "NODE-AGENT OK: one document, two readers"
-fi
+[[ "$documents" == "1" ]] \
+  || { echo "two pods on one key should be one watch, not $documents" >&2; exit 1; }
+[[ "$readers" == "2" ]] \
+  || { echo "one watch should have two readers, not $readers" >&2; exit 1; }
+
+echo "NODE-AGENT OK: one document, two readers"
 
 # ── A change reaches both ─────────────────────────────────────────────
 

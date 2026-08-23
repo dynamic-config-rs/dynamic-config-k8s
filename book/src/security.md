@@ -291,9 +291,28 @@ refused.
   crates.io — the same audited path every other binding uses; there is
   no k8s-only fork of anything.
 
-## What this integration never does
+## What the injected agent never does
 
 No `hostPath`, no `privileged`, no capabilities added, no writes
-outside the shared volume, no API server calls from the webhook, no
-credentials in flags or annotations, and no way — flag or annotation —
-to turn TLS verification off toward any store.
+outside the shared volume, no API server calls from the webhook, and no
+credentials in flags or annotations.
+
+Two of those used to be said of the whole integration, and 0.3.0 made
+that untrue in two places. Both are off by default and both are named
+here rather than left for a reader to find:
+
+- **The node agent mounts `hostPath` and runs as root.** It is a CSI
+  node plugin, so the kubelet's plugin socket and pod directories are
+  where its work is, and the kubelet creates those directories owned by
+  root. It adds no capabilities, escalates no privileges, and — since it
+  makes no mounts — asks for `HostToContainer` propagation rather than
+  the `Bidirectional` that would require a privileged container.
+  `nodeAgent.enabled` is `false`. See [the node agent](node-agent.md).
+- **`tls-skip-verify` exists.** A pod can ask to reach its store without
+  authenticating it, and the answer is no unless the installer set
+  `webhook.allowTlsSkipVerify`, which defaults to false. It is the one
+  annotation that trades away the guarantee the rest of this page is
+  arranged around, which is why it is the installer's to grant and not
+  the pod author's to take. `server-name` is the answer to the problem
+  that usually leads people here — a certificate whose name does not
+  match the address — and it gives up nothing.

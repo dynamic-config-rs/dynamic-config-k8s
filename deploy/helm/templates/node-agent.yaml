@@ -100,11 +100,17 @@ spec:
           volumeMounts:
             - name: socket
               mountPath: /csi
-            # `Bidirectional` so a mount this driver makes is visible to
-            # the kubelet and to the pods it publishes into.
+            # `HostToContainer`, not `Bidirectional`. This driver makes
+            # no mounts: `NodePublishVolume` writes a file into the
+            # directory the kubelet made and `NodeUnpublishVolume` leaves
+            # the directory to the kubelet, so there is nothing to
+            # propagate outward. `Bidirectional` would be describing work
+            # that does not happen — and Kubernetes allows it only to a
+            # `privileged` container, which is the one thing this driver
+            # exists to avoid asking for.
             - name: pods
               mountPath: {{ .Values.nodeAgent.kubeletPath }}/pods
-              mountPropagation: Bidirectional
+              mountPropagation: HostToContainer
       volumes:
         - name: socket
           hostPath:

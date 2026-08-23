@@ -148,3 +148,48 @@ fn the_service_monitor_selects_a_service_this_chart_labels() {
         );
     }
 }
+
+/// **The node agent asks for nothing privileged.**
+///
+/// It is the one component here that mounts `hostPath` and runs as root,
+/// which is what a CSI node plugin is; it does not follow that it may ask
+/// for more. `Bidirectional` mount propagation is the specific trap —
+/// Kubernetes grants it only to a `privileged` container, so a DaemonSet
+/// requesting it is *rejected by the API server at install time*. That is
+/// exactly what happened, and it took a kind cluster and four image
+/// builds to find out. `helm template` knows it in a second.
+///
+/// This driver makes no mounts at all — it writes a file into a directory
+/// the kubelet made — so `HostToContainer` is both sufficient and free.
+#[test]
+fn the_node_agent_daemon_set_asks_for_no_privilege() {
+    let Some(rendered) = rendered(&["nodeAgent.enabled=true"]) else {
+        return;
+    };
+
+    assert!(
+        rendered.contains("kind: DaemonSet"),
+        "nodeAgent.enabled did not render the DaemonSet"
+    );
+
+    // The key, not the word: the template explains in a comment why it
+    // does not ask for this, and a comment survives `helm template`.
+    for forbidden in [
+        "mountPropagation: Bidirectional",
+        "privileged: true",
+        "allowPrivilegeEscalation: true",
+    ] {
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with(forbidden)),
+            "the chart renders {forbidden:?}, which the API server refuses \
+             outside a privileged container"
+        );
+    }
+
+    assert!(
+        rendered.contains("mountPropagation: HostToContainer"),
+        "the plugin still needs to see the kubelet's mounts under pods/"
+    );
+}

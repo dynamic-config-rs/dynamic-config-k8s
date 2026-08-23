@@ -828,9 +828,11 @@ impl Spec {
 
         if !templated && crate::render::OutputFormat::of(&self.out).is_none() {
             return Err(format!(
- "--out {:?}: the extension must be one of .json .toml .yaml .ini .properties                  (or give a --template, which owns the bytes)",
- self.out
- ));
+                "--out {:?}: the extension must be one of .json .toml \
+                 .yaml .ini .properties (or give a --template, which owns \
+                 the bytes)",
+                self.out
+            ));
         }
 
         Ok(self)
