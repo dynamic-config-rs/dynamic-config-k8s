@@ -106,7 +106,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Two dimensions, eight jobs. `arch` has to be a dimension rather
+        # than something `include` adds: an `include` entry whose keys are
+        # all absent from the matrix is merged into *every* combination,
+        # so two such entries left four jobs that all agreed they were
+        # arm64 and no amd64 build at all. `runner` is what `include`
+        # is for — it keys off a dimension that already exists.
         component: [agent, webhook, operator, node-agent]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-latest
@@ -137,7 +144,17 @@ jobs:
       # `provenance` and `sbom` stay here rather than moving to the join:
       # they attest what was *built*, and what was built is one
       # architecture. `SECURITY.md` says which digest carries which.
-      - name: build and push by digest
+      # **One registry per step, and ghcr's digest is the one that
+      # travels.** Both registries in one step exports two manifest lists,
+      # not one — the provenance attestation records the image name it was
+      # built for, so the index differs per registry — and the action can
+      # only report one `digest`. It reported Docker Hub's, the join looked
+      # it up on ghcr, and the release stopped there.
+      #
+      # The join assembles *both* registries' lists out of the ghcr
+      # digests, so ghcr is the one it has to be given. Docker Hub gets its
+      # per-architecture images here and its index there.
+      - name: build and push by digest, ghcr
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -153,6 +170,19 @@ jobs:
           cache-to: type=gha,mode=max,scope=image-${{ matrix.component }}-${{ matrix.arch }}
           outputs: |
             type=image,name=${{ env.GHCR }}/dynamic-config-${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
+
+      # A cache hit on everything above; what this costs is the push.
+      - name: build and push by digest, Docker Hub
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.component }}
+          platforms: linux/${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=image-${{ matrix.component }}-${{ matrix.arch }}
+          outputs: |
             type=image,name=${{ env.DOCKERHUB }}/dynamic-config-${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
 
       # One file per leg, named for the digest: the join needs both, and a
