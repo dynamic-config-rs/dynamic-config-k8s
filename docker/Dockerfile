@@ -1,4 +1,4 @@
-# The three images, from one file and one dependency build.
+# The four images, from one file and one dependency build.
 #
 # Two things this is arranged around, and both were costing whole minutes
 # per run before it existed:
@@ -8,9 +8,9 @@
 #   and only then copies the sources in. An edit to this project's code
 #   reuses the layer holding the gRPC stack, the AWS SDK and rustls, which
 #   is where the time actually goes.
-# - **The three binaries share that layer.** They were three files with
-#   the same forty lines and three separate `COPY . .` builds, so each
-#   image paid for the whole workspace's dependencies again.
+# - **The binaries share that layer.** They were separate files with the
+#   same forty lines and a `COPY . .` build each, so every image paid for
+#   the whole workspace's dependencies again.
 #
 # **The base images are pinned by digest**, and the tag is kept beside the
 # digest so a reader can see what it is. A digest says which bytes; a tag
@@ -24,7 +24,8 @@
 FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS chef
 WORKDIR /src
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+      protobuf-compiler libprotobuf-dev \
  && rm -rf /var/lib/apt/lists/* \
  && cargo install cargo-chef --locked --version 0.1.71
 
@@ -44,8 +45,8 @@ RUN cargo build --release \
       -p dynamic-config-operator \
       -p dynamic-config-node-agent
 
-# One stage per binary, all three from the same build layer. `--target`
-# picks which one an image is.
+# One stage per binary, all from the same build layer. `--target` picks
+# which one an image is.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS agent
 COPY --from=build /src/target/release/dynamic-config-agent /usr/local/bin/
 USER nonroot
