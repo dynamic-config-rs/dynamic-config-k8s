@@ -32,7 +32,7 @@ jobs:
         env:
           SOAK_HOURS: "5"
 
-  # The three images, built once for the whole run.
+  # The four images, built once for the whole run.
   #
   # Each e2e leg used to build all three itself: three legs, nine builds,
   # every one of them compiling the same dependency graph from nothing.

@@ -3,11 +3,14 @@ name: Release
 # Merging a version bump into `main` IS the release — the wheel wave's
 # shape, aimed at registries. The `decide` job checks whether the
 # workspace version is new; a docs merge is a green no-op and a version
-# bump builds the three images multi-arch, pushes them to ghcr.io and
-# Docker Hub with identical digests (one buildx build, both registries in
-# the tag list), signs everything with cosign keyless, attaches SBOM and
-# provenance attestations, pushes the chart as OCI with its ArtifactHub
-# metadata, and mints the tag last — a tag marks what actually shipped.
+# bump builds the four images, each architecture on its own runner
+# rather than under QEMU, pushes them by digest to ghcr.io and Docker Hub,
+# and joins them into one index per registry — so the digest a consumer
+# pulls is the index's. It signs that index with cosign keyless, attaches
+# SBOM and provenance to the per-architecture images beneath it (an index
+# does not carry attestations up), pushes the chart as OCI with its
+# ArtifactHub metadata, and mints the tag last — a tag marks what actually
+# shipped.
 on:
   push:
     branches: [main]
