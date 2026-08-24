@@ -21,7 +21,7 @@
 # Trivy scan exists to notice.
 #
 # Build one:  docker build -f docker/Dockerfile --target agent -t agent:dev .
-FROM rust:1.88-slim@sha256:38bc5a86d998772d4aec2348656ed21438d20fcdce2795b56ca434cf21430d89 AS chef
+FROM rust:1.98-slim@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078 AS chef
 WORKDIR /src
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev \
@@ -47,17 +47,17 @@ RUN cargo build --release \
 
 # One stage per binary, all from the same build layer. `--target` picks
 # which one an image is.
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS agent
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS agent
 COPY --from=build /src/target/release/dynamic-config-agent /usr/local/bin/
 USER nonroot
 ENTRYPOINT ["dynamic-config-agent"]
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS webhook
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS webhook
 COPY --from=build /src/target/release/dynamic-config-webhook /usr/local/bin/
 USER nonroot
 ENTRYPOINT ["dynamic-config-webhook"]
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS operator
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS operator
 COPY --from=build /src/target/release/dynamic-config-operator /usr/local/bin/
 USER nonroot
 ENTRYPOINT ["dynamic-config-operator"]
@@ -68,6 +68,6 @@ ENTRYPOINT ["dynamic-config-operator"]
 # them cannot publish anything. Every other binary in this repository runs
 # nonroot and this one cannot, which is one of the reasons the node agent
 # is off by default and the sidecar remains the shape to reach for.
-FROM gcr.io/distroless/cc-debian12@sha256:c53c9416a1acdbfd6e09abba720442444a3d1a6338b8db850e5e198b59af5570 AS node-agent
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa AS node-agent
 COPY --from=build /src/target/release/dynamic-config-node-agent /usr/local/bin/
 ENTRYPOINT ["dynamic-config-node-agent"]
