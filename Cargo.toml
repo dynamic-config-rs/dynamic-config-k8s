@@ -37,7 +37,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 # The meta file's digest. Already in the graph through the engine; named
 # here so the agent can hash the bytes it just wrote.
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 # Transport credentials are wiped when they go. Not the resolved document —
 # that has to be plaintext to be written — but the token, the password and
 # the keys used to *reach* a store have no reason to outlive their use.
